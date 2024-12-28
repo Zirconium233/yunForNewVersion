@@ -542,8 +542,8 @@ if __name__ == '__main__':
     if not args.auto_run:
         if len(conf.get('User', 'token')) == 0:
             my_token,my_device_id,my_device_name,my_uuid,my_sys_edition = noTokenLogin()
-
-        if conf.get('Yun', 'app_edition') != '3.4.5':
+        # 检查版本是否小于3.4.5
+        if conf.get('Yun', 'app_edition') < '3.4.5':
             conf.set('Yun', 'app_edition', '3.4.5')
             with open(cfg_path, 'w+', encoding='utf-8') as f:
                 conf.write(f)
