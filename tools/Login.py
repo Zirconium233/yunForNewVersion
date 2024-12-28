@@ -84,8 +84,7 @@ class Login():
         
         #判断school_id是否在[Yun]中
         if 'school_id' not in conf['Yun']:
-            school_id = input('未找到school_id，肥工用户为100，其他学校用户请先进行一次抓包获得schoolid：')
-            conf.set('Yun', 'school_id', school_id)
+            conf.set('Yun', 'school_id', '100')
             with open('./config.ini', 'w', encoding='utf-8') as f:
                 conf.write(f)
         
@@ -97,19 +96,7 @@ class Login():
         iniuuid = conf.get('User', 'uuid')
         iniSysedition = conf.get('User', 'sys_edition')
         appedition = conf.get('Yun', 'app_edition')
-
-        #脑子抽了 为什么要这么判断。。判断schoolhost就行啊
-        #isHFUT = input('是否是合肥工业大学用户？(y/n)') or 'n'
-        #if isHFUT == 'y':
-        #    url = conf.get('Yun', 'school_host') + '/login/appLoginHGD'
-        #else:
-        #    url = conf.get('Yun', 'school_host') + '/login/appLogin'
-
-        url = conf.get('Yun', 'school_host')
-        if url == 'http://210.45.246.53:8080':
-            url = url + '/login/appLoginHGD'
-        else:
-            url = url + '/login/appLogin'
+        url = conf.get('Yun', 'school_host') + '/login/appLoginHGD'
         platform = conf.get('Yun', 'platform')
         schoolid = conf.get('Yun', 'school_id')
 
@@ -152,7 +139,7 @@ class Login():
         sign=Login.md5_encryption(sign_data)
         key='e2c9e15e84f93b81ee01bbd299a31563'
         content=Login.sm4_encrypt(encryptData, key, mode='ECB', padding='Pkcs7', output_format='Base64')
-        #content=content[:-24]
+        content=content[:-24]
         headers = {
             "token": "",
             "isApp": "app",
@@ -177,9 +164,6 @@ class Login():
         # 打印响应内容
         result=response.text
         rawResponse=json.dumps(json.loads(result))
-        #print(rawResponse)
-        #print(data)
-        #print(headers)
         if rawResponse.find('500') != -1:
             print('返回数据报错 检查账号密码')
             exit()
