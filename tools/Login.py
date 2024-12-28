@@ -97,15 +97,8 @@ class Login():
         iniuuid = conf.get('User', 'uuid')
         iniSysedition = conf.get('User', 'sys_edition')
         appedition = conf.get('Yun', 'app_edition')
-
-        #脑子抽了 为什么要这么判断。。判断schoolhost就行啊
-        #isHFUT = input('是否是合肥工业大学用户？(y/n)') or 'n'
-        #if isHFUT == 'y':
-        #    url = conf.get('Yun', 'school_host') + '/login/appLoginHGD'
-        #else:
-        #    url = conf.get('Yun', 'school_host') + '/login/appLogin'
-
         url = conf.get('Yun', 'school_host')
+        #判断HFUT接口
         if url == 'http://210.45.246.53:8080':
             url = url + '/login/appLoginHGD'
         else:
@@ -152,7 +145,6 @@ class Login():
         sign=Login.md5_encryption(sign_data)
         key='e2c9e15e84f93b81ee01bbd299a31563'
         content=Login.sm4_encrypt(encryptData, key, mode='ECB', padding='Pkcs7', output_format='Base64')
-        #content=content[:-24]
         headers = {
             "token": "",
             "isApp": "app",
