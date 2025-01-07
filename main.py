@@ -14,6 +14,8 @@ import gmssl.sm2 as sm2
 from base64 import b64encode, b64decode
 import traceback
 import gzip
+
+from pyasn1_modules.rfc8226 import id_ad_stirTNList
 from tqdm import tqdm
 import argparse
 from tools.drift import add_drift
@@ -495,7 +497,38 @@ class Yun_For_New:
         }
         resp = default_post("/run/finish", json.dumps(data))
         print(resp)
+    def get_ppt_list(self):
+        res_json = json.loads(default_post(router="/cwInfo/getStudentStudyList", data=""))
+        print(res_json)
+        data = res_json['data']
+        cwList = data['cwList']
+        id_list = []
+        for cw in cwList:
+            if cw["fullMark"] != cw["currentScore"] :
+                id_list.append(cw["id"])
+        return id_list
+    def watch_ppt(self):
+        id_list = self.get_ppt_list()
+        for id in id_list:
+            data = {
+                "id": str(id)
+            }
+            res_data = json.loads(default_post(router="/cwInfo/getStudentStudyById", data=json.dumps(data)))
+            print(res_data)
+            data = res_data['data']
+            page_time = int(data['pageTime'])
+            page_count = int(data['pageCount'])
+            now_page = int(data["cwPageNum"])
+            while now_page < page_count:
+                time.sleep(page_time)
+                data = {
+                    "id": str(id),
+                    "cwPageNum": str(now_page + 1),
+                }
+                print(default_post(router="/cwInfo/submitCwById", data=json.dumps(data)))
+                now_page += 1
 
+        pass
 if __name__ == '__main__':
     args = parse_args()
     cfg_path = args.config_path
@@ -564,6 +597,11 @@ if __name__ == '__main__':
         sure = input("确认：[y/n]")
     try:
         if sure == 'y':
+            mode = input("模式选择(跑步/观看PPT)：[1/2]")
+            if mode == '2':
+                Yun = Yun_For_New()
+                Yun.watch_ppt()
+                exit()
             if args.auto_run:
                 print_table = 'y'
             else:
