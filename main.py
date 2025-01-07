@@ -15,7 +15,6 @@ from base64 import b64encode, b64decode
 import traceback
 import gzip
 
-from pyasn1_modules.rfc8226 import id_ad_stirTNList
 from tqdm import tqdm
 import argparse
 from tools.drift import add_drift
