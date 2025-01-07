@@ -499,7 +499,6 @@ class Yun_For_New:
         print(resp)
     def get_ppt_list(self):
         res_json = json.loads(default_post(router="/cwInfo/getStudentStudyList", data=""))
-        print(res_json)
         data = res_json['data']
         cwList = data['cwList']
         id_list = []
@@ -514,12 +513,14 @@ class Yun_For_New:
                 "id": str(id)
             }
             res_data = json.loads(default_post(router="/cwInfo/getStudentStudyById", data=json.dumps(data)))
-            print(res_data)
             data = res_data['data']
             page_time = int(data['pageTime'])
             page_count = int(data['pageCount'])
             now_page = int(data["cwPageNum"])
+            name = data["name"]
+            print(f"开始观看{name}")
             while now_page < page_count:
+                print(f"第{now_page}页")
                 time.sleep(page_time)
                 data = {
                     "id": str(id),
