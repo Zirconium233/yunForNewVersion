@@ -128,28 +128,28 @@ def default_post(router, data, headers=None, m_host=None, isBytes=False, gen_sig
     except:
         return req.text
 
-def noTokenLogin():
-    print("config中token为空，是否尝试使用账号密码登录？(y/n)")
-    LoginChoice = input()
-    if LoginChoice == 'y':
-        token,DeviceId,DeviceName,uuid,sys_edition = Login.main()
-        #TEST CONTENT
-        print("是否保存本次登录产生的token和uuid？(y/n)")
-        TokenWrite = input()
-        if TokenWrite == 'y':
-            config = configparser.ConfigParser()
-            config.read('config.ini', encoding='utf-8')
-            config.set('User', 'token', token)
-            config.set('User', 'uuid', uuid)
-            config.set('User', 'device_id', DeviceId)
-            config.set('User', 'device_name', DeviceName)
-            config.set('User', 'sys_edition', sys_edition)
-            with open('config.ini', 'w+', encoding='utf-8') as f:
-                config.write(f)
-        return token,DeviceId,DeviceName,uuid,sys_edition
-    elif LoginChoice == 'n':
-        print("由于缺少token退出")
-        exit()
+#def noTokenLogin():
+#    print("config中token为空，是否尝试使用账号密码登录？(y/n)")
+#    LoginChoice = input()
+#    if LoginChoice == 'y':
+#        token,DeviceId,DeviceName,uuid,sys_edition = Login.main()
+#        #TEST CONTENT
+#        print("是否保存本次登录产生的token和uuid？(y/n)")
+#        TokenWrite = input()
+#        if TokenWrite == 'y':
+#            config = configparser.ConfigParser()
+#            config.read('config.ini', encoding='utf-8')
+#            config.set('User', 'token', token)
+#            config.set('User', 'uuid', uuid)
+#            config.set('User', 'device_id', DeviceId)
+#            config.set('User', 'device_name', DeviceName)
+#            config.set('User', 'sys_edition', sys_edition)
+#            with open('config.ini', 'w+', encoding='utf-8') as f:
+#                config.write(f)
+#        return token,DeviceId,DeviceName,uuid,sys_edition
+#    elif LoginChoice == 'n':
+#        print("由于缺少token退出")
+#        exit()
 
 class Yun_For_New:
 
@@ -540,14 +540,14 @@ if __name__ == '__main__':
     md5key = conf.get("Yun", "md5key")
     platform = conf.get("Yun", "platform")
     if not args.auto_run:
-        if len(conf.get('User', 'token')) == 0:
-            my_token,my_device_id,my_device_name,my_uuid,my_sys_edition = noTokenLogin()
-        # 检查版本是否小于3.4.5
-        if conf.get('Yun', 'app_edition') < '3.4.5':
-            conf.set('Yun', 'app_edition', '3.4.5')
+        #if len(conf.get('User', 'token')) == 0:
+        #    my_token,my_device_id,my_device_name,my_uuid,my_sys_edition = noTokenLogin()
+        # 检查版本是否小于3.4.8
+        if conf.get('Yun', 'app_edition') < '3.4.8':
+            conf.set('Yun', 'app_edition', '3.4.8')
             with open(cfg_path, 'w+', encoding='utf-8') as f:
                 conf.write(f)
-        #config app版本检查 当前可用3.4.5
+        #config app版本检查 当前可用3.4.8
         
         print("确定数据无误：")
     print("Token: ".ljust(15) + my_token)
