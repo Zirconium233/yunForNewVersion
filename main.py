@@ -180,37 +180,56 @@ def getsign(utc, uuid):
     return m.hexdigest()
 
 def default_post(router, data, headers=None, m_host=None, isBytes=False, gen_sign=True):
-    if m_host is None:
-        m_host = my_host
-    url = m_host + router
-    if gen_sign:
-        my_utc = str(int(time.time()))
-    sign = getsign(my_utc, my_uuid) if gen_sign else my_sign
-    if headers is None:
-        headers = {
-            'token': my_token,
-            'isApp': 'app',
-            'deviceId': my_device_id,
-            'deviceName': my_device_name,
-            'version': my_app_edition,
-            'platform': 'android',
-            'Content-Type': 'application/json; charset=utf-8',
-            'Connection': 'Keep-Alive',
-            'Accept-Encoding': 'gzip',
-            'User-Agent': 'okhttp/3.12.0',
-            'utc': my_utc,
-            'uuid': my_uuid,
-            'sign': sign
-        }
-    data_json = {
-        "cipherKey":CipherKeyEncrypted,
-        "content":encrypt_sm4(data, b64decode(default_key),isBytes=isBytes)
-    }
-    req = requests.post(url=url, data=json.dumps(data_json), headers=headers) # data进行了加密
-    try:
-        return decrypt_sm4(req.text, b64decode(default_key)).decode()
-    except:
-        return req.text
+    max_retries = 3  # 最大重试次数
+    retry_delay = 5  # 重试间隔（秒）
+    
+    for attempt in range(max_retries):
+        try:
+            if m_host is None:
+                m_host = my_host
+            url = m_host + router
+            if gen_sign:
+                my_utc = str(int(time.time()))
+            sign = getsign(my_utc, my_uuid) if gen_sign else my_sign
+            if headers is None:
+                headers = {
+                    'token': my_token,
+                    'isApp': 'app',
+                    'deviceId': my_device_id,
+                    'deviceName': my_device_name,
+                    'version': my_app_edition,
+                    'platform': 'android',
+                    'Content-Type': 'application/json; charset=utf-8',
+                    'Connection': 'Keep-Alive',
+                    'Accept-Encoding': 'gzip',
+                    'User-Agent': 'okhttp/3.12.0',
+                    'utc': my_utc,
+                    'uuid': my_uuid,
+                    'sign': sign
+                }
+            data_json = {
+                "cipherKey": CipherKeyEncrypted,
+                "content": encrypt_sm4(data, b64decode(default_key), isBytes=isBytes)
+            }
+            req = requests.post(url=url, data=json.dumps(data_json), headers=headers, timeout=10)
+
+            if req.status_code != 200:
+                raise requests.exceptions.RequestException(f"HTTP错误状态码: {req.status_code}")
+
+            try:
+                return decrypt_sm4(req.text, b64decode(default_key)).decode()
+            except Exception as e:
+                print("响应解密失败，返回原始内容")
+                return req.text
+                
+        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            print(f"请求失败({e})，第{attempt+1}次重试...")
+            time.sleep(retry_delay)
+        except requests.exceptions.RequestException as e:
+            print(f"请求异常({e})，第{attempt+1}次重试...")
+            time.sleep(retry_delay)
+            
+    raise Exception(f"请求失败，超过最大重试次数{max_retries}次")
 
 def noTokenLogin():
     print("config中token为空，是否尝试使用账号密码登录？(y/n)")
