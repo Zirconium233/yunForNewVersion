@@ -51,7 +51,7 @@ class Yun:
         self.count = self.get_tasks_else_file_count()
 
     def get_tasks_else_file_count(self):
-        tasks_else_path = "./tasks_else"
+        tasks_else_path = "../tasks_else"
         try:
             file_count = len([name for name in os.listdir(tasks_else_path) if os.path.isfile(os.path.join(tasks_else_path, name))])
         except FileNotFoundError:
