@@ -406,7 +406,9 @@ class TestR3BusinessCode:
         with pytest.raises(yh.BusinessException, match="code=500"):
             yun.split_by_points_map(make_pts(2))
 
-    def test_finish_rejected_not_reported_success(self, capsys):
+    def test_finish_rejected_still_never_reported_success(self, capsys):
+        # 二返修 S1：isStandard 先查（200 通过）→ finish 被拒 → 不得出现"受理"；
+        # finish 是序列最后一个请求（其后什么都不发）。
         client = StubClient()
         client.behavior = {"/run/finish": lambda c, r, kw: {
             "code": 500, "msg": "记录异常", "data": None}}
@@ -417,20 +419,283 @@ class TestR3BusinessCode:
             yun.finish_by_points_map()
         out = capsys.readouterr().out
         assert "受理" not in out
-        assert not any(r.endswith("/run/isStandard") for r in client.routers())
+        rs = client.routers()
+        assert sum(1 for r in rs if r.endswith("/run/isStandard")) == 1
+        assert sum(1 for r in rs if r.endswith("/run/finish")) == 1
+        assert rs.index(next(r for r in rs if r.endswith("/run/isStandard"))) \
+            < rs.index(next(r for r in rs if r.endswith("/run/finish")))
+        assert rs[-1].endswith("/run/finish")
 
     def test_isstandard_result_parsed_and_reported(self, capsys):
-        # 结束链查询必须解析呈报（非 200 也如实说“有效性未确认”，不谎报）
+        # 二返修 S1：isStandard 是结束链前置门。code!=200 → 停止（重抛），
+        # 尾批与 finish 一律不发；呈报失败/未知。
         client = StubClient()
         client.behavior = {"/run/isStandard": lambda c, r, kw: {
             "code": 500, "msg": "查询拒绝"}}
         yun = make_yun(client, home=home_fixture("N"))
         yun.crsRunRecordId, yun.task_map = 5, task_dict(make_pts(1))
         yun.recordStartTime = "2026-01-01 00:00:00"
-        yun.finish_by_points_map()
+        with pytest.raises(yh.BusinessException):
+            yun.finish_by_points_map()
         out = capsys.readouterr().out
-        assert "[isStandard] 服务端拒绝查询" in out
-        assert "不报告" in out
+        assert "[isStandard] 状态检查失败/未知" in out
+        assert "不发送尾批、不发送 finish" in out
+        assert not any(r.endswith("/run/finish") for r in client.routers())
+
+
+# ============================================================ 二返修 S1
+class TestS1FinishChainOrder:
+    """结束链 = 状态检查 → 尾批 → finish（不再"先 finish 后查询"）。"""
+
+    def _flow(self, behavior=None):
+        import main as _m
+        client = StubClient()
+        if behavior:
+            client.behavior = behavior
+        yun = make_yun(client, home=home_fixture("N"))
+        yun.start()
+        yun.task_map = task_dict(make_pts(12))
+        pts = list(yun.task_map["data"]["pointsList"])
+        sc = _m.split_count
+        yun.split_by_points_map(pts[:sc])
+        yun._pending_tail_points = pts[sc:]
+        return client, yun
+
+    def test_isstandard_http_error_blocks_tail_and_finish(self):
+        def boom(c, r, kw):
+            raise yh.HttpStatusException(502, "http://x/run/isStandard", "bad gw")
+        client, yun = self._flow({"/run/isStandard": boom})
+        with pytest.raises(yh.HttpStatusException):
+            yun.finish_by_points_map()
+        rs = client.routers()
+        assert not any(r.endswith("/run/finish") for r in rs)
+        assert sum(1 for r in rs if r.endswith("splitPointCheating")) == 1
+
+    def test_isstandard_decode_error_blocks(self):
+        def boom(c, r, kw):
+            raise yh.DecodeException("响应无法解码")
+        client, yun = self._flow({"/run/isStandard": boom})
+        with pytest.raises(yh.DecodeException):
+            yun.finish_by_points_map()
+        rs = client.routers()
+        assert not any(r.endswith("/run/finish") for r in rs)
+        assert sum(1 for r in rs if r.endswith("splitPointCheating")) == 1
+
+    def test_isstandard_unsupported_branch_stops(self, capsys):
+        client, yun = self._flow({"/run/isStandard": lambda c, r, kw: {
+            "code": 200, "msg": "ok",
+            "data": {"isStandard": "N", "isCheat": "Y",
+                     "msg": "需复核", "url": "http://x/recheck",
+                     "list": [{"a": 1}]}}})
+        with pytest.raises(M.FaceRunStopError, match="暂不支持"):
+            yun.finish_by_points_map()
+        rs = client.routers()
+        assert not any(r.endswith("/run/finish") for r in rs)
+        assert sum(1 for r in rs if r.endswith("splitPointCheating")) == 1
+        assert "[isStandard 预检]" in capsys.readouterr().out
+
+    def test_tail_rejected_means_no_finish(self):
+        cnt = {"n": 0}
+
+        def reject2nd(c, r, kw):
+            cnt["n"] += 1
+            if cnt["n"] >= 2:
+                return {"code": 500, "msg": "尾批拒绝", "data": None}
+            return None                     # 第一批默认成功
+        client, yun = self._flow({"/run/splitPointCheating": reject2nd})
+        with pytest.raises(yh.BusinessException):
+            yun.finish_by_points_map()
+        rs = client.routers()
+        assert not any(r.endswith("/run/finish") for r in rs)
+        assert rs[-1].endswith("splitPointCheating")   # 终止于尾批拒绝
+
+    def test_happy_path_full_order(self):
+        client, yun = self._flow()
+        yun.finish_by_points_map()
+        rs = [r.split("/run/")[-1] for r in client.routers()]
+        core = [x for x in rs if x.startswith(("start", "splitPoint",
+                                               "isStandard", "finish"))]
+        assert core == ["start", "splitPointCheating", "isStandard",
+                        "splitPointCheating", "finish"]
+
+# ============================================================ 二返修 S2
+class TestS2PreflightBeforeStart:
+    """build_face_runner 在 start 之前完成全量预检（它先于任何网络调用）。"""
+
+    def _args(self, photo=None, video=None, det=None, mirror=False):
+        return argparse.Namespace(face_photo=photo, face_video=video,
+                                  face_detection=det, face_mirror=mirror)
+
+    def _frames(self):
+        return [Image.new("RGB", (400, 500), "black"),
+                Image.new("RGB", (400, 500), "white")]
+
+    def _vid(self, tmp_path):
+        v = tmp_path / "clip.mp4"
+        v.write_bytes(b"\x00fakevideo")
+        return v
+
+    def _frames_det(self, tmp_path, vid, frame_ids=(1,), name="detv.json"):
+        import hashlib
+        det = tmp_path / name
+        det.write_text(json.dumps({
+            "frames": {str(i): {"box": list(BOX_PASS),
+                                "points": [list(p) for p in PTS_PASS],
+                                "score": 0.9, "space": "image"}
+                       for i in frame_ids},
+            "source_sha256": hashlib.sha256(vid.read_bytes()).hexdigest(),
+            "bind_apply": {"after_exif": True, "mirrored": False},
+        }), encoding="utf-8")
+        return det
+
+    def test_photo_without_detection_no_longer_passes(self, tmp_path):
+        photo, _ = photo_pair(tmp_path)
+        with pytest.raises(yf.FaceInputError, match=r"--face-detection"):
+            M.build_face_runner(self._args(photo=str(photo), det=None))
+
+    def test_photo_quality_gate_failure_preflight(self, tmp_path):
+        import hashlib
+        photo = tmp_path / "p2.jpg"
+        b = io.BytesIO()
+        Image.new("RGB", (400, 500), "gray").save(b, "JPEG", quality=95)
+        photo.write_bytes(b.getvalue())
+        det = tmp_path / "dbad.json"
+        det.write_text(json.dumps({
+            "box": [10.0, 10.0, 60.0, 60.0],
+            "points": [[20.0, 30.0], [50.0, 30.0], [35.0, 45.0],
+                       [25.0, 55.0], [45.0, 55.0]],
+            "score": 0.9, "space": "image",
+            "source_sha256": hashlib.sha256(photo.read_bytes()).hexdigest(),
+            "bind_apply": {"after_exif": True, "mirrored": False},
+        }), encoding="utf-8")
+        with pytest.raises(yf.FaceInputError, match="质量门"):
+            M.build_face_runner(self._args(photo=str(photo), det=str(det)))
+
+    def test_photo_compression_failure_preflight(self, tmp_path, monkeypatch):
+        photo, det = photo_pair(tmp_path)
+
+        def bad(data, branch="compare", **kw):
+            raise yf.FaceCompressError("模拟压缩链失败")
+        monkeypatch.setattr(yf, "process_face_image", bad)
+        with pytest.raises(yf.FaceInputError, match="预检失败"):
+            M.build_face_runner(self._args(photo=str(photo), det=str(det)))
+
+    def test_broken_video_preflight_fails(self, tmp_path):
+        vid = self._vid(tmp_path)
+
+        def bad_provider(p):
+            raise yf.FaceInputError("视频无法打开: corrupt")
+        det = self._frames_det(tmp_path, vid)
+        with pytest.raises(yf.FaceInputError, match="预检失败"):
+            M.build_face_runner(self._args(video=str(vid), det=str(det)),
+                                frame_provider=bad_provider)
+
+    def test_wrong_source_video_annotation_rejected(self, tmp_path):
+        vid = self._vid(tmp_path)
+        det = self._frames_det(tmp_path, vid)
+        vid.write_bytes(b"\x01replaced")               # 换视频沿用同帧号标注
+        with pytest.raises(yf.FaceInputError, match="与实际视频不符"):
+            M.build_face_runner(self._args(video=str(vid), det=str(det)),
+                                frame_provider=lambda p: iter(self._frames()))
+
+    def test_video_annotation_without_sha_rejected(self, tmp_path):
+        vid = self._vid(tmp_path)
+        det = tmp_path / "d.nosha.json"
+        det.write_text(json.dumps({
+            "frames": {"1": {"box": list(BOX_PASS),
+                             "points": [list(p) for p in PTS_PASS],
+                             "score": 0.9, "space": "image"}},
+            "bind_apply": {"after_exif": True, "mirrored": False},
+        }), encoding="utf-8")
+        with pytest.raises(yf.FaceInputError, match="source_sha256"):
+            M.build_face_runner(self._args(video=str(vid), det=str(det)),
+                                frame_provider=lambda p: iter(self._frames()))
+
+    def test_annotated_frame_not_in_video_fails(self, tmp_path):
+        vid = self._vid(tmp_path)
+        det = self._frames_det(tmp_path, vid, frame_ids=(99,))   # 只有 2 帧
+        with pytest.raises(yf.FaceInputError, match="预检失败"):
+            M.build_face_runner(self._args(video=str(vid), det=str(det)),
+                                frame_provider=lambda p: iter(self._frames()))
+
+    def test_valid_video_frames_input_builds(self, tmp_path):
+        vid = self._vid(tmp_path)
+        det = self._frames_det(tmp_path, vid)
+        runner = M.build_face_runner(self._args(video=str(vid), det=str(det)),
+                                     frame_provider=lambda p: iter(self._frames()))
+        assert runner is not None and runner.detection.get(1) is not None
+
+    def test_valid_photo_caches_prepared_input(self, tmp_path):
+        photo, det = photo_pair(tmp_path)
+        runner = M.build_face_runner(self._args(photo=str(photo), det=str(det)))
+        assert runner.prepared is not None
+        _img, meta, face = runner.prepared
+        assert face.data and meta["source"] == "photo"
+        assert len(face.data) <= yf.MAX_BYTES
+
+
+# ============================================================ 二返修 S3
+class TestS3RequestTimeoutBudget:
+    def _client(self):
+        c = StubClient()
+        c.timeout = (5.0, 30.0)
+        seen = []
+
+        def cap(c2, r, kw):
+            seen.append(tuple(c2.timeout))
+            return {"code": 200, "msg": "ok",
+                    "data": {"status": "Y", "msg": "ok"}}
+        c.behavior = {"/run/appFace/runFaceInfoComparison": cap}
+        return c, seen
+
+    def test_connect_and_read_both_capped(self):
+        c, seen = self._client()
+        t = [1000.0]
+        v = yf.FaceVerifier(c, "7",
+                            cfg=yf.VerifierConfig(immediate_retries=0,
+                                                  pending_seconds=5),
+                            sleep=lambda s: t.__setitem__(0, t[0] + s),
+                            clock=lambda: t[0], deadline=t[0] + 0.3)
+        out = v.run(b"face")
+        assert out.state == "success"
+        assert seen and abs(seen[0][0] - 0.3) < 0.02 and seen[0][0] <= 0.3
+        assert seen[0][1] <= seen[0][0] + 1e-9 and seen[0][1] < 0.5  # 无 0.5s 下限
+
+    def test_tiny_budget_stops_without_request(self):
+        c, seen = self._client()
+        t = [1000.0]
+        v = yf.FaceVerifier(c, "7", cfg=yf.VerifierConfig(immediate_retries=0),
+                            sleep=lambda s: t.__setitem__(0, t[0] + s),
+                            clock=lambda: t[0], deadline=t[0] + 0.01)
+        out = v.run(b"face")
+        assert out.state == "expired"
+        assert seen == []                              # 一个请求都没发
+        assert any("below send floor" in x for x in v.trace)
+
+    def test_pending_success_beyond_phase_budget_dropped(self):
+        # 无窗口 deadline：等待阶段预算(pending_seconds)独立生效——请求耗时
+        # 使返回越过阶段截止的成功不采信（二返修 S3）。
+        t = [1000.0]
+        state = {"n": 0}
+
+        def flaky(c2, r, kw):
+            state["n"] += 1
+            if state["n"] == 1:
+                raise yh.HttpStatusException(500, "u", "x")   # 首传失败→等待态
+            t[0] += 8.0                                        # 慢请求 8s
+            return {"code": 200, "msg": "ok",
+                    "data": {"status": "Y", "msg": "ok"}}
+        c = StubClient()
+        c.behavior = {"/run/appFace/runFaceInfoComparison": flaky}
+        v = yf.FaceVerifier(c, "7",
+                            cfg=yf.VerifierConfig(immediate_retries=0,
+                                                  pending_seconds=10,
+                                                  resend_every=3),
+                            sleep=lambda s: t.__setitem__(0, t[0] + s),
+                            clock=lambda: t[0])
+        out = v.run(b"face")
+        assert out.state == "expired"
+        assert any("beyond pending-phase" in x for x in v.trace)
 
 
 
@@ -594,7 +859,7 @@ class TestR6DetectionBinding:
         det2.write_text(json.dumps({"box": list(BOX_PASS),
                                     "points": [list(p) for p in PTS_PASS]}),
                         encoding="utf-8")
-        with pytest.raises(yf.FaceInputError, match="未绑定"):
+        with pytest.raises(yf.FaceInputError, match="source_sha256"):
             M.build_face_runner(self._args(photo=str(photo), det=str(det2)))
 
     def test_bind_apply_must_match_mirror(self, tmp_path):

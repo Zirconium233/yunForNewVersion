@@ -493,13 +493,21 @@ class FaceVerifier:
             return self._expired_outcome()
         restore = None
         rem = self.remaining()
-        if rem is not None and self.client is not None and \
-                isinstance(getattr(self.client, "timeout", None), tuple):
-            orig = self.client.timeout
-            capped_read = max(0.5, min(float(orig[1]), rem))
-            if capped_read < float(orig[1]):
-                restore = orig
-                self.client.timeout = (orig[0], capped_read)
+        if rem is not None:
+            # 二返修 S3：极小预算直接停发，不用固定下限把预算撑大；
+            # 连接与读取两段都按剩余预算裁剪（timeout 参数≠整体截止，
+            # 回调截止检查仍保留在 _apply 与等待阶段核对中）。
+            if rem < REQ_SEND_MIN_S:
+                self.trace.append(f"attempt skipped: remaining {rem:.3f}s "
+                                  "below send floor")
+                return self._expired_outcome()
+            if self.client is not None and \
+                    isinstance(getattr(self.client, "timeout", None), tuple):
+                orig = self.client.timeout
+                capped = (min(float(orig[0]), rem), min(float(orig[1]), rem))
+                if capped != tuple(orig):
+                    restore = orig
+                    self.client.timeout = capped
         try:
             if self.cfg.attempt_fn is not None:
                 return self.cfg.attempt_fn(face_data)
@@ -575,6 +583,12 @@ class FaceVerifier:
                 break
             self.trace.append(f"pending resend elapsed={self._now() - start:.1f}s")
             outcome = wrap(self._attempt(face_data))
+            if outcome is not None and outcome.state == "success" and \
+                    self._now() > end:
+                # 二返修 S3：请求返回早于窗口总截止也不够——越过
+                # 等待阶段预算（pending_seconds）的成功不采信。
+                self.trace.append("success beyond pending-phase budget dropped")
+                return self._expired_outcome()
             if outcome is None or outcome.state != "transport_failed":
                 return outcome or FaceOutcome("session_terminated")
             next_fire += self.cfg.resend_every
@@ -850,6 +864,8 @@ class FaceRunner:
         self._sleep = sleep or time.sleep
         self.voice_lead = voice_lead
         self._log = log or (lambda s: None)
+        # S2：预检完成的有效输入缓存 (image, meta, FaceImageOutput)
+        self.prepared = None
 
     def _detect(self, image, frame_index: Optional[int] = None) -> Optional[FaceDetection]:
         """检测解析：FaceDetection（静态）、callable(image)、dict{帧号: FaceDetection}。
@@ -916,21 +932,29 @@ class FaceRunner:
             self._sleep(lead)
         if _expired():
             return _out_expired("语音引导阶段")
-        image, meta = (self.source.select(lambda img, idx: self._gate_for_video(img, idx))
-                       if isinstance(self.source, VideoFrameSource)
-                       else self.source.load())
-        self._last_meta = meta
-        if _expired():
-            return _out_expired("取源阶段")
-        try:
-            face = self.build_face_image(image, meta)
-        except FaceInputError as exc:
+        prepared = getattr(self, "prepared", None)
+        if prepared is not None:
+            # 二返修 S2：预检阶段已把照片走完"解码→检测匹配→取景门→最终压缩"，
+            # 窗口执行直接复用缓存输入，不再中途撞上必然失败的预处理。
+            image, meta, face = prepared
+            self._last_meta = meta
+            self._log("[face] 使用预检完成的有效输入（照片缓存复用）")
+        else:
+            image, meta = (self.source.select(lambda img, idx: self._gate_for_video(img, idx))
+                           if isinstance(self.source, VideoFrameSource)
+                           else self.source.load())
+            self._last_meta = meta
             if _expired():
-                return _out_expired("预处理阶段")
-            window.upload_success = ""
-            window.compare_success = "N"
-            window.reason = str(exc)
-            return FaceOutcome("compare_failed", msg=str(exc))
+                return _out_expired("取源阶段")
+            try:
+                face = self.build_face_image(image, meta)
+            except FaceInputError as exc:
+                if _expired():
+                    return _out_expired("预处理阶段")
+                window.upload_success = ""
+                window.compare_success = "N"
+                window.reason = str(exc)
+                return FaceOutcome("compare_failed", msg=str(exc))
         if _expired():
             return _out_expired("预处理阶段")
         verifier = FaceVerifier(client, record_id, cfg=verifier_cfg,
@@ -962,6 +986,10 @@ class FaceRunner:
         if res.ok and det.score < MANUAL_SHOT_MIN_SCORE:
             return GateResult(False, f"score {det.score} 低于手动拍摄门")
         return res
+
+
+# 二返修 S3：剩余预算低于该下限则不再发起请求（固定 0.5s 下限会把预算撑大，已废弃）
+REQ_SEND_MIN_S = 0.05
 
 
 def load_detection_json(path: str) -> FaceDetection:
@@ -1020,6 +1048,36 @@ def load_detection_bundle(path: str) -> DetectionBundle:
                            bind_apply=d.get("bind_apply"))
 
 
+def sha256_file(path: str) -> str:
+    """大文件流式哈希（二返修 S2：内容身份校验，路径字符串不算）。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def verify_content_binding(bundle: DetectionBundle, raw: bytes, path: str,
+                           kind: str = "photo") -> None:
+    """二返修 S2：绑定必须是内容哈希（source_sha256）。
+
+    source_path 只能核对"文件名相同"，无法识别同路径文件被替换，不是有效的
+    内容身份；保留为辅助一致性检查，但单独存在即拒绝。
+    """
+    if not bundle.source_sha256:
+        raise FaceInputError(
+            f"{kind}标注缺少 source_sha256（内容哈希）绑定：路径字符串不是内容"
+            "身份（同路径文件可能被替换），拒绝宣称标注对应当前文件内容")
+    got = hashlib.sha256(raw).hexdigest()
+    if got != bundle.source_sha256:
+        raise FaceInputError(
+            f"{kind}标注 source_sha256 与实际文件不符（{got[:12]}… != "
+            f"{bundle.source_sha256[:12]}…）：过期/错源标注，拒绝当作检测成功")
+    if bundle.source_path and os.path.abspath(bundle.source_path) != os.path.abspath(path):
+        raise FaceInputError(
+            f"{kind}标注 source_path 与当前输入不一致：{bundle.source_path} != {path}")
+
+
 def verify_photo_binding(bundle: DetectionBundle, raw: bytes, path: str) -> None:
     """照片标注必须绑定具体来源文件（Rework R6）：sha256 或规范化路径一致。
 
@@ -1029,16 +1087,7 @@ def verify_photo_binding(bundle: DetectionBundle, raw: bytes, path: str) -> None
     """
     if bundle.static is None:
         raise FaceInputError("照片源需要静态检测标注（static 或旧版单标注格式）")
-    if not bundle.source_sha256 and not bundle.source_path:
-        raise FaceInputError(
-            "照片标注未绑定来源：请在标注 JSON 提供 source_sha256 或 source_path，"
-            "并用 bind_apply 声明坐标是否按摆正/镜像后的图像标注")
-    if bundle.source_sha256:
-        got = hashlib.sha256(raw).hexdigest()
-        if got != bundle.source_sha256:
-            raise FaceInputError(
-                f"照片标注 source_sha256 与实际文件不符（{got[:12]}… != "
-                f"{bundle.source_sha256[:12]}…）：过期/错图标注，拒绝当作检测成功")
+    verify_content_binding(bundle, raw, path, kind="photo")
     if bundle.source_path and os.path.abspath(bundle.source_path) != os.path.abspath(path):
         raise FaceInputError(
             f"照片标注 source_path 与当前输入不一致：{bundle.source_path} != {path}")

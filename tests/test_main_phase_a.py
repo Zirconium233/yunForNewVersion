@@ -84,7 +84,8 @@ def test_loader_preserves_run_step(loaded):
     yun.do_by_points_map(path=TASKS, random_choose=True, isDrift=False)
     splits = [c for c in fake.calls
               if urlparse(c["url"]).path.endswith("/run/splitPointCheating")]
-    assert len(splits) == 2  # 12 点 / split_count 10 => 10 + 2
+    # 二返修 S1：尾批（2 点）暂存，批末不再无条件发送——do 后只有 1 个 split
+    assert len(splits) == 1
     body = json.loads(gzip.decompress(
         yh.decrypt_sm4(splits[0]["envelope"]["content"],
                        base64.b64decode(splits[0]["sm4_key_b64"]))).decode())
@@ -92,6 +93,20 @@ def test_loader_preserves_run_step(loaded):
     assert p0["runStep"] == 0
     assert p0["runMileage"] == 0.0
     assert "ts" in p0
+    # 结束链：状态检查 → 尾批补发 → finish（完整顺序断言）
+    yun.finish_by_points_map()
+    paths = [urlparse(c["url"]).path for c in fake.calls]
+    idx_split = [i for i, p in enumerate(paths)
+                 if p.endswith("/run/splitPointCheating")]
+    idx_std = [i for i, p in enumerate(paths) if p.endswith("/run/isStandard")]
+    idx_fin = [i for i, p in enumerate(paths) if p.endswith("/run/finish")]
+    assert len(idx_split) == 2 and len(idx_std) == 1 and len(idx_fin) == 1
+    assert idx_split[0] < idx_std[0] < idx_split[1] < idx_fin[0]
+    tail = json.loads(gzip.decompress(
+        yh.decrypt_sm4(fake.calls[idx_split[1]]["envelope"]["content"],
+                       base64.b64decode(
+                           fake.calls[idx_split[1]]["sm4_key_b64"]))).decode())
+    assert len(tail["cardPointList"]) == 2   # 12 点 / split_count 10 => 10 + 2
 
 
 # ---------------------------------------------------------------- dry-run（§3-A.5）

@@ -44,7 +44,7 @@ dry_run_home.json  --dry-run 的 getHomeRunInfo 假响应
 
 **两层重试语义**：通用 HTTP 层（yun_http）对任何失败都不自动重放，调用方按“结果未知”报告；唯一的例外是人脸比对业务状态机（FaceVerifier，APK L()/Z() 等价），且其重试受窗口单调时钟预算约束、终端结果（compare_failed/expired）绝不重试。
 
-**业务 code 即终端（返修 R3）**：split/finish 解析 HTTP 200 里的业务 code，code!=200 → `BusinessException` 传播即停止——后续 split/finish 一律不再发送，报告保留 recordId 与最后确认位置。finish 受理（code=200）后按 APK 结束链以同一 P1 体调用 `run/isStandard`（API.java:343-344，call site :1836）并解析呈报 `isStandard/isCheat/msg`（查询失败如实报“有效性未确认”，不谎报）。
+**业务 code 即终端（返修 R3）**：split/finish 解析 HTTP 200 里的业务 code，code!=200 → `BusinessException` 传播即停止——后续 split/finish 一律不再发送，报告保留 recordId 与最后确认位置。结束链顺序（二返修 S1 修正）：先以同一 P1 体调 `run/isStandard` 做状态检查（API.java:343-344；SportRunMapActivity.java:2798 T1 先 checkRunState，b0 回调 :481-514 仅 code=200 才决定 sendLastPoints 或 S1，S1 :2775 才 runToFinish）→ 通过后补发缓存的尾批 → 最后发 finish；检查失败/未知/返回 url/list 的未移植分支 → 尾批与 finish 均不发送。此前"finish 后查询"的顺序与依据（:1836）不成立，已撤回。
 
 ## 3. 线上载荷投影（服务器可见字段对齐层）
 
@@ -77,7 +77,9 @@ FaceRunner.run_window             语音提前 4s → 取源帧 → 检测框 �
 PhotoSource / VideoFrameSource    方案1 照片 / 方案2 视频选帧（frame_provider 可注入，
                                   不硬依赖 opencv）；视频门按 (image, frame_index)
                                   逐帧判检测——静态单标注不能冒充每帧检测（R6）；
-                                  照片标注必须绑定文件哈希/路径 + bind_apply 坐标约定
+                                  照片标注必须按内容哈希 source_sha256 绑定（仅路径不算）+ bind_apply
+                                  坐标约定；照片预检走完解码→检测→取景门
+                                  →最终压缩并缓存复用（二返修 S2）
 process_face_image(branch)        compare/register/timeout 三分支独立：
                                   EXIF 仅 3/6/8 旋转；仅宽>720 缩 720/q90（高度
                                   取整=Java Math.round 正数 half-up）；
@@ -90,7 +92,9 @@ quality_gate / check_framing      K()(:531-602) 逐条同序同阈值；
 FaceVerifier.run                  首传 → ≤3 次立即重试(1s，间隔裁剪进剩余预算) →
                                   等待期每 3s 复用同一文件重发——按单调时钟经过
                                   时间计（网络耗时计入），上界 min(pending_seconds,
-                                  deadline)；请求读超时临时压进剩余预算；越界/迟到
+                                  deadline)；connect/read 两段超时都压进剩余预算
+                                  （剩余 <0.05s 直接停发；timeout≠整体截止，
+                                  回调后仍核对窗口+等待阶段两道截止）；越界/迟到
                                   的成功回调丢弃 → expired；
                                   code=200 且 status!=Y 为终端 compare_failed（不重试）
 windows_from_random_list          窗口构造（idStr = recordId+序号）
@@ -121,7 +125,7 @@ recover_unfinished                o2(:3337-3368) 断点恢复分类（纯函数�
 | test_yun_http.py | 密码 golden 向量、SM2 24 样本多 k 交叉验证、信封/解码/脱敏 |
 | test_wire_alignment.py | 服务器可见字段集合/类型/顺序、HTTP 头、gzip 容器头字节 |
 | test_main_phase_a.py / test_phase_a_fixes.py | 会话流程、登录连续性、canSport/faceTime、CLI 契约 |
-| test_rework_final.py | 返修 R1-R6 回归：逐点窗口事件、预算截止、业务拒绝终止、步骤同包一致、压缩目标对象、标注绑定 |
+| test_rework_final.py | 返修 R1-R6 回归：逐点窗口事件、预算截止、业务拒绝终止、步骤同包一致、压缩目标对象、标注绑定；二返修 S1 结束链顺序、S2 全量预检、S3 超时预算 |
 | test_yun_face.py | 质量门几何、图像链、比对状态机、窗口调度、照片→线上格式 E2E |
 
 命名约束：自动验收产物只叫 `offline_client_compatibility`；测试反向锁死
@@ -143,6 +147,9 @@ recover_unfinished                o2(:3337-3368) 断点恢复分类（纯函数�
    不随仓库分发）。
 
 8. finish 前的“窗口完整性检查”（实际经过范围内存在未弹/未确认窗口即拒绝 finish）是比 APK 更严格的脚本策略；APK 对应路径会走提交链。
+9. 窗口触发时序：每批上传后批内逐点评估，非 APK 的按轨迹时间独立推进；
+   同批内弹窗时刻受批次节奏影响（漏窗防护已兜底，时序差异如实记录）。
+10. 结束链 isStandard 返回 url/list 的后续处理分支不支持：明确停止不猜测。
 
 ## 8. 维护提示
 

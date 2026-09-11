@@ -990,7 +990,8 @@ class Yun_For_New:
                 self._face_guard("splitPoint 批次上传")   # R2：人脸阻断后不再发任何请求
                 self.split_by_points_map(points)
                 self._last_confirmed_mileage_m = int(float(points[-1]['runMileage']))
-                # 返修 R1：距离事件逐轨迹点推进（与网络批次解耦），
+                # 返修 R1：距离事件在批内逐轨迹点评估——时序仍与批次
+                # 耦合（非按轨迹时间独立推进，见文档残留偏差）；
                 # 首批/尾批跨窗不再依赖批末单点。
                 for p in points:
                     self._face_on_mileage(float(p['runMileage']))
@@ -1000,13 +1001,17 @@ class Yun_For_New:
                 count = 0
                 points = []
         if count != 0:
-            self._face_guard("splitPoint 尾批上传")
-            self.split_by_points_map(points)
-            self._last_confirmed_mileage_m = int(float(points[-1]['runMileage']))
+            # 二返修 S1：尾批不再于批末无条件发送。APK 结束链：checkRunState
+            # （API.java:343-344 映射 /run/isStandard）先发起
+            # （SportRunMapActivity.java:2798 T1），b0 回调（:481-514）仅在
+            # code=200 时决定 sendLastPoints 或 S1，S1（:2775）才 runToFinish。
+            # 尾批在此缓存，由 finish 链在 isStandard 状态检查通过后补发。
+            # 窗口距离事件照常逐点推进（时序仍与批次耦合，见文档偏差记录）。
+            self._pending_tail_points = points
             for p in points:
                 self._face_on_mileage(float(p['runMileage']))
-            count = 0
-            points = []
+            print(f"[尾批] 暂存尾部 {len(points)} 点，未在批末发送；"
+                  "将由 finish 链按『状态检查 → 尾批 → finish』顺序处理")
 
     def split_by_points_map(self, points):
         self._face_guard("splitPoint 批次上传")   # R2：任何入口直接调用同样被拦截
@@ -1023,7 +1028,6 @@ class Yun_For_New:
         # 返修 R1/R2：finish 前必须过窗口完整性检查与会话阻断检查
         self._face_guard("finish")
         self._face_check_complete_before_finish()
-        print('发送结束信号...')
         data = _build_finish_body(
             record_mileage_km=self.task_map['data']['recordMileage'],
             recode_cadence=self.task_map['data']['recodeCadence'],
@@ -1037,16 +1041,26 @@ class Yun_For_New:
             duration_s=self.task_map['data']['duration'],
             record_start_time=self.recordStartTime,
         )
+        # 二返修 S1：状态检查（isStandard，同一 P1 体）→ 必要尾批 → finish，
+        # 对齐 APK checkRunState 先行、b0 code=200 才 sendLastPoints/S1 的顺序；
+        # 检查失败/未知/不支持分支 → 不发尾批也不发 finish（上方已 raise）。
+        std = self._finish_state_check(data)
+        tail = getattr(self, "_pending_tail_points", None)
+        if tail:
+            print(f"[finish链] 发送尾批 {len(tail)} 点（APK sendLastPoints 位置）...")
+            self._face_guard("splitPoint 尾批上传（结束链）")
+            self.split_by_points_map(tail)
+            self._last_confirmed_mileage_m = int(float(tail[-1]['runMileage']))
+            self._pending_tail_points = []
+        print('发送结束信号...')
         obj = self._post_checked("/run/finish", json.dumps(data))
         print('  ' + json.dumps(redact(obj), ensure_ascii=False))
-        print("[finish] 服务端已受理本次结束请求（code=200）。成绩是否有效不作担保，"
-              "随后按 APK 结束链查询 isStandard。")
-        self._post_finish_is_standard(data)
+        print("[finish] 服务端已受理本次结束请求（code=200）。成绩有效性以上方 "
+              "isStandard 预检呈报为准（判定语义未线上验证）")
 
     def finish(self):
         self._face_guard("finish")
         self._face_check_complete_before_finish()
-        print('发送结束信号...')
         data = _build_finish_body(
             record_mileage_km=self.now_dist / 1000,
             recode_cadence=random.randint(self.raCadenceMin, self.raCadenceMax),
@@ -1060,36 +1074,53 @@ class Yun_For_New:
             duration_s=self.now_time,
             record_start_time=self.recordStartTime,
         )
+        # 二返修 S1：状态检查（isStandard，同一 P1 体）→ 必要尾批 → finish，
+        # 对齐 APK checkRunState 先行、b0 code=200 才 sendLastPoints/S1 的顺序；
+        # 检查失败/未知/不支持分支 → 不发尾批也不发 finish（上方已 raise）。
+        std = self._finish_state_check(data)
+        tail = getattr(self, "_pending_tail_points", None)
+        if tail:
+            print(f"[finish链] 发送尾批 {len(tail)} 点（APK sendLastPoints 位置）...")
+            self._face_guard("splitPoint 尾批上传（结束链）")
+            self.split_by_points_map(tail)
+            self._last_confirmed_mileage_m = int(float(tail[-1]['runMileage']))
+            self._pending_tail_points = []
+        print('发送结束信号...')
         obj = self._post_checked("/run/finish", json.dumps(data))
         print('  ' + json.dumps(redact(obj), ensure_ascii=False))
-        print("[finish] 服务端已受理本次结束请求（code=200）。成绩是否有效不作担保，"
-              "随后按 APK 结束链查询 isStandard。")
-        self._post_finish_is_standard(data)
+        print("[finish] 服务端已受理本次结束请求（code=200）。成绩有效性以上方 "
+              "isStandard 预检呈报为准（判定语义未线上验证）")
 
-    def _post_finish_is_standard(self, data):
-        """APK 结束链在 finish 回调后以同一 P1(d2,false) 体调用
-        run/isStandard（API.java:343-343 call site SportRunMapActivity:1836）。
+    def _finish_state_check(self, data):
+        """二返修 S1：结束链的 checkRunState → run/isStandard（API.java:343-344）
+        在 finish 之前发起——SportRunMapActivity.java:2798（T1 先调 checkRunState）、
+        b0 回调 :481-514（仅 code=200 才决定 sendLastPoints 或 S1）、S1 :2775
+        （才 runToFinish）。此前引用的 :1836（B1）同样只是 checkRunState 调用点，
+        不构成"finish 后查询"依据——原方法注释的依据不成立，已撤回。
 
-        返修 R3：查询结果必须解析并如实呈报，不允许"发一个不看结果的请求"；
-        查询本身失败不掩盖（报告"有效性未确认"），也不谎报成功。
+        处置：
+        - HTTP 失败/解码失败/业务 code!=200 → 呈报停止信息并重抛：
+          尾批与 finish 一律不再发送。
+        - code=200 → RunStateBean 字段原样呈报（isStandard/isCheat/msg；
+          判定语义未线上验证，不据此宣称成绩有效）。
+        - url/list 非空 = 服务端给出本脚本未移植的分支（补拍/复核等）：
+          明确停止，不发尾批不 finish，不假装支持。
         """
         try:
-            if hasattr(self.client, "post_json"):
-                obj = self.client.post_json("/run/isStandard", json.dumps(data))
-            else:                       # 鸭子客户端等价路线（测试桩）
-                obj = json.loads(self.client.post("/run/isStandard", json.dumps(data)))
-        except (HttpStatusException, DecodeException) as exc:
-            print(f"[isStandard] 查询结果未知（{type(exc).__name__}）："
-                  "服务端是否判定成绩有效未确认，请查历史记录。")
-            return
-        if obj.get("code") != 200:
-            print(f"[isStandard] 服务端拒绝查询（code={obj.get('code')} "
-                  f"msg={obj.get('msg')!r}）：不报告'结束成功且有效性已确认'。")
-            return
+            obj = self._post_checked("/run/isStandard", json.dumps(data))
+        except (HttpStatusException, DecodeException, BusinessException) as exc:
+            print(f"[isStandard] 状态检查失败/未知（{type(exc).__name__}）："
+                  "不发送尾批、不发送 finish。本次未走结束链结束。")
+            raise
         d = obj.get("data") or {}
-        print(f"[isStandard] isStandard={d.get('isStandard')!r} "
+        print(f"[isStandard 预检] isStandard={d.get('isStandard')!r} "
               f"isCheat={d.get('isCheat')!r} msg={d.get('msg')!r}"
               "（字段=RunStateBean；服务端判定语义未线上验证，原样呈报）")
+        if d.get("url") or d.get("list"):
+            raise FaceRunStopError(
+                "run/isStandard 返回 url/list（服务端要求后续处理的分支），该分支"
+                "暂不支持：明确停止，不发送尾批、不发送 finish。")
+        return d
 
 
 def dry_run_responder(home_fixture: dict, face_status: str = "Y",
@@ -1144,18 +1175,21 @@ def _check_bind_apply(bundle, mirrored: bool):
             f"{mirrored!r} 不一致：坐标系矛盾，拒绝")
 
 
-def build_face_runner(args, sleep=None):
+def build_face_runner(args, sleep=None, frame_provider=None):
     """按 CLI 输入构建 yun_face.FaceRunner；未提供源返回 None。
 
     用 getattr 读取 face_* 参数，兼容旧调用方自造的 argparse.Namespace。
 
-    Rework R6（预检在任何真实网络请求之前——本函数在 Yun 构造/start 前被调用，
-    失败即未发出任何 start/split）：
-    - 照片：标注必须绑定该文件（source_sha256/source_path）并声明 bind_apply
-      坐标约定；未绑定/哈希不符/与镜像预处理矛盾 → 预检失败。
-    - 视频：必须提供逐帧标注 frames。本轮未移植检测模型（RetinaFace 在
-      deferred 清单），没有逐帧检测能力就在预检失败，不允许拿一份静态
-      标注冒充每帧检测、也不允许运行中选中无标注帧。
+    Rework R6 + 二返修 S2（预检在任何真实网络请求之前——本函数在
+    Yun 构造/start 前被调用，失败即未发出任何 start/split）：
+    - 照片：标注必须按内容哈希（source_sha256）绑定该文件——路径字符串不是
+      内容身份，仅 path 不算绑定；并声明 bind_apply 坐标约定。预检走完
+      "解码→检测匹配→取景质量门→最终上传图像准备"，通过则缓存复用。
+      无标注的照片输入直接预检失败（不再只打印提示放行到 start 之后）。
+    - 视频：逐帧标注 frames + 按内容哈希绑定该视频文件（换视频沿用同帧号
+      标注会被拒绝）。预检执行真实选帧链（解码→逐帧标注→质量门→压缩形态；
+      注入 frame_provider 同样必经，不允许绕过预检）。人工逐帧标注模式，
+      不声称自动检测（RetinaFace 未移植）。
     """
     face_photo = getattr(args, "face_photo", None)
     face_video = getattr(args, "face_video", None)
@@ -1171,8 +1205,10 @@ def build_face_runner(args, sleep=None):
     if face_detection:
         bundle = yun_face.load_detection_bundle(resolve_cli_path(face_detection))
     else:
-        print("[face] 未提供 --face-detection 标注：取景质量门将因无检测结果按失败处理"
-              "（不以“图里有人脸”替代客户端姿态门）。")
+        raise yun_face.FaceInputError(
+            "人脸源必须配合 --face-detection 标注：检测模型未移植，没有检测结果"
+            "时取景质量门必然失败。二返修 S2：这种必然失败的输入不再推迟到 "
+            "start 之后——预检失败，未发出任何请求")
     if face_video:
         vp = resolve_cli_path(face_video)
         if not os.path.isfile(vp):
@@ -1183,28 +1219,60 @@ def build_face_runner(args, sleep=None):
                 "检测模型未移植：没有逐帧标注能力时按预检失败停止，不用静态单标注"
                 "冒充每帧检测。")
         _check_bind_apply(bundle, face_mirror)
-        try:
-            import cv2  # noqa: F401 —— 默认抽帧路径依赖，缺失必须预检失败
-        except ImportError as exc:
+        want = bundle.source_sha256
+        if not want:
             raise yun_face.FaceInputError(
-                "视频源默认抽帧需要 opencv-python（未安装）：预检失败，未发出任何请求"
-            ) from exc
+                "视频标注缺少 source_sha256（内容哈希）绑定：路径与帧号不是内容"
+                "身份，换视频沿用同帧号标注必须被拒绝（二返修 S2）")
+        got = yun_face.sha256_file(vp)
+        if got != want:
+            raise yun_face.FaceInputError(
+                f"视频标注 source_sha256 与实际视频不符（{got[:12]}… != {want[:12]}…）："
+                "错源视频标注，预检失败，未发出任何请求")
+        if frame_provider is None:
+            try:
+                import cv2  # noqa: F401 —— 默认抽帧路径依赖，缺失必须预检失败
+            except ImportError as exc:
+                raise yun_face.FaceInputError(
+                    "视频源默认抽帧需要 opencv-python（未安装）：预检失败，未发出任何请求"
+                ) from exc
         detection = dict(bundle.frames)
-        source = yun_face.VideoFrameSource(vp, mirror=face_mirror)
+        source = yun_face.VideoFrameSource(vp, frame_provider=frame_provider,
+                                           mirror=face_mirror)
+        runner = yun_face.FaceRunner(source, detection=detection,
+                                     sleep=sleep or time.sleep)
+        # 二返修 S2：真实选帧链预检（解码→逐帧标注匹配→取景门→最终压缩形态）。
+        # 注入 provider 也必经这段预检，不允许绕过 build_face_runner 后宣称完成。
+        try:
+            v_img, v_meta = source.select(
+                lambda img, idx: runner._gate_for_video(img, idx))
+            runner.build_face_image(v_img, v_meta)
+        except yun_face.FaceInputError as exc:
+            raise yun_face.FaceInputError(
+                f"视频源预检失败（不存在解码成功且标注/质量门通过的帧）：{exc} —— "
+                "未发出任何请求") from exc
+        return runner
     else:
         pp = resolve_cli_path(face_photo)
         if not os.path.isfile(pp):
             raise yun_face.FaceInputError(f"照片源文件不存在: {pp}（预检失败，未发出任何请求）")
         with open(pp, "rb") as f:
             raw = f.read()
-        if bundle is not None:
-            yun_face.verify_photo_binding(bundle, raw, pp)
-            _check_bind_apply(bundle, face_mirror)
-        detection = bundle.static if bundle is not None else None
+        yun_face.verify_photo_binding(bundle, raw, pp)
+        _check_bind_apply(bundle, face_mirror)
         source = yun_face.PhotoSource(pp, mirror=face_mirror)
-        source.load()   # 预检：文件可解码（坏图在 start 前失败，不跑完再报）
-    return yun_face.FaceRunner(source, detection=detection,
-                               sleep=sleep or time.sleep)
+        runner = yun_face.FaceRunner(source, detection=bundle.static,
+                                     sleep=sleep or time.sleep)
+        # 二返修 S2：完整预检——解码/EXIF/镜像 → 标注匹配 → 取景质量门 →
+        # 最终上传图像准备；任何一步失败都在 start 之前停止，通过则缓存复用。
+        try:
+            p_img, p_meta = source.load()
+            p_face = runner.build_face_image(p_img, p_meta)
+        except yun_face.FaceInputError as exc:
+            raise yun_face.FaceInputError(
+                f"照片源预检失败：{exc} —— 未发出任何请求") from exc
+        runner.prepared = (p_img, p_meta, p_face)
+        return runner
 
 
 def run_dry(cfg_path: str, task_path: str, args):
