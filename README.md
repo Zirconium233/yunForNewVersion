@@ -1,57 +1,81 @@
-### 寄了
+### 寄了，但是没完全寄
 
-没想到这套AI时代之前的代码，能在无维护的情况撑一年，最后倒在了3.6.4的人脸上面，详见[issue](https://github.com/Zirconium233/yunForNewVersion/issues/78) 
+~没想到这套AI时代之前的代码，能在无维护的情况撑一年，最后倒在了3.6.4的人脸上面，详见[issue](https://github.com/Zirconium233/yunForNewVersion/issues/78)~
+~这个项目大概率是死了，我会尝试去收集一下新版本云运动的人脸相关信息，看看能否用比较合适的方式解决。~
+~- 如果搞不定，项目会转为archived，不推荐fork，参考解密的实现方式即可，fork反而拉低AI的代码质量。（要是搞定了一定要开源啊，别闭源拿去卖钱了！）~
+~- 如果能搞定，我会更新项目的。（欢迎勇士提供有跑步任务的账号，作为人脸过验证的实验田）~
 
-学长已经大四了，云运动里面没有任何跑步任务，连包的抓不了，已经失去维护项目的条件了 T_T
+学长已经大四了，云运动里面没有任何跑步任务，连包的抓不了，已经失去维护项目的条件了 T_T 不过静态分析还是可行的。
 
-这个项目大概率是死了，我会尝试去收集一下新版本云运动的人脸相关信息，看看能否用比较合适的方式解决。
-- 如果搞不定，项目会转为archived，不推荐fork，参考解密的实现方式即可，fork反而拉低AI的代码质量。（要是搞定了一定要开源啊，别闭源拿去卖钱了！）
-- 如果能搞定，我会更新项目的。（欢迎勇士提供有跑步任务的账号，作为人脸过验证的实验田）
+以下关于人脸的分析全部基于反编译（3.6.6版本apk），由GPT-6 Astra逐条核实。
+
+#### 1. 触发时间：谁决定什么
+
+**服务端决定全部要素，客户端只做"距离到达→弹窗"的执行**，且服务端从不推送"现在弹"的指令。决策链分四层：
+
+| 层 | 包 | 决定 |
+|---|---|---|
+| 启用与否 | `run/getHomeRunInfo`（任务列表）响应 | 该跑步区域本次任务是否启用人脸（`runFaceStatus`） |
+| 跑点与预算 | `/run/start` 响应 | 本次会话每个人脸校验点的**距离位置**（`randomList`，服务端随机下发）和单窗倒计时（`faceTime`） |
+| 账号准入 | `run/getRlStatus` 响应 | 账号人脸注册状态（N1 时连正版 APP 都拒绝开跑） |
+| 结果判定 | `run/appFace/runFaceInfoComparison` 响应 | 单次比对通过与否（`data.status=="Y"`） |
+
+客户端侧的"触发时刻"= 累计里程跨过 `randomList` 某项（弹窗前有 4s 语音引导；弹窗后的总预算 = `faceTime+4` 秒）。服务端事后对整条记录做核验，其核验算法离线不可见，只能尽可能模仿客户端的行为。
+
+#### 2. 相关配置参数（包 → 参数 → 功能）
+
+**决定人脸行为的全部字段**
+
+| 端点/方向 | 字段 | 语义 | APK 消费点 | 我方实现 |
+|---|---|---|---|---|
+| `run/getHomeRunInfo` 响应 `data.cralist[]` | `runFaceStatus` "Y"/"N" | **人脸验证唯一启用开关**（区域任务级） | NewRunningFragment:1079 启动前分支；SportRunMapActivity:4314 `B1="Y".equals(...)`、:3056 `N0.setNeedFace` | main.py:796-797 明示"faceTime 不是开关"；N=完全不执行 |
+| 同上 | `raRunArea`/`id`/`raDislikes`/`raSingleMileageMin/Max`/`raCadenceMin/Max`/`points` | 任务基准（区域、踩点数、里程/步频约束、围栏点）；randomList 取值范围落在里程区间内 | 任务卡片→start | 打表与守卫上下文用 |
+| `run/getRlStatus` 请求 `{raRunArea}` 响应 `data.runFaceStudentStatus` | Y=注册通过可跑；N=未注册（APP 强制先去 `runFaceInfo` 采集）；N0=认证失败重采；**N1=审核中，禁止跑步** | NewRunningFragment:929-932 构造、:640-698 四分支 | 仅 `live_probe.py` L1 只读探测（退出码 0/5 区分 Y/非Y）；正式跑流程不调用 |
+| `/run/start` 响应 `data.id` | crsRunRecordId（字符串）——比对包 `recordId` 唯一来源 | 结束链/比对共用 | `build_compare_body` 强转 str |
+| 同响应 `faceTime`（int，秒） | 单窗口倒计时；**APK 对 <10 的值夹到 10**（:787-788 `if(K1<10)K1=10`）；窗口总预算 `faceTime+4`（:1500、:2172 `(K1+4)*1000`、:3344） | start 回调 f0；断点续跑从本地 RunTaskModel.FaceTime 恢复（:3126） | `yun_face.FACE_TIME_FLOOR=10`（main.py:803-804 同下限）；**Y 任务 faceTime 缺失/非法 → 拒绝执行**（:812-815，不默认放行） |
+| 同响应 `randomList`（List\<Double\>，km） | 本次人脸校验点距离列表；每项生成一个窗口：`FaceRunWindowBean{idStr=recordId+序号, window=值, isShow="N", ...}`（a2() :2989-3012，落 GreenDao） | MAP:786、a2() | `windows_from_random_list`（main.py:818）；**Y 任务 randomList 缺失 → 停止**（:808-810）；int(km×1000) 米制跨越判定 |
+| `/run/appFace/runFaceInfoComparison` 响应 `data.status`/`msg` | Y=该窗口通过（唯一记成功值）；非 Y=终端失败不重试；code≠200/HTTP/解码=可重试的传输失败 | JTFaceCompareActivity:737/845、f:370、L():607-611、3004 | `compare_once`/`FaceVerifier` 逐态对齐 |
+| `/run/isStandard` 响应 `data.isStandard/isCheat/msg/url/list` | 结束前有效性预检；**`url/list` 非空 = 服务端要求补拍/复核**（人脸关联分支） | b0 回调 :481-514 | `_finish_state_check`：非200/解码失败/超时→尾批+finish 不发；url/list→明确停止 |
+
+**客户端本地字段（不上行，但是"完成度"的依据）**：`FaceRunWindowBean` 的 `voiceSecond/voiceTime`（弹窗时刻）、`uploadSuccess/compareSuccess/reason`——正版靠它+GreenDao 做断点续跑；我们可以用同构跟踪（`WindowTrigger` + 窗口记账）支撑守卫。config.ini `[Run]` 全部与人脸无关；`[User].legacy_uuid` 仅协议回退。
+
+#### 3. 当前的核心对策
+
+- **参数严格性**：开关只认 `runFaceStatus`；Y 任务缺 `faceTime`/`randomList` 直接拒绝；faceTime 下限 10 与 APK 一致；N 任务带窗口参数只提示不执行。
+- **W1 事件语义等价**：起点基线 0（首批跨窗不漏）、`int(window_m)` 边界算跨越、非单调忽略、每窗一次、在途互斥（在途漏跨与 APK 相同不补偿）；其上叠加自加护栏——finish 前完整性检查（范围内任何窗口未弹/未确认 → 拒绝 finish）+ expired 窗口拦截后续 split/finish。
+- **时钟与预算**：双轨（utc/sign 走 epoch，一切预算走 client.mono）；重试状态机对齐 a0（会话终止丢弃）、f:370（3 次即时间隔 1s + 等待期每 3s 复用同图、30s 耗尽报 3004）；`faceTime+4` 与 `pending_seconds` 两道截止，**恰好压线或越界的成功一律丢弃**（reviewer 小修后连请求的 connect/read 裁剪都按阶段剩余预算，<0.05s 直接停发）。
+- **图像链**：EXIF 摆正→镜像声明→限宽 720（不限长边）→质量阶梯 80..20 压至 ≤150KB，与 FaceImageCompressor 逐字节对齐；取景质量门（人脸占比/俯仰/偏航/滚转）复刻相机 UI 提交前门；内容哈希（sha256）绑定 + 全量预检（解码→标注匹配→质量门→最终压缩形态）在 **start 之前**完成并缓存（照片与视频预检帧均锁死为已验证内容，运行中换源文件不影响上传）。
+- **比对上传**：两键体 `{faceBaseData, recordId}` 逐字对齐；只有 `data.status=="Y"` 记成功；成功以外的终端失败不重试。
+- **结束链**：isStandard 前置门——失败/未知/`url/list`（补拍分支）时尾批与 finish 都不发，不猜测服务端后续流程。
+- **边界与诚实**：人脸采集链（`runFaceInfo`）有意不实现不自动调用（真人审核材料，代发=伪造）；准入状态用只读 `live_probe.py` 先行探测；服务端复核语义未线上验证（概率分层表见 README §2）；全部离线可证部分由 155 项测试覆盖（含禁网守卫复跑）。
+
+#### 4. 如何使用最新的实现
+
+**注意：最新的实现只经过和客户端逻辑的严格比对，未经过实际测试（建议等我借到账号跑完验证）**
+
+**目前只推荐作为开发者和你的harness一起入场尝试，因为很可能跑出来的记录还是不合格**
+
+使用步骤：
+1. 切到develop分支，那里包含了当前的最新实现，详细的说明在对应分支的`README.d`和`docs/`文件夹下。
+2. 准备一张**人脸证件照**，或者准备你**跑步时候的自拍**，以及config.ini里面抓包获取到的参数（Astra说已经重构了登录功能，如果你愿意可以试试看）
+3. 按照develop分支的说明部署，或者让你的harness帮你部署。你也可以直接下载后就让它帮你部署，它要什么就给什么，期间唯一需要自己动手的是抓包，看README底下之前的教学即可。
+
+建议：
+1. 如果你成功完成了跑步，欢迎反馈到issues中，develop分支将和master合并，后续会开发GUI版本，降低使用门槛。（所以我就不用借号测试了）
+2. 如果出现了问题，请用你的harness debug一下，很可能根据反馈小调几个参数就解决了，欢迎把你验证通过后的代码PR进来，并在README里面留下说明，成为本项目贡献者之一；
+3. 如果出现了问题，并且你的额度归零了、API欠费了、模型太笨了、服务器反馈到信息太少等等总之无法解决问题，欢迎在issues里面反馈你的日志。**有效的信息越多，这个项目能维护下去的希望越大。**
+4. 不过请注意核对不合格原因，别把跑步时间不在要求的时间范围内这种问题当成了代码问题猛干一晚上发现早上自己好了。。。
 
 ### 简介：
 
 这是(3.4.8)云运动代跑脚本，可以进行云运动全自动代跑。
 
-**比下面提示更重要的提示**：
-
-1. 作者大三了，没有跑步任务，完全失去的对脚本debug的能力，只能处理通信问题。但是我还是会尝试继续维护一段时间，不过问题信息收集依赖各位通过issue提供。
-
-2. [issue](https://github.com/Zirconium233/yunForNewVersion/issues/70) 确定错误原因是踩点要求改成3个了，之前是2个，地图录入时候大多数都是按2个的，所以错误。
-
-      - 解决方法1：自己跑几个通过的，然后history.py抓下来直接用就行。
-      - 解决方法2：编辑tasklist的json文件，把关键点ManageList都改成Y，把踩点数从2都改成5。
-      - (不用担心轨迹不过关键点，服务器不会去验证你到底踩没踩点，你说什么服务器信什么)
- 
-
-
-
-**重要提示**：云运动时隔1年，3.4.7 终于对加密方式下手了，新的加密逻辑和解决方案可以在 [issue#48](https://github.com/Zirconium233/yunForNewVerison/issues/48) 找到。
-
-1. **现在我们对cipherKey只有加密能力，没有解密能力，只能使用自己提供的~固定的Key~(现在是自己指定的Key)和服务器通信**。这个问题理论上无法解决，因为云运动工程师拍脑袋发现，非对称加密中客户端只用负责加密就行了，不需要解密能力。所以`libcrs-sdk.so`没有提供正确的PrivateKey。这个问题无解。
-
-2. **以后怎么抓包**：
-
-   - **如何获取历史记录**：`python history.py`，api细节可以参考 [这个](./history.md)
-
-   - **如何获取api接口**：这个抓包也是可以的，软件不可能加密访问的URL。参数的填写参考封包内容
-
-3. **TODO**
-
-   - 提供自动随机sm4Key通讯功能 - Done (By 10punny)
-   
-   - 封装抓历史记录功能 - Done
-
-   - 都大AI时代了
-     1. 是时候找个时间把代码改漂亮点，搞一些界面和自动配置出来了
-     2. 网络相关用python？翻译成网页，直接浏览器一键是不是更好？
-
-4. 常见问题：[常见问题](./questions.md)
-
-
-
-
-
 ### 更新记录：
+
+- 2026/9/12：
+   1. 对云运动的人脸问题安排了对策，但未经过实际测试。
+ 
+   2. 用Astra重构了代码，我承认我在24年手搓的代码质量，一坨。。
 
 - 2025/12/9：
    1. 感谢 10punny 解决gmssl和hutool的验签问题，加密函数加上04头就可以被后端正确解密。现在我们可以使用随机密钥了(注意是随机加密，不是解密)详见[PR](https://github.com/Zirconium233/yunForNewVersion/pull/75)
