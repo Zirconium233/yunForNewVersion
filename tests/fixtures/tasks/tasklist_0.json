@@ -1,0 +1,29 @@
+{
+  "msg": "success",
+  "code": 200,
+  "data": {
+    "duration": 600,
+    "recordMileage": "1.20",
+    "recodeCadence": "150",
+    "recodePace": "5.50",
+    "recodeDislikes": 2,
+    "manageList": [
+      {"point": "117.200001,31.770001", "marked": "Y", "index": "0"},
+      {"point": "117.200101,31.770101", "marked": "Y", "index": "1"}
+    ],
+    "pointsList": [
+      {"point": "117.200000,31.770000", "runStatus": "1", "speed": "5.50", "isFence": "Y", "isMock": false, "runMileage": 0.0, "runTime": 0, "runStep": 0, "ts": "1757500000"},
+      {"point": "117.200010,31.770010", "runStatus": "1", "speed": "5.50", "isFence": "Y", "isMock": false, "runMileage": 0.1, "runTime": 30, "runStep": 125, "ts": "1757500030"},
+      {"point": "117.200020,31.770020", "runStatus": "1", "speed": "5.50", "isFence": "Y", "isMock": false, "runMileage": 0.2, "runTime": 60, "runStep": 250, "ts": "1757500060"},
+      {"point": "117.200030,31.770030", "runStatus": "1", "speed": "5.50", "isFence": "Y", "isMock": false, "runMileage": 0.3, "runTime": 90, "runStep": 375, "ts": "1757500090"},
+      {"point": "117.200040,31.770040", "runStatus": "1", "speed": "5.50", "isFence": "Y", "isMock": false, "runMileage": 0.4, "runTime": 120, "runStep": 500, "ts": "1757500120"},
+      {"point": "117.200050,31.770050", "runStatus": "1", "speed": "5.50", "isFence": "Y", "isMock": false, "runMileage": 0.5, "runTime": 150, "runStep": 625, "ts": "1757500150"},
+      {"point": "117.200050,31.770050", "runStatus": "1", "speed": "5.50", "isFence": "Y", "isMock": false, "runMileage": 0.6, "runTime": 180, "runStep": 750, "ts": "1757500180"},
+      {"point": "117.200060,31.770060", "runStatus": "1", "speed": "5.50", "isFence": "Y", "isMock": false, "runMileage": 0.7, "runTime": 210, "runStep": 875, "ts": "1757500210"},
+      {"point": "117.200070,31.770070", "runStatus": "1", "speed": "5.50", "isFence": "Y", "isMock": false, "runMileage": 0.8, "runTime": 240, "runStep": 1000, "ts": "1757500240"},
+      {"point": "117.200080,31.770080", "runStatus": "1", "speed": "5.50", "isFence": "Y", "isMock": false, "runMileage": 0.9, "runTime": 270, "runStep": 1125, "ts": "1757500270"},
+      {"point": "117.200090,31.770090", "runStatus": "1", "speed": "5.50", "isFence": "Y", "isMock": false, "runMileage": 1.0, "runTime": 300, "runStep": 1250, "ts": "1757500300"},
+      {"point": "117.200100,31.770100", "runStatus": "1", "speed": "5.50", "isFence": "Y", "isMock": false, "runMileage": 1.1, "runTime": 330, "runStep": 1375, "ts": "1757500330"}
+    ]
+  }
+}

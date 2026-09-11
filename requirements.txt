@@ -1,5 +1,5 @@
 requests
-gmssl
+gmssl==3.2.2  # CryptSM2 构造依赖 mode/asn1 参数（3.2.1 无该参数）；其 encrypt/decrypt 缺陷见 docs/PHASE_A.md
 tqdm
 schedule
 mitmproxy

@@ -1,4 +1,7 @@
 __pycache__
+.pytest_cache/
+.venv/
+work_dir/
 t.py
 cfg_my.ini
 t.ipynb
