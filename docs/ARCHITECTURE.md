@@ -42,8 +42,9 @@ dry_run_home.json  --dry-run 的 getHomeRunInfo 假响应
         HTTP!=200 → HttpStatusException；传输异常 → TransportOutcomeUnknown
 ```
 
-**不重试原则**：状态改变类请求（start/split/finish/人脸比对）任何失败都不自动重放，
-由调用方按"结果未知"报告。
+**两层重试语义**：通用 HTTP 层（yun_http）对任何失败都不自动重放，调用方按“结果未知”报告；唯一的例外是人脸比对业务状态机（FaceVerifier，APK L()/Z() 等价），且其重试受窗口单调时钟预算约束、终端结果（compare_failed/expired）绝不重试。
+
+**业务 code 即终端（返修 R3）**：split/finish 解析 HTTP 200 里的业务 code，code!=200 → `BusinessException` 传播即停止——后续 split/finish 一律不再发送，报告保留 recordId 与最后确认位置。finish 受理（code=200）后按 APK 结束链以同一 P1 体调用 `run/isStandard`（API.java:343-344，call site :1836）并解析呈报 `isStandard/isCheat/msg`（查询失败如实报“有效性未确认”，不谎报）。
 
 ## 3. 线上载荷投影（服务器可见字段对齐层）
 
@@ -65,21 +66,32 @@ APK 用 Gson（`serializeNulls`）序列化 `UpPointsModel`，用 `org.json` 手
 ## 4. 人脸子系统（yun_face.py）
 
 ```
-WindowTrigger.on_distance(km)     W1 等价：int(win*1000) 跨越判定、首轮仅建基线、
-                                  每窗口一次、在途互斥
+WindowTrigger.on_distance(km)     W1 等价事件语义：起点基线 0（首批跨窗不漏）、
+                                  int(win*1000) 跨越（点恰在边界算）、非单调
+                                  忽略、每窗口一次、在途互斥；在途漏跨由 finish 前
+                                  完整性检查兜底（见 main 的窗口检查）
 FaceRunner.run_window             语音提前 4s → 取源帧 → 检测框 → 质量门 →
-                                  图像处理 → runFaceInfoComparison → 状态机
+                                  图像处理 → runFaceInfoComparison → 状态机；
+                                  语音/取源/预处理/上传共用 caller 注入的单调
+                                  时钟与 deadline=faceTime+4s，越界一律 expired
 PhotoSource / VideoFrameSource    方案1 照片 / 方案2 视频选帧（frame_provider 可注入，
-                                  不硬依赖 opencv）
+                                  不硬依赖 opencv）；视频门按 (image, frame_index)
+                                  逐帧判检测——静态单标注不能冒充每帧检测（R6）；
+                                  照片标注必须绑定文件哈希/路径 + bind_apply 坐标约定
 process_face_image(branch)        compare/register/timeout 三分支独立：
-                                  EXIF 仅 3/6/8 旋转；仅宽>720 缩 720/q90；
-                                  >153600B 走质量阶梯 80..20；
+                                  EXIF 仅 3/6/8 旋转；仅宽>720 缩 720/q90（高度
+                                  取整=Java Math.round 正数 half-up）；
+                                  >153600B 走质量阶梯 80..20——阶梯作用于当前
+                                  处理阶段图像（R5：修复前误传缩放前原图）；
                                   Luban.ignoreBy 未证实 → APPROX 透传标记
 quality_gate / check_framing      K()(:531-602) 逐条同序同阈值；
                                   DrawResult 映射原样移植（两轴分母同 640 的字面写法）；
                                   零分母按 Java float 的 NaN/Inf 语义
-FaceVerifier.run                  首次上传 → ≤3 次立即重试(1s) → 30s 等待期每 3s
-                                  复用同一文件重发 → 3004；
+FaceVerifier.run                  首传 → ≤3 次立即重试(1s，间隔裁剪进剩余预算) →
+                                  等待期每 3s 复用同一文件重发——按单调时钟经过
+                                  时间计（网络耗时计入），上界 min(pending_seconds,
+                                  deadline)；请求读超时临时压进剩余预算；越界/迟到
+                                  的成功回调丢弃 → expired；
                                   code=200 且 status!=Y 为终端 compare_failed（不重试）
 windows_from_random_list          窗口构造（idStr = recordId+序号）
 recover_unfinished                o2(:3337-3368) 断点恢复分类（纯函数）
@@ -88,6 +100,9 @@ recover_unfinished                o2(:3337-3368) 断点恢复分类（纯函数�
 边界：检测模型（RetinaFace）未移植——检测结果是注入点，**缺检测=不放行**；
 注册接口存在但永不自动调用；比对失败不自动提交跑步数据（APK 会提交，
 此偏差是刻意的，见 `_face_on_mileage` 注释与 USAGE §4）；窗口断点持久化未实现。
+时钟双轨（R2）：utc/sign 用 epoch 秒（client.now），窗口/请求预算用单调时钟
+（client.mono），不得互相顶替。人脸注册/预登记链路（getRlStatus 预查询+注册调用）
+不支持：脚本无调用点，需注册流程的任务必须走官方 App。
 
 ## 5. 配置与全局变量契约
 
@@ -106,6 +121,7 @@ recover_unfinished                o2(:3337-3368) 断点恢复分类（纯函数�
 | test_yun_http.py | 密码 golden 向量、SM2 24 样本多 k 交叉验证、信封/解码/脱敏 |
 | test_wire_alignment.py | 服务器可见字段集合/类型/顺序、HTTP 头、gzip 容器头字节 |
 | test_main_phase_a.py / test_phase_a_fixes.py | 会话流程、登录连续性、canSport/faceTime、CLI 契约 |
+| test_rework_final.py | 返修 R1-R6 回归：逐点窗口事件、预算截止、业务拒绝终止、步骤同包一致、压缩目标对象、标注绑定 |
 | test_yun_face.py | 质量门几何、图像链、比对状态机、窗口调度、照片→线上格式 E2E |
 
 命名约束：自动验收产物只叫 `offline_client_compatibility`；测试反向锁死
@@ -114,7 +130,9 @@ recover_unfinished                o2(:3337-3368) 断点恢复分类（纯函数�
 ## 7. 已知偏差 / 未验证清单（勿当 bug 顺手"修复"）
 
 1. 人脸失败后不自动提交跑步数据（APK 会）——策略性偏差。
-2. StepNumber/runSteps 由里程/步幅估算；simulateNum 恒 0；remake 恒 "0|{}"——
+2. StepNumber：点列带真实累计步数时 = 末点-首点（Y1:2946，同包零矛盾）；点列
+   全零（脚本合成任务）时按里程/步幅把累计步数合成进点列本身再取差值（返修 R4，
+   不再出现“点列 0、汇总 1000”式矛盾）。simulateNum 恒 0；remake 恒 "0|{}"——
    无传感器/无设备自检环境下的格式对齐近似。
 3. Luban 压缩库行为未证实：>150KB 路径直接进质量阶梯（APPROX）。
 4. 人脸挂钩只接在 do_by_points_map 路径（高德 do() 路径未接）。
@@ -123,6 +141,8 @@ recover_unfinished                o2(:3337-3368) 断点恢复分类（纯函数�
 7. TLS/HTTP 栈指纹（requests vs OkHttp/Conscrypt）、HTTP 版本协商、请求节奏等
    字段之外的可观测面不在本项目控制范围（详见开发期审查记录 WIRE_AUDIT，
    不随仓库分发）。
+
+8. finish 前的“窗口完整性检查”（实际经过范围内存在未弹/未确认窗口即拒绝 finish）是比 APK 更严格的脚本策略；APK 对应路径会走提交链。
 
 ## 8. 维护提示
 

@@ -152,6 +152,11 @@ def test_build_split_body_derived_numbers():
     assert b["speeds"] == pytest.approx(10.0)    # (600/60)/(1km)
     assert b["runSteps"] == pytest.approx(100.0)  # 1000 步/10min
     assert b["strides"] == pytest.approx(1.0)
+    # 返修 R4：该用例走"点列步数全零→按里程/步幅合成"契约——cardPointList 的
+    # 累计步数必须与 StepNumber 同包自洽（差值），而不是只冻结汇总快照。
+    assert [p["runStep"] for p in b["cardPointList"]] == [0, 1000]
+    assert b["StepNumber"] == b["cardPointList"][-1]["runStep"] \
+        - b["cardPointList"][0]["runStep"]
 
 
 # ------------------------------------------------------------ start / finish 体

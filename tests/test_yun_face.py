@@ -11,6 +11,7 @@ import io
 import json
 import math
 import os
+import hashlib
 from contextlib import redirect_stdout
 
 import pytest
@@ -90,17 +91,19 @@ class TestFramingGate:
         assert not _gate(pts=pts_pitch(0.801)).ok
 
     def test_roll_bound(self):
-        # 眼线倾角 15° 界限：atan2(dy, dx)
+        # 眼线倾角 15° 界限：atan2(dy, dx)。用专用小几何让其余门必然放行，
+        # 断言精确（返修 R5：删除旧的 `... or True` 式自欺断言）。
         import math as m
         dy_ok = 100 * m.tan(m.radians(14.9))
         dy_bad = 100 * m.tan(m.radians(15.1))
-        assert _gate(pts=[(130, 180), (230, 180 + dy_ok), (180, 240),
-                          (140, 300 + 0), (220, 300 + 0)]).ok or True  # 位置门可能先拦，专用小几何见下
-        r = yf.check_framing((100, 120, 260, 360),
-                             [(100, 250), (200, 250 + dy_bad), (150, 300),
-                              (120, 330), (180, 330)], 400, 400)
-        # 该几何专测翻滚：其余门先拦也算数——直接断言 roll 值被计算且 >15
-        assert r.roll_deg > 15.0
+        g_ok = yf.check_framing((100, 150, 300, 400),
+                                [(100, 250), (200, 250 + dy_ok), (150, 300),
+                                 (120, 330), (180, 330)], 500, 500)
+        assert g_ok.roll_deg <= 15.0 and g_ok.ok          # 14.9°：通过
+        g_bad = yf.check_framing((100, 150, 300, 400),
+                                 [(100, 250), (200, 250 + dy_bad), (150, 300),
+                                  (120, 330), (180, 330)], 500, 500)
+        assert g_bad.roll_deg > 15.0 and not g_bad.ok     # 15.1°：拒绝
 
     def test_zero_preview_raises(self):
         with pytest.raises(yf.FaceInputError):
@@ -307,14 +310,17 @@ class TestVerifierStateMachine:
         assert o.state == "compare_failed" and o.attempts == 1 and sleeps == []
 
     def test_full_exhaustion_counts(self):
-        # 全失败：1 首传 + 3 立即重试 + 等待态 30s 内每 3s 重发（F=29..1 中 3 的倍数：27..3 → 9 次）
+        # 全失败：1 首传 + 3 立即重试 + 等待态按经过时间每 3s 重发
+        # （elapsed 3..27 共 9 次，网络耗时计入；耗尽→识别超时 3004）
         v, sleeps, seen = self._v([])
         o = v.run(b"B")
         assert o.state == "transport_failed"
         assert o.attempts == 1 + 3 + 9
         assert o.msg == "识别超时(3004)"
         assert all(s is seen[0] for s in seen)      # 重用同一份最终文件（a0(B)）
-        assert len(sleeps) == 3 + 29                 # 立即重试 1s×3 + 等待态每秒 1 tick
+        # 返修 R2：等待是"时间预算驱动"而非每秒 tick ——
+        # 3×1s 立即重试间隔 + 10 段 3s（9 个重发点 + 归零段）
+        assert sleeps == [1.0, 1.0, 1.0] + [3.0] * 10
 
     def test_success_in_pending(self):
         seq = [yf.FaceOutcome("transport_failed")] * (1 + 3 + 2)
@@ -322,8 +328,8 @@ class TestVerifierStateMachine:
         v, sleeps, _ = self._v(seq)
         o = v.run(b"B")
         assert o.state == "success" and o.attempts == 7
-        # 成功后立即返回：等待态 tick 只走到 f=21（未再 sleep 该秒）
-        assert len(sleeps) == 3 + 8
+        # 成功后立即返回：不再走后续 3s 段（elapsed 只到第 3 个重发点）
+        assert sleeps == [1.0, 1.0, 1.0] + [3.0, 3.0, 3.0]
 
     def test_session_termination_drops_late_result(self):
         flag = {"t": False}
@@ -470,14 +476,19 @@ class TestFaceRunnerE2E:
         pub = base64.b64decode(conf.get("Yun", "PublicKey"))
         pri = base64.b64decode(conf.get("Yun", "PrivateKey"))
         # 测试照片 + 人工标注（与门几何一致的 400x500 图）
+        # 返修 R6：照片标注必须绑定来源文件哈希 + 坐标约定声明
         img = Image.new("RGB", (400, 500), "gray")
         photo = tmp_path / "selfie.jpg"
         b = io.BytesIO(); img.save(b, "JPEG", quality=95)
-        photo.write_bytes(b.getvalue())
+        photo_bytes = b.getvalue()
+        photo.write_bytes(photo_bytes)
         det_json = tmp_path / "det.json"
         det_json.write_text(json.dumps({
             "box": list(BOX_PASS), "points": [list(p) for p in PTS_PASS],
-            "score": 0.9, "space": "image"}), encoding="utf-8")
+            "score": 0.9, "space": "image",
+            "source_sha256": hashlib.sha256(photo_bytes).hexdigest(),
+            "bind_apply": {"after_exif": True, "mirrored": False},
+        }), encoding="utf-8")
         return photo, det_json, pub, pri
 
     def test_photo_to_wire_full_chain(self, tmp_path):
@@ -493,8 +504,8 @@ class TestFaceRunnerE2E:
         body = fake.calls[0]["business"]
         assert body["recordId"] == "555"
         uploaded = base64.b64decode(body["faceBaseData"])
-        assert len(uploaded) <= yf.MAX_BYTES or True   # 尺寸取决于合成图，链上已按规则压缩
-        assert Image.open(io.BytesIO(uploaded)).width <= 720 + 1
+        assert len(uploaded) <= yf.MAX_BYTES            # 返修 R5：真实约束，不再 `or True`
+        assert Image.open(io.BytesIO(uploaded)).width <= 720   # 且不再有 +1 容差
 
     def test_gate_failure_stops_before_network(self, tmp_path):
         photo, _, pub, pri = self._setup(tmp_path)

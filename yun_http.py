@@ -557,6 +557,7 @@ class YunClient:
                  transport: Optional[Callable[..., Any]] = None,
                  rng: Optional[_random_module.Random] = None,
                  now: Optional[Callable[[], int]] = None,
+                 mono: Optional[Callable[[], float]] = None,
                  sleep: Optional[Callable[[float], None]] = None,
                  timeout: Tuple[float, float] = DEFAULT_TIMEOUT,
                  legacy_uuid: bool = False):
@@ -566,6 +567,9 @@ class YunClient:
         self.rng = rng
         self._now = now or (lambda: int(time.time()))
         self.now = self._now  # 公开别名：人脸窗口计时等调用方读取注入时钟
+        # Rework R2 dual clock: utc/sign must use epoch seconds (now);
+        # window/request budgets must use the monotonic clock (mono).
+        self.mono = mono or time.monotonic
         self.sleep = sleep or time.sleep
         self.timeout = timeout
         # 评审 P2：3.6.6 对齐模式默认每请求随机大写 UUID

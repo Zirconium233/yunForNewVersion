@@ -80,21 +80,47 @@ python main.py -d              # 轨迹漂移（tools/drift.py）
 - **未提供源**：立即抛 `FaceRequiredError` 停止（不默认放行）。请使用官方 App，
   或按下面提供离线源。
 - **提供 `--face-photo 图片`**（方案 1）：按 APK 图像链处理照片
-  （EXIF 定向→JPEG→宽度>720 才缩图→>150KB 走质量阶梯 80..20）；
+  （EXIF 定向→JPEG→宽度>720 才缩图→>150KB 走质量阶梯 80..20，缩放与阶梯
+  作用于同一处理阶段图像）；标注 JSON **必须绑定该图片文件**：提供
+  `source_sha256`（文件哈希）或 `source_path`，并用 `bind_apply` 声明坐标系
+  （`{"after_exif":bool,"mirrored":bool}`，管线是 EXIF 摆正→可选镜像）。
+  未绑定/哈希不符 = 预检失败（不能拿无主或过期标注宣称“这张图检测到了”）。
 - **提供 `--face-video 视频`**（方案 2）：逐帧（可配 `frame_step`）用同一质量门
-  选第一帧合格画面；需要 `opencv-python`。
+  选第一帧合格画面；需要 `opencv-python`。**检测标注必须逐帧**：JSON 提供
+  `{"frames":{"<帧号>":{box,points,...}}}`，未标注帧一律视为无检测（不挪用
+  其他帧标注凑数）。**没有逐帧标注能力时在 run/start 之前的预检即失败**
+  （发生在 `build_face_runner`，早于任何真实网络请求），不会先建任务再报错。
 - 两种源都必须配合 **`--face-detection 检测标注.json`** 提供人脸框/五点，
   或自行注入检测器。检测模型（RetinaFace）**未随仓库移植**，且
   **没有检测结果时不放行**（不默认通过质量门）。
-- `--face-mirror`：前置摄像头镜像（照片/视频源默认**不**镜像，与 APK 一致，
-  仅在源本身是镜像预览时开启）。
+- `--face-mirror`：照片/视频源默认**不**镜像（与 APK 一致，仅在源本身是镜像预览时开启）；开启时标注 `bind_apply.mirrored` 必须同为 true，坐标系矛盾即拒绝。
+- `runFaceStatus=Y` 且 start 响应缺少 `randomList` 或 `faceTime`：必要参数
+  不完整，显式停止（不按“无限预算/默认放行”继续）。
 
-窗口调度与重试均为 APK 等价实现：距离跨越 `randomList` 触发（每公里截断比较、
-每窗口一次）、语音提前 4s、比对失败后 3 次立即重试（间隔 1s）+ 30s 等待期每 3s
-复用同一张图重发，超时判 `识别超时(3004)`。
+窗口调度语义与 APK W1 对齐，事件源为**轨迹点**（与网络批次解耦，首批跨
+窗不漏）：起点基线 0、`int(window_km*1000)` 跨越判定（点恰在边界算跨越）、
+非单调事件忽略、每窗口一次、在途互斥。**与 APK 相同**：会话在途期间跨过的
+窗口不会自动补触发。在此之上本脚本加了一道**更严格的策略**：finish 前
+检查实际经过范围内所有窗口，存在“未弹（含在途漏跨）或比对未确认成功”
+的窗口即拒绝发送 finish（不得静默收尾）。
+
+窗口预算与重试：语音引导 4s、比对失败后 ≤3 次立即重试（间隔 1s）+ 等待期
+每 3s 复用同一张图重发——这些形态与 APK 一致；但等待按**单调时钟经过
+时间**计（网络请求耗时计入预算；返修 R2：修复前按 sleep 计数，慢请求会
+把窗口拖出预算），整个窗口共用 `faceTime+4s` 截止（时钟双轨：utc/sign 用
+epoch 秒，预算用 client.mono）。预算耗尽 → `expired`：该窗口
+`compare_success` 一律不记 Y，且**后续 split 与 finish 全部被守卫拦截**（不
+补发、不静默收尾）。`code=200 且 data.status!=Y` 仍是终端
+compare_failed（不重试）。
 
 **已知策略偏差**：APK 在人脸失败路径会自动提交本次跑步数据（checkRunState），
 本脚本**不自动提交**，改为停止并保留现场——提交与否由人工决定。
+
+**支持范围声明**：人脸**注册/预登记链路不支持**——`run/getRlStatus`（登记
+状态预查询）与注册接口在本脚本中无调用点；遇到需要注册流程的任务应使用
+官方 App。**窗口断点持久化未实现**：进程中断不会恢复未完成窗口；完整性
+检查只覆盖当前进程观察到的里程。`recover_unfinished` 是纯函数，**未接入
+运行时**。
 
 人脸数据（faceBaseData）默认脱敏，不落日志明文；本脚本**不会调用注册接口**
 （`runFaceInfo` 注册链路存在但禁用，不做自动录入）。
@@ -131,6 +157,7 @@ python main.py --dry-run [--dry-home dry_run_home.json]
 | `HttpStatusException` | 非 200 响应（消息已脱敏） | 同上按"结果未知"对待 |
 | `RunNotPermittedError` | 服务端拒绝开始（canSport=N），异常带 recordId | 按提示处理已开始的记录 |
 | `FaceRequiredError` | 任务要求人脸 / 状态缺失未知 | 用官方 App 或提供人脸源 |
+| `BusinessException` | 服务器明确拒绝（HTTP 200 业务 code!=200）：上传/finish 即时停止 | 按提示查 recordId 与最后确认位置，勿盲目重发 |
 | `FaceRunStopError` | 人脸窗口未确认通过 | 按提示"勿盲目重发"，人工核对 |
 | `DecodeException` | 响应无法按 明文/SM4/SM4+gzip 解码 | 保留现场报告，不要当成业务失败 |
 

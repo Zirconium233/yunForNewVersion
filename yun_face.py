@@ -44,12 +44,14 @@ FakeTransport 解包断言）在 Python 侧一致（offline_client_compatibility
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import math
+import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from yun_http import (
     BusinessException,
@@ -330,18 +332,23 @@ def process_face_image(data: bytes, branch: str = "compare",
     steps.append(f"jpeg q={q0} -> {len(out)}B")
 
     if branch == "compare":
-        # FaceImageCompressor.d：仅宽度超 720 才重采样（等比，q90）；≤720 原样返回
+        # FaceImageCompressor.d：仅宽度超 720 才重采样（等比，q90）；≤720 原样返回。
+        # 阶梯必须作用在"当前处理阶段"的图像上（返修 R5：曾因传回缩放前原图，
+        # 导致可能上传超宽图或可压缩输入被误判失败）。
+        # 高度取整改 Java Math.round 语义（正数 half-up，floor(x+0.5)），
+        # 不用 Python round 的银行家取整。
         w, h = img.size
+        cur = img.convert("RGB")
         if w > MAX_WIDTH:
-            new_h = int(round(h * (MAX_WIDTH / float(w))))
-            img2 = img.convert("RGB").resize((MAX_WIDTH, new_h))
-            out = save_jpeg(img2, 90)
+            new_h = max(1, math.floor(h * (MAX_WIDTH / float(w)) + 0.5))
+            cur = cur.resize((MAX_WIDTH, new_h))
+            out = save_jpeg(cur, 90)
             steps.append(f"resize w>720 -> 720x{new_h}, jpeg q=90 -> {len(out)}B")
         else:
             steps.append("resize skipped (width<=720)")
         if len(out) > MAX_BYTES:
             steps.append("luban ignoreBy(150)=APPROX(passthrough to ladder)")
-            out = _ladder(img.convert("RGB"), MAX_BYTES, steps)
+            out = _ladder(cur, MAX_BYTES, steps)
     else:
         limit = LUBAN_100
         if len(out) > limit:
@@ -360,8 +367,12 @@ def build_compare_body(record_id: Any, face_b64: str) -> str:
 
 @dataclass
 class FaceOutcome:
-    """结果分层（评审 §二.3：HTTP200 / 业务 code / 上传完成 / 比对成功是四种状态）。"""
-    state: str                 # success | compare_failed | transport_failed | session_terminated
+    """结果分层（评审 §二.3：HTTP200 / 业务 code / 上传完成 / 比对成功是四种状态）。
+
+    state ∈ success | compare_failed | transport_failed | session_terminated | expired
+    （expired=返修 R2 新增：单调时钟预算内未确认，结果一律不采信。）
+    """
+    state: str
     code: Optional[Any] = None
     msg: str = ""
     detail: str = ""
@@ -416,37 +427,104 @@ class FaceVerifier:
     """上传+重试状态机。同一次上传流程重用同一份最终文件字节（f:358 a0(B)）。
 
     时钟/sleep/上传动作全部注入；通用 HTTP 层依旧无自动重试。
+
+    返修 R2：等待时长改为按经过时间（elapsed）而非 sleep 计数——
+    - clock: 单调时钟（可注入；main 路线注入 client.mono/client.now）。缺省为
+      “虚拟时钟”：只随注入的 sleep 推进，用于无网络上下文的单测；它无法感知
+      attempt_fn 自身耗时，因此有真实预算约束时必须注入外部时钟。
+    - deadline: 该绝对时刻后一切结果作废（expired），每次发起请求前与收到回调
+      后都检查；网络请求耗时天然计入。
+    - 有 deadline 时，请求的读超时被压缩到剩余预算内（client.timeout 临时调整，
+      结束恢复）。
     """
 
     def __init__(self, client: YunClient, record_id: Any,
                  cfg: Optional[VerifierConfig] = None,
                  sleep: Optional[Callable[[float], None]] = None,
                  session_terminated: Optional[Callable[[], bool]] = None,
-                 log: Optional[Callable[[str], None]] = None):
+                 log: Optional[Callable[[str], None]] = None,
+                 clock: Optional[Callable[[], float]] = None,
+                 deadline: Optional[float] = None):
         self.client = client
         self.record_id = record_id
         self.cfg = cfg or VerifierConfig()
-        self._sleep = sleep or time.sleep
+        self._ext_sleep = sleep or time.sleep
         self._terminated = session_terminated or (lambda: False)
         self._log = log or (lambda s: None)
+        self._vnow = 0.0
+        self._own_clock = clock is None
+        self._ext_clock = clock
+        self._deadline = deadline
         self.trace: List[str] = []
 
+    # ---- 预算原语 ----
+    def _now(self) -> float:
+        """有效时刻 = max(外部时钟, 内部睡眠下界)。
+
+        睡眠声明的时间必然被消耗：外部时钟若未随之推进（静态测试时钟），
+        内部下界兜底推进，保证等待循环有界、预算不被“冻结时钟”绕过。
+        """
+        if self._ext_clock is None:
+            return self._vnow
+        return max(self._ext_clock(), self._vnow)
+
+    def remaining(self) -> Optional[float]:
+        if self._deadline is None:
+            return None
+        return max(0.0, self._deadline - self._now())
+
+    def expired(self) -> bool:
+        return self._deadline is not None and self._now() >= self._deadline
+
+    def _pause(self, seconds: float) -> None:
+        if seconds <= 0:
+            return
+        self._vnow += seconds
+        self._ext_sleep(seconds)
+
+    # ---- 发起与回调 ----
     def _attempt(self, face_data: bytes) -> Optional[FaceOutcome]:
         """a0()：先查会话终止（:711-714），终止则丢弃本次上传。"""
         if self._terminated():
             self.trace.append("attempt skipped: session terminated")
             return FaceOutcome("session_terminated")
-        if self.cfg.attempt_fn is not None:
-            return self.cfg.attempt_fn(face_data)
-        return compare_once(self.client, self.record_id, face_data)
+        if self.expired():
+            self.trace.append("attempt skipped: window deadline exceeded")
+            return self._expired_outcome()
+        restore = None
+        rem = self.remaining()
+        if rem is not None and self.client is not None and \
+                isinstance(getattr(self.client, "timeout", None), tuple):
+            orig = self.client.timeout
+            capped_read = max(0.5, min(float(orig[1]), rem))
+            if capped_read < float(orig[1]):
+                restore = orig
+                self.client.timeout = (orig[0], capped_read)
+        try:
+            if self.cfg.attempt_fn is not None:
+                return self.cfg.attempt_fn(face_data)
+            return compare_once(self.client, self.record_id, face_data)
+        finally:
+            if restore is not None:
+                self.client.timeout = restore
+
+    def _expired_outcome(self) -> FaceOutcome:
+        return FaceOutcome("expired", msg="人脸窗口截止时间已过（单调时钟预算耗尽）",
+                           detail="expired：结果一律不采信（返修 R2）")
 
     def _apply(self, out: Optional[FaceOutcome]) -> Optional[FaceOutcome]:
-        """e.onSuccess 的会话终止优先检查（:299-301）：迟到回调丢弃。"""
+        """e.onSuccess 的会话终止优先检查（:299-301）：迟到回调丢弃。
+
+        返修 R2：成功回调迟到（返回时已越过 deadline）同样丢弃并作废。
+        """
         if out is None or out.state == "session_terminated":
             return out
         if self._terminated():
             self.trace.append(f"late callback dropped ({out.state})")
             return FaceOutcome("session_terminated")
+        if out.state == "success" and self.expired():
+            self.trace.append("late success dropped: deadline passed during request")
+            return self._expired_outcome()
         return out
 
     def run(self, face_data: bytes) -> FaceOutcome:
@@ -461,30 +539,48 @@ class FaceVerifier:
 
         # 首传
         outcome = wrap(self._attempt(face_data))
-        if outcome is None or outcome.state in ("success", "session_terminated"):
+        if outcome is None or outcome.state in ("success", "session_terminated", "expired"):
             return outcome
         if outcome.state == "compare_failed":
             return outcome  # 终端性比对失败：status!=Y 不重试（e.onSuccess :314）
 
-        # L()：立即重试 ≤ immediate_retries 次，间隔 1s
+        # L()：立即重试 ≤ immediate_retries 次，间隔 1s（有预算时 sleep 被裁剪，
+        # 且发起前逐次检查截止）
         for i in range(1, self.cfg.immediate_retries + 1):
+            if self.expired():
+                return self._expired_outcome()
             self.trace.append(f"immediate retry {i}/{self.cfg.immediate_retries}")
-            self._sleep(self.cfg.immediate_delay)
+            rem = self.remaining()
+            delay = self.cfg.immediate_delay if rem is None else \
+                min(self.cfg.immediate_delay, rem)
+            self._pause(delay)
             outcome = wrap(self._attempt(face_data))
             if outcome is None or outcome.state != "transport_failed":
                 return outcome or FaceOutcome("session_terminated")
 
-        # Z()+f：30s 等待态，每秒 tick，每 3s 重用同一文件再传（同步模型必不并发）
-        f = self.cfg.pending_seconds - 1
-        while f > 0:
-            if f % self.cfg.resend_every == 0:
-                self.trace.append(f"pending resend F={f}")
-                outcome = wrap(self._attempt(face_data))
-                if outcome is None or outcome.state != "transport_failed":
-                    return outcome or FaceOutcome("session_terminated")
-            self._sleep(1.0)
-            f -= 1
+        # Z()+f：等待态。以“经过时间”驱动的每 3s 重发调度（网络耗时计入），
+        # 上界 = min(外部 deadline, 进入等待态 + pending_seconds)。
+        start = self._now()
+        end = start + self.cfg.pending_seconds
+        if self._deadline is not None:
+            end = min(end, self._deadline)
+        next_fire = start + self.cfg.resend_every
+        while True:
+            now = self._now()
+            if now >= end:
+                break
+            wait = min(max(0.0, next_fire - now), max(0.0, end - now))
+            self._pause(wait)
+            if self.expired() or self._now() >= end:
+                break
+            self.trace.append(f"pending resend elapsed={self._now() - start:.1f}s")
+            outcome = wrap(self._attempt(face_data))
+            if outcome is None or outcome.state != "transport_failed":
+                return outcome or FaceOutcome("session_terminated")
+            next_fire += self.cfg.resend_every
 
+        if self.expired():
+            return self._expired_outcome()
         # 倒计时归零：识别超时(3004)，同 f:370
         return FaceOutcome("transport_failed", msg="识别超时(3004)",
                            detail="30s 等待态耗尽", attempts=attempts)
@@ -522,7 +618,15 @@ def windows_from_random_list(record_id: Any, random_list: Sequence[float]) -> Li
 class WindowTrigger:
     """W1(SportRunMapActivity.java:2854-2900) 等价：距离跨越触发，单窗口在途，防重复。
 
-    on_distance(km) 用 int(km*1000) 米制（Java (int) 截断语义一致）。
+    距离事件与网络批次分离：调用方必须按轨迹点（事件）逐个推进，而不是只喂
+    批末里程（返修 R1）。事件语义定义：
+    - 首个事件：以跑步起点 0 为基线，直接评估 (0, cur] 内的跨越——
+      因此首批就越过窗口不会漏（APK 首次回调里程≈0，两条规则对 APK 等价）；
+    - 后续事件：评估 (prev, cur]；点恰在窗口值上算跨越（wm<=cur）；
+    - 非单调（cur < prev）：忽略该事件、基线不回退（累计里程本应单调）；
+    - 负值：输入错误，直接抛异常（不允许静默吞掉）；
+    - 同一事件跨越多个窗口：触发第一个未弹窗口（与 APK 单次回调一致）；
+      其余窗口不会自动补触发——由结束前的完整性检查兜底拒绝静默 finish。
     """
 
     def __init__(self, windows: List[FaceWindow]):
@@ -532,16 +636,21 @@ class WindowTrigger:
         self.current: Optional[FaceWindow] = None  # G1
 
     def on_distance(self, km: float) -> Optional[FaceWindow]:
+        if km < 0:
+            raise FaceInputError(f"距离事件非法（负里程）: {km}")
         cur_m = int(km * 1000.0)
-        if self.prev_m is None:
-            self.prev_m = cur_m
+        if self.prev_m is not None and cur_m < self.prev_m:
+            # 非单调事件：忽略（基线不回退）
+            return None
+        first_event = self.prev_m is None
+        base = 0 if first_event else self.prev_m  # 起点基线 0
         if self.in_flight:                    # :2860-2863 只更新基线
             self.prev_m = cur_m
             return None
         triggered = None
         for w in self.windows:                # :2865-2873
             wm = int(w.window_m)
-            if not w.is_show and wm > self.prev_m and wm <= cur_m:
+            if not w.is_show and wm > base and wm <= cur_m:
                 w.is_show = True
                 w.distance = km
                 self.current = w
@@ -551,6 +660,18 @@ class WindowTrigger:
         if triggered is not None:
             self.in_flight = True
         return triggered
+
+    def required_within(self, max_m: int) -> List[FaceWindow]:
+        """实际经过范围 (0, max_m] 内所有本应触发的窗口（含未弹的）。"""
+        return [w for w in self.windows if int(w.window_m) <= int(max_m)]
+
+    def incomplete_within(self, max_m: int) -> List[FaceWindow]:
+        """经过范围内未完成的窗口：未弹（漏触发）或弹出但比对未成功。"""
+        bad = []
+        for w in self.required_within(max_m):
+            if not w.is_show or w.compare_success != "Y":
+                bad.append(w)
+        return bad
 
 
 def recover_unfinished(windows: List[FaceWindow], face_time: float, now: float) -> Tuple[List[FaceWindow], List[FaceWindow]]:
@@ -673,14 +794,18 @@ class VideoFrameSource:
         import numpy as np
         return Image.fromarray(np.asarray(frame)[:, :, ::-1])  # BGR->RGB
 
-    def select(self, gate_fn: Callable[[Any], GateResult]) -> Tuple[Any, dict]:
-        """取第一个通过 gate_fn 的帧；记录媒体序号与结果，保证可复现。"""
+    def select(self, gate_fn: Callable[..., GateResult]) -> Tuple[Any, dict]:
+        """取第一个通过 gate_fn 的帧；记录媒体序号与结果，保证可复现。
+
+        Rework R6：gate 支持 (image, frame_index) 两参回调（逐帧检测）；
+        兼容单参回调（纯帧内判据，如测试桩）。
+        """
         tried = 0
         for idx, img in self.candidates():
             tried += 1
             if self.mirror:
                 img = mirror_image(img)
-            res = gate_fn(img)
+            res = _call_gate(gate_fn, img, idx)
             if res.ok:
                 meta = {"source": "video_frame", "path": self.path, "frame_index": idx,
                         "frames_tried": tried, "mirrored": self.mirror,
@@ -688,6 +813,21 @@ class VideoFrameSource:
                 return img, meta
         raise FaceInputError(
             f"视频 {self.path} 无合格帧（尝试 {tried} 帧）。按输入不合格处理，不宣称通过。")
+
+
+def _call_gate(gate_fn, img, idx):
+    """按回调 arity 兼容调用：2 参（含逐帧检测）或 1 参（帧内判据）。"""
+    import inspect
+    try:
+        params = inspect.signature(gate_fn).parameters
+        n_pos = sum(1 for p in params.values()
+                    if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD))
+        var = any(p.kind == p.VAR_POSITIONAL for p in params.values())
+        if var or n_pos >= 2:
+            return gate_fn(img, idx)
+    except (TypeError, ValueError):
+        pass
+    return gate_fn(img)
 
 
 # ---------------------------------------------------------------- 集成：窗口执行器
@@ -711,16 +851,23 @@ class FaceRunner:
         self.voice_lead = voice_lead
         self._log = log or (lambda s: None)
 
-    def _detect(self, image) -> Optional[FaceDetection]:
+    def _detect(self, image, frame_index: Optional[int] = None) -> Optional[FaceDetection]:
+        """检测解析：FaceDetection（静态）、callable(image)、dict{帧号: FaceDetection}。
+
+        Rework R6：dict 为逐帧静态标注——该帧无标注即无检测（不放行），
+        禁止把单帧标注复用到其他帧。
+        """
         if self.detection is None:
             return None
+        if isinstance(self.detection, dict):
+            return self.detection.get(frame_index)
         if callable(self.detection):
             return self.detection(image)
         return self.detection
 
     def build_face_image(self, image, meta: dict) -> FaceImageOutput:
         """图片→最终上传字节。质量门失败在这里抛 FaceInputError。"""
-        det = self._detect(image)
+        det = self._detect(image, (meta or {}).get("frame_index"))
         if det is None:
             raise FaceInputError(
                 "没有可用检测结果（客户端取景质量门无法执行）。"
@@ -738,38 +885,76 @@ class FaceRunner:
 
     def run_window(self, window: FaceWindow, client: YunClient, record_id: Any,
                    session_terminated: Optional[Callable[[], bool]] = None,
-                   verifier_cfg: Optional[VerifierConfig] = None) -> FaceOutcome:
-        """一个窗口的完整执行；语音引导 4s（voice_lead）经注入 sleep，离线可 no-op。"""
-        self._sleep(self.voice_lead)
-        image, meta = (self.source.select(self._gate_for_video)
+                   verifier_cfg: Optional[VerifierConfig] = None,
+                   clock: Optional[Callable[[], float]] = None,
+                   window_seconds: Optional[float] = None) -> FaceOutcome:
+        """一个窗口的完整执行；语音引导 4s（voice_lead）经注入 sleep，离线可 no-op。
+
+        Rework R2：caller 注入 clock（单调预算时钟，勿用 epoch-utc 顶替）与
+        window_seconds（=faceTime+4s）。语音引导、取源/预处理、上传状态机共用
+        同一 deadline；每段边界与每次请求回调后检查截止；越界一律 expired——
+        绝不把 compare_success 置 Y，外层必须停止后续流程。
+        """
+        clock = clock or time.monotonic
+        t0 = clock()
+        deadline = None if window_seconds is None else t0 + float(window_seconds)
+
+        def _expired() -> bool:
+            return deadline is not None and clock() >= deadline
+
+        def _out_expired(stage: str) -> FaceOutcome:
+            out = FaceOutcome("expired", msg=f"窗口 {window.id_str} {stage}时截止已到")
+            window.upload_success = window.upload_success or "N"
+            window.compare_success = ""       # 未确认：不得标成功
+            window.reason = out.msg
+            return out
+
+        lead = self.voice_lead
+        if deadline is not None:
+            lead = min(lead, max(0.0, deadline - clock()))
+        if lead > 0:
+            self._sleep(lead)
+        if _expired():
+            return _out_expired("语音引导阶段")
+        image, meta = (self.source.select(lambda img, idx: self._gate_for_video(img, idx))
                        if isinstance(self.source, VideoFrameSource)
                        else self.source.load())
         self._last_meta = meta
+        if _expired():
+            return _out_expired("取源阶段")
         try:
             face = self.build_face_image(image, meta)
         except FaceInputError as exc:
+            if _expired():
+                return _out_expired("预处理阶段")
             window.upload_success = ""
             window.compare_success = "N"
             window.reason = str(exc)
             return FaceOutcome("compare_failed", msg=str(exc))
+        if _expired():
+            return _out_expired("预处理阶段")
         verifier = FaceVerifier(client, record_id, cfg=verifier_cfg,
                                 sleep=self._sleep, session_terminated=session_terminated,
-                                log=self._log)
+                                log=self._log, clock=clock, deadline=deadline)
         outcome = verifier.run(face.data)
         if outcome.state == "success":
             window.upload_success, window.compare_success = "Y", "Y"
         elif outcome.state == "compare_failed":
             window.upload_success, window.compare_success = "Y", "N"
+        elif outcome.state == "expired":
+            window.upload_success = window.upload_success or "N"
+            window.compare_success = ""
+            window.reason = outcome.msg or outcome.detail
         else:
             window.upload_success, window.compare_success = "N", ""
         window.reason = outcome.msg or outcome.detail
         return outcome
 
-    def _gate_for_video(self, image) -> GateResult:
+    def _gate_for_video(self, image, frame_index: Optional[int] = None) -> GateResult:
         from PIL import Image
         size = (image.width, image.height)
         pw, ph = self.preview_size or size
-        det = self._detect(image)
+        det = self._detect(image, frame_index)
         if det is None:
             return GateResult(False, "无检测结果")
         rect, pts = detection_to_preview(det, size, (pw, ph))
@@ -785,6 +970,75 @@ def load_detection_json(path: str) -> FaceDetection:
      "space":"image"|"model640", "letterbox":[ox,oy]?}"""
     with open(path, "r", encoding="utf-8") as f:
         d = json.load(f)
+    return _detection_from_dict(d)
+
+
+def _detection_from_dict(d: dict) -> FaceDetection:
     return FaceDetection(box=tuple(d["box"]), points=[tuple(p) for p in d["points"]],
                          score=float(d.get("score", 1.0)), space=d.get("space", "image"),
                          letterbox=(tuple(d["letterbox"]) if d.get("letterbox") else None))
+
+
+# ---------------------------------------------------------------- R6：检测标注包
+@dataclass
+class DetectionBundle:
+    """检测标注的装载结果（Rework R6：区分离线标注模式与可实测输入模式）。
+
+    - static: 单一标注。只允许配合照片源使用，且必须绑定来源（见
+      verify_photo_binding）——同一份标注不能宣称代表别的图。
+    - frames: 帧号 → 检测。视频源用它做"逐帧有效"的取景判定；未标注帧
+      即无检测，质量门不放行。
+    - bind_apply: 标注坐标系约定，如 {"after_exif": true, "mirrored": false}
+      ——坐标是相对"摆正/镜像之后"的图像声明。
+    本轮不移植检测模型：bundle 覆盖不了"真实任意视频每帧都有检测"，
+    所以视频只支持带 frames 标注的人工选段（明确声明，不冒充自动检测）。
+    """
+    static: Optional[FaceDetection] = None
+    frames: Dict[int, FaceDetection] = field(default_factory=dict)
+    source_sha256: Optional[str] = None
+    source_path: Optional[str] = None
+    bind_apply: Optional[dict] = None
+
+
+def load_detection_bundle(path: str) -> DetectionBundle:
+    """扩展标注格式（兼容旧版单标注）：
+    旧：{"box":..., "points":..., ...}
+    新：{"static":{...}, "source_sha256":"...", "source_path":"...",
+         "bind_apply":{"after_exif":true,"mirrored":false},
+         "frames":{"0":{...},"37":{...}}}
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        d = json.load(f)
+    frames = {int(k): _detection_from_dict(v) for k, v in (d.get("frames") or {}).items()}
+    static_raw = d.get("static")
+    if static_raw is None and "box" in d:
+        static_raw = d          # 旧版单标注
+    static = _detection_from_dict(static_raw) if static_raw else None
+    return DetectionBundle(static=static, frames=frames,
+                           source_sha256=d.get("source_sha256"),
+                           source_path=d.get("source_path"),
+                           bind_apply=d.get("bind_apply"))
+
+
+def verify_photo_binding(bundle: DetectionBundle, raw: bytes, path: str) -> None:
+    """照片标注必须绑定具体来源文件（Rework R6）：sha256 或规范化路径一致。
+
+    未绑定 = 拒绝（不能拿一份无主标注宣称"这张图有人脸且检测到了"）；
+    哈希不匹配 = 过期/错图标注，拒绝。坐标系的摆正/镜像约定由 bind_apply
+    声明，供标注工具与人工核对使用。
+    """
+    if bundle.static is None:
+        raise FaceInputError("照片源需要静态检测标注（static 或旧版单标注格式）")
+    if not bundle.source_sha256 and not bundle.source_path:
+        raise FaceInputError(
+            "照片标注未绑定来源：请在标注 JSON 提供 source_sha256 或 source_path，"
+            "并用 bind_apply 声明坐标是否按摆正/镜像后的图像标注")
+    if bundle.source_sha256:
+        got = hashlib.sha256(raw).hexdigest()
+        if got != bundle.source_sha256:
+            raise FaceInputError(
+                f"照片标注 source_sha256 与实际文件不符（{got[:12]}… != "
+                f"{bundle.source_sha256[:12]}…）：过期/错图标注，拒绝当作检测成功")
+    if bundle.source_path and os.path.abspath(bundle.source_path) != os.path.abspath(path):
+        raise FaceInputError(
+            f"照片标注 source_path 与当前输入不一致：{bundle.source_path} != {path}")

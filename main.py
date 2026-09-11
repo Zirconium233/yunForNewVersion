@@ -416,17 +416,24 @@ _dropped_point_keys = set()
 
 
 def _project_card_point(point):
-    """把表格/任务字典投影为 UpPointModel 的 9 字段，类型严格对齐 bean。"""
+    """把表格/任务字典投影为 UpPointModel 的 9 字段，类型严格对齐 bean。
+
+    Rework R4：数值字段非法不再静默吞成 0——直接报错停止（同包一致性优先）。
+    """
     for extra in point:
         if extra not in _POINT_FIELD_ORDER and extra not in _dropped_point_keys:
             _dropped_point_keys.add(extra)
             print(f"[wire] 点项含 APK bean 外字段，按 UpPointModel 裁剪（该键仅提示一次）: {extra!r}")
 
-    def _num(v, cast):
+    def _num(v, cast, what):
         try:
-            return cast(float(v))
-        except (TypeError, ValueError):
-            return cast(0)
+            f = float(v)
+        except (TypeError, ValueError) as exc:
+            raise yun_face.FaceInputError(
+                f"点字段 {what} 非数值（{v!r}）：拒绝静默按 0 处理") from exc
+        if not math.isfinite(f):
+            raise yun_face.FaceInputError(f"点字段 {what} 非有限数（{v!r}）")
+        return int(f) if cast is int else f
 
     speed_raw = point.get("speed", "0.0")
     speed = speed_raw if isinstance(speed_raw, str) else format(float(speed_raw), ".2f")
@@ -434,22 +441,49 @@ def _project_card_point(point):
         "isFence": str(point.get("isFence", "Y")),
         "isMock": bool(point.get("isMock", False)),
         "point": str(point.get("point", "")),
-        "runMileage": _num(point.get("runMileage", 0), float),   # bean: double
+        "runMileage": _num(point.get("runMileage", 0), float, "runMileage"),  # bean: double
         "runStatus": str(point.get("runStatus", "1")),
-        "runStep": _num(point.get("runStep", 0), int),           # bean: int
-        "runTime": _num(point.get("runTime", 0), int),           # bean: long
-        "speed": speed,                                          # bean: String
+        "runStep": _num(point.get("runStep", 0), int, "runStep"),              # bean: int
+        "runTime": _num(point.get("runTime", 0), int, "runTime"),              # bean: long
+        "speed": speed,                                                         # bean: String
         "ts": str(point.get("ts", "")),
     }
 
 
 def _build_split_body(record_id, user_name, school_id, points, strides_cfg):
-    """splitPointCheating/splitPoints 体（UpPointsModel Gson 形态，声明序+null 保留）。"""
+    """splitPointCheating/splitPoints 体（UpPointsModel Gson 形态，声明序+null 保留）。
+
+    Rework R4——步数派生与同包点列严格一致（Y1:2946 runStep 差值语义）：
+    1) 点列自带累计步数（任一非零）→ StepNumber = 末点-首点（与点列零矛盾）；
+       回退（末<首）视为输入错误，停止。
+    2) 点列步数全零（脚本合成任务）→ 显式策略：按里程/步幅为每个点合成
+       累计步数（同一来源派生），StepNumber 仍取点列差值——同包自洽，
+       绝不出现"点列 0、汇总 1000"或两个数据源互相矛盾。
+    3) 无步数又无步幅 → 报错停止（不静默补 0 再从他处生成汇总）。
+    """
     pts = [_project_card_point(p) for p in points]
     mileage = pts[-1]["runMileage"] - pts[0]["runMileage"]        # 米，double
     times = pts[-1]["runTime"] - pts[0]["runTime"]                # 秒，long
+    if mileage < 0:
+        raise yun_face.FaceInputError(
+            f"批内 runMileage 非单调（{pts[-1]['runMileage']} < {pts[0]['runMileage']}）")
+    if times < 0:
+        raise yun_face.FaceInputError(
+            f"批内 runTime 非单调（{pts[-1]['runTime']} < {pts[0]['runTime']}）")
     s_cfg = float(strides_cfg or 0)
-    step_number = int(round(mileage / s_cfg)) if s_cfg > 0 else 0
+    if any(p["runStep"] != 0 for p in pts):
+        step_number = pts[-1]["runStep"] - pts[0]["runStep"]
+        if step_number < 0:
+            raise yun_face.FaceInputError(
+                "cardPointList runStep 回退（末点 < 首点）：输入矛盾，拒绝派生")
+    elif s_cfg > 0:
+        for p in pts:   # 合成累计步数（绝对里程/步幅），保证汇总=点列差值
+            p["runStep"] = math.floor(p["runMileage"] / s_cfg + 0.5)
+        step_number = pts[-1]["runStep"] - pts[0]["runStep"]
+    else:
+        raise yun_face.FaceInputError(
+            "点列无累计步数且步幅(strides)未配置/非法：无法在与点列一致的前提下"
+            "派生 StepNumber；拒绝静默补 0 后生成矛盾汇总")
     minutes = times / 60.0
     # 与 Y1() 同一组派生公式（Y1:2947-2959）：speeds 是配速 min/km。
     speeds = minutes / (mileage / 1000.0) if (times > 0 and mileage > 10.0) else 0.0
@@ -775,6 +809,11 @@ class Yun_For_New:
                 raise FaceRequiredError(
                     "runFaceStatus=Y 但 start 响应缺少 randomList 窗口参数，"
                     "不默认放行，自动流程已停止。")
+            if self.faceTime is None:
+                # Rework R2：窗口必要参数缺失必须显式停止，不得按"无限预算"继续
+                raise FaceRequiredError(
+                    "runFaceStatus=Y 但 start 响应缺少/非法 faceTime：窗口时长"
+                    "无法确定（截止无法设定），不默认放行，自动流程已停止。")
             self._face_trigger = yun_face.WindowTrigger(
                 yun_face.windows_from_random_list(self.crsRunRecordId, self.randomList))
             print(f"云运动任务创建成功！（runFaceStatus=Y，"
@@ -789,12 +828,20 @@ class Yun_For_New:
             print("云运动任务创建成功！\n")
 
     def _face_on_mileage(self, meters: float):
-        """W1 等价挂钩：每次 splitPoint 成功后用累计里程(米)推进距离窗口。
+        """距离事件挂钩（返修 R1/R2）：调用方按轨迹点逐个推进，不能只喂批末里程。
 
-        触发即执行整次人脸（语音引导→图像管线→上传状态机）。失败策略是停止
-        并保留现场；APK 在此处会走 checkRunState 自动提交（T1 :2798），本脚本
-        不自动提交——该偏差在 docs 中显式记录。
+        触发即执行整次人脸（语音引导→图像管线→上传状态机），全部预算共用
+        单调时钟 deadline=faceTime+4s。expired/会话终止不即刻 raise，而是记入
+        _face_block，由后续 split 前的守卫与 finish 检查点抛出
+        FaceRunStopError——保证超时后“既不继续 split，也不 finish”；
+        终端性 compare_failed 与结果未知的传输失败仍当场抛出。
+        本函数对已阻断会话的后续事件只记录里程、不再处理（迟到回调丢弃）。
+        APK 在人脸失败路径会走 checkRunState 自动提交（T1 :2798），本脚本
+        不自动提交——该偏差显式记录。
         """
+        self._max_mileage_m = max(int(getattr(self, "_max_mileage_m", 0)), int(meters))
+        if getattr(self, "_face_block", None):
+            return
         trigger = getattr(self, "_face_trigger", None)
         if trigger is None:
             return
@@ -808,7 +855,13 @@ class Yun_For_New:
                 "但未提供照片/视频源；自动流程停止，请使用官方 App 完成核验。")
         window.voice_second = self.client.now()
         print(f"[face] 窗口 {window.id_str} 触发 @ {meters / 1000.0:.3f} km")
-        outcome = runner.run_window(window, self.client, self.crsRunRecordId)
+        clock = getattr(self.client, "mono", None) or self.client.now
+        outcome = runner.run_window(
+            window, self.client, self.crsRunRecordId,
+            session_terminated=lambda: bool(getattr(self, "_face_block", None)),
+            clock=clock,
+            window_seconds=float(self.faceTime or yun_face.FACE_TIME_FLOOR)
+            + yun_face.WINDOW_LEAD_SECONDS)
         trigger.in_flight = False
         if outcome.state == "success":
             print("[face] 比对通过（data.status=Y），跑步继续")
@@ -817,20 +870,72 @@ class Yun_For_New:
                 f"人脸比对未通过（{outcome.msg or outcome.detail}）。"
                 "APK 行为会自动提交本次跑步数据（T1/checkRunState），"
                 "本脚本策略：不自动提交，保留现场由人工决定。")
+        elif outcome.state == "expired":
+            self._face_block = (f"{outcome.msg or outcome.detail}"
+                                "（窗口预算 faceTime+4s 耗尽，结果一律不采信）")
+            print("[face] " + self._face_block + "；不再发送任何后续请求，也不允许 finish。")
         elif outcome.state == "session_terminated":
-            print("[face] 会话已终止，本次比对结果按迟到回调丢弃")
+            self._face_block = "人脸会话已终止（迟到回调丢弃，自动流程终止）"
+            print("[face] " + self._face_block)
         else:
             raise FaceRunStopError(
                 f"人脸上传未确认成功（{outcome.msg or outcome.detail}）；"
                 "结果未知，不要盲目重发，请先查询服务端记录。")
 
+    def _face_guard(self, action: str):
+        """返修 R2：任何后续网络动作前的阻断检查（expired/会话终止后不得继续）。"""
+        blk = getattr(self, "_face_block", None)
+        if blk:
+            raise FaceRunStopError(f"拒绝执行『{action}』：{blk}")
+
+    def _face_check_complete_before_finish(self):
+        """返修 R1：结束前检查实际经过范围内所有必需窗口的状态；不得静默 finish。"""
+        trigger = getattr(self, "_face_trigger", None)
+        if trigger is None:
+            return
+        max_m = int(getattr(self, "_max_mileage_m", 0))
+        bad = trigger.incomplete_within(max_m)
+        if bad:
+            desc = "; ".join(
+                f"{w.id_str}({w.window_m}m: isShow={w.is_show}, upload={w.upload_success!r}, "
+                f"compare={w.compare_success!r}, reason={w.reason!r})"
+                for w in bad)
+            raise FaceRunStopError(
+                f"实际经过范围 {max_m / 1000:.3f} km 内存在 {len(bad)} 个未完成人脸窗口"
+                f"（含被跳过/在途漏跨/比对未确认）：{desc}。拒绝发送 finish。")
+
+    def _post_checked(self, router, json_text="", **kw):
+        """业务 code 强制检查的统一发送口（返修 R3）。
+
+        真机路线：YunClient.post_json(raise_on_business_code=True)。
+        鸭子类型客户端（评审复现脚本/测试桩只提供 post 文本）：等价地自行
+        解码并对 code!=200 抛 BusinessException——失败分支不因客户端形态
+        而异，绝不允许“打印后继续”。
+        """
+        if hasattr(self.client, "post_json"):
+            return self.client.post_json(router, json_text,
+                                         raise_on_business_code=True, **kw)
+        text = self.client.post(router, json_text, **kw)
+        try:
+            obj = json.loads(text)
+        except Exception as exc:
+            raise DecodeException("响应无法解码为 JSON，业务检查无法完成") from exc
+        if not isinstance(obj, dict):
+            raise DecodeException("响应不是 JSON 对象，业务检查无法完成")
+        if obj.get("code") != 200:
+            raise BusinessException(obj.get("code"), str(obj.get("msg", "")), obj)
+        return obj
+
     def split(self, points):
         data = _build_split_body(self.crsRunRecordId, self.userName, self.schoolId,
                                  points, self.strides)
         # 特殊接口：gzip 后再 SM4（合工大抓包验证过；其他学校未知）
-        resp = self.client.post("/run/splitPointCheating",
-                                raw_bytes=yun_http.gzip_apk(json.dumps(data).encode("utf-8")))
-        print('  ' + resp)
+        # 返修 R3：HTTP 200 里的业务 code 同样解析——服务器拒绝立即停止，
+        # 不再"打印后继续"。
+        obj = self._post_checked("/run/splitPointCheating",
+                                 raw_bytes=yun_http.gzip_apk(json.dumps(data).encode("utf-8")))
+        print('  ' + json.dumps({"code": obj.get("code"), "msg": obj.get("msg")},
+                                ensure_ascii=False))
 
     def do(self):
         sleep_time = self.now_time / (self.task_count + 1)
@@ -882,27 +987,42 @@ class Yun_For_New:
             points.append(point_changed)
             count += 1
             if count == split_count:
+                self._face_guard("splitPoint 批次上传")   # R2：人脸阻断后不再发任何请求
                 self.split_by_points_map(points)
-                self._face_on_mileage(float(points[-1]['runMileage']))
+                self._last_confirmed_mileage_m = int(float(points[-1]['runMileage']))
+                # 返修 R1：距离事件逐轨迹点推进（与网络批次解耦），
+                # 首批/尾批跨窗不再依赖批末单点。
+                for p in points:
+                    self._face_on_mileage(float(p['runMileage']))
                 sleep_time = self.task_map['data']['duration'] / len(self.task_map['data']['pointsList']) * split_count
                 print(f" 等待{sleep_time:.2f}秒.")
                 self.client.sleep(sleep_time)
                 count = 0
                 points = []
         if count != 0:
+            self._face_guard("splitPoint 尾批上传")
             self.split_by_points_map(points)
-            self._face_on_mileage(float(points[-1]['runMileage']))
+            self._last_confirmed_mileage_m = int(float(points[-1]['runMileage']))
+            for p in points:
+                self._face_on_mileage(float(p['runMileage']))
             count = 0
             points = []
 
     def split_by_points_map(self, points):
+        self._face_guard("splitPoint 批次上传")   # R2：任何入口直接调用同样被拦截
         data = _build_split_body(self.crsRunRecordId, self.userName, self.schoolId,
                                  points, self.strides)
-        resp = self.client.post("/run/splitPointCheating",
-                                raw_bytes=yun_http.gzip_apk(json.dumps(data).encode("utf-8")))
-        print('  ' + resp)
+        # 返修 R3：业务 code 解析；服务器拒绝（如 code=500）→ BusinessException
+        # 传播，do_by_points_map 立即停止，不再推进窗口/继续上传/finish。
+        obj = self._post_checked("/run/splitPointCheating",
+                                 raw_bytes=yun_http.gzip_apk(json.dumps(data).encode("utf-8")))
+        print('  ' + json.dumps({"code": obj.get("code"), "msg": obj.get("msg")},
+                                ensure_ascii=False))
 
     def finish_by_points_map(self):
+        # 返修 R1/R2：finish 前必须过窗口完整性检查与会话阻断检查
+        self._face_guard("finish")
+        self._face_check_complete_before_finish()
         print('发送结束信号...')
         data = _build_finish_body(
             record_mileage_km=self.task_map['data']['recordMileage'],
@@ -917,10 +1037,15 @@ class Yun_For_New:
             duration_s=self.task_map['data']['duration'],
             record_start_time=self.recordStartTime,
         )
-        resp = self.client.post("/run/finish", json.dumps(data))
-        print(resp)
+        obj = self._post_checked("/run/finish", json.dumps(data))
+        print('  ' + json.dumps(redact(obj), ensure_ascii=False))
+        print("[finish] 服务端已受理本次结束请求（code=200）。成绩是否有效不作担保，"
+              "随后按 APK 结束链查询 isStandard。")
+        self._post_finish_is_standard(data)
 
     def finish(self):
+        self._face_guard("finish")
+        self._face_check_complete_before_finish()
         print('发送结束信号...')
         data = _build_finish_body(
             record_mileage_km=self.now_dist / 1000,
@@ -935,8 +1060,36 @@ class Yun_For_New:
             duration_s=self.now_time,
             record_start_time=self.recordStartTime,
         )
-        resp = self.client.post("/run/finish", json.dumps(data))
-        print(resp)
+        obj = self._post_checked("/run/finish", json.dumps(data))
+        print('  ' + json.dumps(redact(obj), ensure_ascii=False))
+        print("[finish] 服务端已受理本次结束请求（code=200）。成绩是否有效不作担保，"
+              "随后按 APK 结束链查询 isStandard。")
+        self._post_finish_is_standard(data)
+
+    def _post_finish_is_standard(self, data):
+        """APK 结束链在 finish 回调后以同一 P1(d2,false) 体调用
+        run/isStandard（API.java:343-343 call site SportRunMapActivity:1836）。
+
+        返修 R3：查询结果必须解析并如实呈报，不允许"发一个不看结果的请求"；
+        查询本身失败不掩盖（报告"有效性未确认"），也不谎报成功。
+        """
+        try:
+            if hasattr(self.client, "post_json"):
+                obj = self.client.post_json("/run/isStandard", json.dumps(data))
+            else:                       # 鸭子客户端等价路线（测试桩）
+                obj = json.loads(self.client.post("/run/isStandard", json.dumps(data)))
+        except (HttpStatusException, DecodeException) as exc:
+            print(f"[isStandard] 查询结果未知（{type(exc).__name__}）："
+                  "服务端是否判定成绩有效未确认，请查历史记录。")
+            return
+        if obj.get("code") != 200:
+            print(f"[isStandard] 服务端拒绝查询（code={obj.get('code')} "
+                  f"msg={obj.get('msg')!r}）：不报告'结束成功且有效性已确认'。")
+            return
+        d = obj.get("data") or {}
+        print(f"[isStandard] isStandard={d.get('isStandard')!r} "
+              f"isCheat={d.get('isCheat')!r} msg={d.get('msg')!r}"
+              "（字段=RunStateBean；服务端判定语义未线上验证，原样呈报）")
 
 
 def dry_run_responder(home_fixture: dict, face_status: str = "Y",
@@ -959,15 +1112,50 @@ def dry_run_responder(home_fixture: dict, face_status: str = "Y",
                     "data": {"status": face_compare_status, "msg": "dry-run"}}
         if router.endswith("/run/finish"):
             return {"code": 200, "msg": "dry-run", "data": None}
+        if router.endswith("/run/isStandard"):
+            # 有效性查询（结束链）：fixture 为 RunStateBean 形态。字段值来自本地
+            # 样本，不代表线上判定——run_dry 汇总行明确“服务端接受未验证”。
+            return {"code": 200, "msg": "dry-run", "data": {
+                "isStandard": "Y", "isCheat": "N", "msg": "dry-run", "url": None,
+                "list": []}}
         # splitPointCheating 等默认成功
         return {"code": 200, "msg": "dry-run", "data": None}
     return responder
+
+
+def _check_bind_apply(bundle, mirrored: bool):
+    """Rework R6：标注必须声明坐标系约定，且与实际预处理一致。
+
+    管线顺序是 EXIF 摆正 →（可选）水平镜像；标注坐标必须按处理后的图像声明，
+    否则框/关键点会整体错位——不能拿处理前的标注冒充处理后的检测。
+    """
+    ba = bundle.bind_apply or {}
+    if "after_exif" not in ba or "mirrored" not in ba:
+        raise yun_face.FaceInputError(
+            "标注缺少 bind_apply 坐标约定声明（需 {\"after_exif\":bool,"
+            "\"mirrored\":bool}，描述相对摆正/镜像后图像的坐标系）")
+    if bool(ba.get("after_exif")) is not True:
+        raise yun_face.FaceInputError(
+            "标注 bind_apply.after_exif=false：管线始终按 EXIF 摆正后处理，"
+            "处理前坐标的标注无法安全换算，拒绝")
+    if bool(ba.get("mirrored")) is not mirrored:
+        raise yun_face.FaceInputError(
+            f"标注 bind_apply.mirrored={ba.get('mirrored')!r} 与实际 --face-mirror="
+            f"{mirrored!r} 不一致：坐标系矛盾，拒绝")
 
 
 def build_face_runner(args, sleep=None):
     """按 CLI 输入构建 yun_face.FaceRunner；未提供源返回 None。
 
     用 getattr 读取 face_* 参数，兼容旧调用方自造的 argparse.Namespace。
+
+    Rework R6（预检在任何真实网络请求之前——本函数在 Yun 构造/start 前被调用，
+    失败即未发出任何 start/split）：
+    - 照片：标注必须绑定该文件（source_sha256/source_path）并声明 bind_apply
+      坐标约定；未绑定/哈希不符/与镜像预处理矛盾 → 预检失败。
+    - 视频：必须提供逐帧标注 frames。本轮未移植检测模型（RetinaFace 在
+      deferred 清单），没有逐帧检测能力就在预检失败，不允许拿一份静态
+      标注冒充每帧检测、也不允许运行中选中无标注帧。
     """
     face_photo = getattr(args, "face_photo", None)
     face_video = getattr(args, "face_video", None)
@@ -978,19 +1166,43 @@ def build_face_runner(args, sleep=None):
         return None
     if face_photo and face_video:
         raise ValueError("--face-photo 与 --face-video 二选一（同一时刻只有一个输入源）")
-    detection = None
+    bundle = None
     face_detection = getattr(args, "face_detection", None)
     if face_detection:
-        detection = yun_face.load_detection_json(resolve_cli_path(face_detection))
+        bundle = yun_face.load_detection_bundle(resolve_cli_path(face_detection))
     else:
         print("[face] 未提供 --face-detection 标注：取景质量门将因无检测结果按失败处理"
               "（不以“图里有人脸”替代客户端姿态门）。")
     if face_video:
-        source = yun_face.VideoFrameSource(resolve_cli_path(face_video),
-                                           mirror=face_mirror)
+        vp = resolve_cli_path(face_video)
+        if not os.path.isfile(vp):
+            raise yun_face.FaceInputError(f"视频源文件不存在: {vp}（预检失败，未发出任何请求）")
+        if bundle is None or not bundle.frames:
+            raise yun_face.FaceInputError(
+                "视频源需要逐帧检测标注（--face-detection JSON 的 frames 帧号映射）。"
+                "检测模型未移植：没有逐帧标注能力时按预检失败停止，不用静态单标注"
+                "冒充每帧检测。")
+        _check_bind_apply(bundle, face_mirror)
+        try:
+            import cv2  # noqa: F401 —— 默认抽帧路径依赖，缺失必须预检失败
+        except ImportError as exc:
+            raise yun_face.FaceInputError(
+                "视频源默认抽帧需要 opencv-python（未安装）：预检失败，未发出任何请求"
+            ) from exc
+        detection = dict(bundle.frames)
+        source = yun_face.VideoFrameSource(vp, mirror=face_mirror)
     else:
-        source = yun_face.PhotoSource(resolve_cli_path(face_photo),
-                                      mirror=face_mirror)
+        pp = resolve_cli_path(face_photo)
+        if not os.path.isfile(pp):
+            raise yun_face.FaceInputError(f"照片源文件不存在: {pp}（预检失败，未发出任何请求）")
+        with open(pp, "rb") as f:
+            raw = f.read()
+        if bundle is not None:
+            yun_face.verify_photo_binding(bundle, raw, pp)
+            _check_bind_apply(bundle, face_mirror)
+        detection = bundle.static if bundle is not None else None
+        source = yun_face.PhotoSource(pp, mirror=face_mirror)
+        source.load()   # 预检：文件可解码（坏图在 start 前失败，不跑完再报）
     return yun_face.FaceRunner(source, detection=detection,
                                sleep=sleep or time.sleep)
 
@@ -1090,6 +1302,7 @@ def main(run=True):
         sure = 'y'
     else:
         sure = input("确认：[y/n]")
+    Yun = None   # 返修 R3：异常分支需要报告 recordId/最后确认位置（未构造时保持 None）
     try:
         if sure == 'y':
             if args.auto_run:
@@ -1149,10 +1362,25 @@ def main(run=True):
     except FaceRequiredError as e:
         print("[停止] " + str(e))
         print("[停止] A 阶段策略：识别人脸要求后不模拟、不猜测，请使用官方 App 完成核验。")
+    except BusinessException as e:
+        # 返修 R3：服务器明确拒绝（HTTP 200 业务 code!=200）= 终止性结果，
+        # 后续 split/finish 不再发送；保留 recordId 与最后确认位置供查询。
+        rid = getattr(Yun, "crsRunRecordId", None)
+        pos = getattr(Yun, "_last_confirmed_mileage_m", None)
+        pos_s = (f"最后确认位置≈{pos / 1000:.3f}km（末个已获 200 确认的批）"
+                 if isinstance(pos, int) else "尚无已确认批次位置")
+        print(f"[业务拒绝] {e}")
+        print(f"[业务拒绝] 后续上传/finish 均未发送。recordId={rid!r}，{pos_s}；"
+              "请先查询服务端记录状态再决定下一步，不要盲目重发。")
     except (HttpStatusException, DecodeException) as e:
         # 评审 §3-A.1：状态未知时保留现场、报告，而不是继续 finish 或自动重发
+        rid = getattr(Yun, "crsRunRecordId", None)
+        pos = getattr(Yun, "_last_confirmed_mileage_m", None)
+        pos_s = (f"最后确认位置≈{pos / 1000:.3f}km（末个已获确认的批）"
+                 if isinstance(pos, int) else "尚无已确认批次位置")
         print("[失败] " + str(e))
-        print("[失败] 请求结果可能未定（状态未知），不要盲目重发；请先查询服务端记录再决定。")
+        print(f"[失败] 请求结果可能未定（状态未知），不要盲目重发；recordId={rid!r}，"
+              f"{pos_s}；请先查询服务端记录再决定。")
     except Exception as e:
         print("跑步失败了，错误信息：")
         print(e)
