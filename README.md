@@ -1,262 +1,196 @@
-### 寄了
-
-**文档导航（develop）**：当前实际行为与操作方式见 [docs/USAGE.md](docs/USAGE.md)；
-协议构造与模块框架见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。下文为历史说明，
-与 develop 现状不一致处以 docs/ 两份文档为准。
-
-没想到这套AI时代之前的代码，能在无维护的情况撑一年，最后倒在了3.6.4的人脸上面，详见[issue](https://github.com/Zirconium233/yunForNewVersion/issues/78) 
-
-学长已经大四了，云运动里面没有任何跑步任务，连包的抓不了，已经失去维护项目的条件了 T_T
-
-这个项目大概率是死了，我会尝试去收集一下新版本云运动的人脸相关信息，看看能否用比较合适的方式解决。
-- 如果搞不定，项目会转为archived，不推荐fork，参考解密的实现方式即可，fork反而拉低AI的代码质量。（要是搞定了一定要开源啊，别闭源拿去卖钱了！）
-- 如果能搞定，我会更新项目的。（欢迎勇士提供有跑步任务的账号，作为人脸过验证的实验田）
-
-### 简介：
-
-这是(3.4.8)云运动代跑脚本，可以进行云运动全自动代跑。
-
-**比下面提示更重要的提示**：
-
-1. 作者大三了，没有跑步任务，完全失去的对脚本debug的能力，只能处理通信问题。但是我还是会尝试继续维护一段时间，不过问题信息收集依赖各位通过issue提供。
-
-2. [issue](https://github.com/Zirconium233/yunForNewVersion/issues/70) 确定错误原因是踩点要求改成3个了，之前是2个，地图录入时候大多数都是按2个的，所以错误。
-
-      - 解决方法1：自己跑几个通过的，然后history.py抓下来直接用就行。
-      - 解决方法2：编辑tasklist的json文件，把关键点ManageList都改成Y，把踩点数从2都改成5。
-      - (不用担心轨迹不过关键点，服务器不会去验证你到底踩没踩点，你说什么服务器信什么)
- 
-
-
-
-**重要提示**：云运动时隔1年，3.4.7 终于对加密方式下手了，新的加密逻辑和解决方案可以在 [issue#48](https://github.com/Zirconium233/yunForNewVerison/issues/48) 找到。
-
-1. **现在我们对cipherKey只有加密能力，没有解密能力，只能使用自己提供的~固定的Key~(现在是自己指定的Key)和服务器通信**。这个问题理论上无法解决，因为云运动工程师拍脑袋发现，非对称加密中客户端只用负责加密就行了，不需要解密能力。所以`libcrs-sdk.so`没有提供正确的PrivateKey。这个问题无解。
-
-2. **以后怎么抓包**：
-
-   - **如何获取历史记录**：`python history.py`，api细节可以参考 [这个](./history.md)
-
-   - **如何获取api接口**：这个抓包也是可以的，软件不可能加密访问的URL。参数的填写参考封包内容
-
-3. **TODO**
-
-   - 提供自动随机sm4Key通讯功能 - Done (By 10punny)
-   
-   - 封装抓历史记录功能 - Done
-
-   - 都大AI时代了
-     1. 是时候找个时间把代码改漂亮点，搞一些界面和自动配置出来了
-     2. 网络相关用python？翻译成网页，直接浏览器一键是不是更好？
-
-4. 常见问题：[常见问题](./questions.md)
-
-
-
-
-
-### 更新记录：
-
-- 2025/12/9：
-   1. 感谢 10punny 解决gmssl和hutool的验签问题，加密函数加上04头就可以被后端正确解密。现在我们可以使用随机密钥了(注意是随机加密，不是解密)详见[PR](https://github.com/Zirconium233/yunForNewVersion/pull/75)
-      
-   2. headers的user-agent被顺手更新成了4.9.1，虽然服务器一直都是忽略这个的。
-
-- 2025/3/16:
-   1. 封装抓历史记录功能。
-
-
-- 2025/2/25:
-   1. 修复3.4.7版本公钥密钥变换问题，脚本基本功能已经恢复。
-
-
-- 2024/12/3: 
-   1. 合并xiaocheng4097代码，提供登录功能支持，可以不抓包直接登录。
-
-   2. 增加自动版本检查，现在会自动检查`config.ini`里面的`app_edition`版本信息，如果小于3.4.5会自动更新最低可运行版本3.4.5，高版本不会更改(截至12/3日，最新版本为3.4.5)。过低的版本会导致服务返回错误信息，详见[issue#35](https://github.com/Zirconium233/yunForNewVersion/issues/35)。
-
-- 2024/10/28:
-   1. 合并laizhangtu代码，现在代理工具可以批量抓取config了。
-
-- 2024/10/18:
-   1. 修改并合并xiaochen4097代码，提供随机偏移添加功能(路线改变效果并不明显，所以也不会鬼畜)。
-
-   2. 有人测试发现ios版本也可以直接抓包token和deviceId，uuid使用当前代码，虽然很逆天但是真的过了。(还是不建议使用iOS登录信息跑本脚本)
-
-- 2024/10/12: 
-   1. 合并ANormalDD代码，提供屯溪路校区地图和自动抓包(配置教程见proxy.md)支持。
-
-   2. 允许传递参数执行`main.py`，提供`./tools/EasyAutoRunServer/run.sh`批量并行运行多个config的任务，配合crontab即可定时批量运行跑步任务(挂一个云服务器上就可以全自动)。
-
-- 2024/9/21：其实我什么都没干，然后它自己又能过了，实锤了是学校服务器问题。
-
-   <img src="./image/pass.png" alt="image" style="zoom:50%;" />
-
-   注意事项：
-   1. 新版本**无需填写config里面的utc和sign参数**(留空就行，直接把那2行删了会报错)，脚本会自动生成utc，然后和uuid计算得到sign。详见 [issue#1](https://github.com/Zirconium233/yunForNewVerison/issues/1)
-   2. finish包500的问题自己好了，不知道是学校服务器是草台班子还是采用即时生成utc方法解决的。现在finish返回的是code 200。
-
-
-- 2024/9/10：给points添加了时间戳数据，目前已经通过splitPointCheating接口测试，finish包还没过测试(神tm要求大二在2月到7月跑步，穿越时空是吧，看上去学校忘记调时间了)
-
-- 2024/5/3：更新随机提速脚本，用python复现了[Ma-minghao/Yunyundong (github.com)](https://github.com/Ma-minghao/Yunyundong)，因为原作者说python不熟...
-
-   <img src="./image/paceChanger.png" alt="image" style="zoom:50%;" />
-
-- ~~2024/5/2：更新了一个小工具，用java实现了端到端的解密，[Source code](https://github.com/Zirconium233/JavaSmDecryptToy)，各位再也不用麻烦费事的找在线解密网页了。~~（3.4.7失效，私钥不对，当然如果有人能拿到正确的私钥还是能用的）
-
-   <img src="./image/javaTool.png" alt="image" style="zoom:50%;" />
-
-   
-
-- 2024/4/3：更新多图随机打表模式，现在可以随机选择多套图中的一套来跑步了，同时也更新了定时系统，现在可以直接输入时间，自动随机选图打表。
-
-- 2024/3/31：更新main.py，现在打表模式再也不需要高德地图key了。顺便给了一个计数器工具，帮助各位自动7:30晨跑(但是你还是要支付电脑放一夜的电费)
-
-- 2024/3/14：添加打表模式，修复路径问题。(可惜finish返回500的问题还是没解决，不过不影响用，就是看着难受)
-
-   <img src="./image/goodMap.jpg" alt="image" style="zoom:50%;" />
-
-
-
-### 使用方法：
-
-**概览：**
-
-1. `pip install -r requirements.txt`
-2. 配置`config.ini`文件(自己抓包或者详见(proxy.md)，只填uuid, token, device_id, device_name 4个就行)
-3. `python history.py` 拿历史记录(有预置的可以直接跑，外校区需要配置)
-4. `pyhton main.py`(可以附带参数)
-5. 按照提示操作即可
-
-**细节：**
-
-1. 
-   - headers: 3.0.0新版本补充了utc，uuid，sign等参数(*3.3.1只需要uuid了，utc和sign可以自动生成，不建议写死*)，同token和deviceId一样需要获取，建议抓包获取，登录功能未经过测试，不保证功能。
-   
-   - 快速模式：无需等待直接通过，不过没有轨迹，但是程序算你过(不是实在没时间别用，被人工干了别找我.jpg)
-   
-2. 配置`config.ini`的具体事项：
-   - 必填: token,device_name,device_id,uuid，抓包获得，不建议更改。token决定了你可以访问你的账户，device_name和id是检测多机的，uuid和一个固定的随机数一样，应该也是检测多机的。
-   - `utc`, `sign`，`utc`是时间生成的随机数，`sign`是`utc`和`uuid`2者的md5值，具体怎么算的看代码就行了，服务器只会验证`sign`是不是前二者的md5，所以可以一套用到死，3.3.1以后脚本会自动生成这些参数，这2个不用填了。
-   - 可选：填写map_key，现在，打表模式再也不需要map_key了。
-   - 备注：只需要填写user部分就行，其他地方我已经设置默认值，如果你不知道那是什么，请不要更改。
-3. 关于`config.ini` 与 `tasklist.json`，可以使用`proxy.py` 快速配置。详细教程请参考[说明](./proxy.md)
-
-**打表模式：**
-
-- **简介：**
-
-1. 使用`task`文件夹的json文件控制轨迹，json文件来源是历史记录的抓包。
-2. 合工大翡翠湖和屯溪路校区有默认提供的表格，无需配置表格即可直接使用。
-
-
-~~更新--java解密小工具，专门用于解包：**(Dead，别看了，现在没有人可以解密)~~
-
-~~- 简介：如果你有java，双击打开`./tools/decrypt_java.jar`就行了*(jdk-17.0.9)*。(后续更新提供了命令行版本)~~
-
-**其他校区或者学校要额外配置：**
-
-1. 确保你config里面的school_host改对了
-2. 使用`history.py`获取跑步数据
-3. 打表
-
-6. **效果展示: **
-
-  - 肉眼无法分辨真假的轨迹：
-
-    <img src="./image/goodMap.jpg" alt="image" style="zoom:50%;" />
-
-  - 进度条显示(只支持打表模式)
-
-    <img src="./image/processBar.png" alt="image" style="zoom:50%;" />
-
-
-**补充抓包教学：**
-
-**新版本可以考虑直接使用ADNormalDD提供的`proxy.py`，教程见`./proxy.md`**
-
-发现很多老哥卡在抓包上了，其实这个云运动是学校架设服务端，还用的http，所以基本上随便抓包，不用什么群里说的fiddler远程、CA证书、ss代理等，甚至还有群友kali都整上了...
-
-其实没这么复杂，我这里介绍一个最简单的方法，**不用root，有一部手机就可以**：
-
-1. Google Play上随便搜一个抓包软件(搞不定Google？你都能上github还搞不定Google？【笑)
-
-   <img src="./image/googleplay.jpg" alt="image" style="zoom:50%;" />
-
-2. 安装它，配置VPN给它过(演示用的群友给的`PCAPdroid`，你用哪个都差不多)
-
-   <img src="./image/VPN.jpg" alt="image" style="zoom:50%;" />
-
-3. 进云运动，随便翻一翻
-
-4. 如果是对于合工大的，找到`ip`是`210.xxx.xxx.xxx:8080`的包就行
-
-   <img src="./image/package.png" alt="image" style="zoom:50%;" />
-
-5. copy里面headers的一切，照着填上去就行了
-
-   <img src="./image/header.jpg" alt="image" style="zoom:50%;" />
-
-6. 还有老哥问sys_edit这个参数，这个是安卓大版本，随便填一个就行，我一般填12，当然我手机是安卓13，服务器不会检查这个
-
-**3.0.0导航模式的残留代码(新版本不推荐使用这种方式，很久没维护了)：**
-
-1. `map.json`的点，你自己post一下getHomeInfo那个，对着地图选几个好看的点填上去就行。我把原作者的随机选点方法弃用改成了手动选点的方法，因为学校很贴心的把位置限定在了一个操场，选的点太乱会导致轨迹魔怔(虽然现在轨迹也很魔怔，不过起码不会抽搐了)
-
-   **补充：**issue里面有老哥提到了轨迹问题，我详细介绍一下`map.json`的作用：
-
-    	1. 这个`map.json`记录的是跑步的控制点，控制着给高德导航目的地的顺序，导航会从里面的上一个点走向下一个点。
-    	2. config.ini里面有一个参数是初始点，这是导航最开始的点，别只改map忘记改这个了。
-    	3. getHomeInfo的点是关键点，就是你跑步要踩点的几个点。
-    	4. 把getHomeInfo的点copy过来相当于作者原本的导航直冲关键点方法，好处是方便，缺点是可能路径直来直去会魔怔。
-    	5. 你可以自己对着地图选优质的点，按顺序填入，从而准确的控制脚本走的路径。
-    	6. 当点距离足够近的时候还是推荐用导航，因为导航会返回距离，当然如果你有用经纬度精确计算里程的把握，你可以设计算法手动跑，这样就不需要高德的map_key了。
-    	7. 经过测试，服务器的关键点也是以你给的点为准，你说什么点是关键点，有没有踩点，服务器就信什么。
-
-   **代码实现细节：**
-
-   普通模式，脚本默认会把`map.json`里面的点当成控制点上传给服务器(回跑的时候不会重复上传关键点)。这是一个偷懒的方式，如果你直接用getHomeInfo的点就不会有问题，当然如果你微操每一个点，打上100个，可能出现一次跑步100个关键点的逆天情况，这时候你可以改代码，比如每20个点add_task后才给manageList.append()一次关键点。*(你可以自己实现，我反正现在都是打表了)*
-
-3. 如果是其他学校要改主机，这个很简单，替换一下就行，当然接口如果用的不一样那没办法，自己抓包研究吧(无慈悲)。
-
-### 相关REPO：
-
-之前的工作：感谢yun大佬的初代脚本[kontori/yun: 云运动一键跑步脚本，理论上适用于一切使用云运动的学校的健跑任务，包括但不限于合肥工业大学 (github.com)](https://github.com/kontori/yun)，为整个脚本提供逻辑框架，可惜作者停更了。
-
-远古的最新消息：仓库公开前已经有人完成了相关工作，[StarYuhen/Yun: 云运动，协议一键刷路程脚本 (github.com)](https://github.com/StarYuhen/Yun)，不过用的接口和合工大的不同，已经测试了合工大用的是`/splitPointCheating`接口，`headers`也大改加了检测，所以合工大学生不能直接使用那个版本。那个项目issue里面提到的更新版本也是这个原因。(随口一提：其实我猜项目作者学校使用的才是老接口，合工大其实是新接口，那位打的其实是简单局，虽然难度也没差多少就是了)（错了当我没说...）
-
-### 加密相关细节：
-
-#### 云运动新版本的加密模式：
-
-1. 随机生成sm4密钥，通过sm2加密sm4密钥。对应"cipherKey"参数
-2. 用sm4密钥加密数据，对应"content"参数
-3. 3.4.7换了公钥，私钥是乱给的，也就是现在我们不能解密，只能加密，详见开头。
-
-#### 云运动防止修改的小细节：
-
-1. sm2密钥存放于`crs-sdk.so`中，包括公钥和私钥。
-2. 这个c++ 库会检查dex文件，如果文件被篡改，会返回错误的密钥(服务器可能因此判定软件作弊)。
-3. apk安装包文件被360壳保护，需要脱壳才能反编译。
-4. 服务器使用`/run/splitPointsCheating`域名，加入了检测，路径不能再魔幻了。
-
-#### 本次实现的细节(偷懒部分)：
-
-~~1. utc是随时间自动改变的，但服务器不会验证，所以可以不管，保证一套sign和utc、uuid对应上就行，具体表现是一次抓包获取一切。~~（已经修了）
-2. cipherKey你给服务器什么服务器就用什么，所以我是直接默认给了一个cipherKey，用到死(偷懒，逃)，当然如果你愿意随机密钥，我提供了sm2加密解密函数和公钥私钥，你可以自己改代码实现。(其实原本不打算偷懒的，但java实现用的hutool和python的gmssl验签过不了，不知道什么原因，看上面那个实现也是一套cipherKey用到死，就不管了，逃~)
-3. finish你说什么服务器信什么，你就是刚刚start原地没动下一秒finish说跑了2公里，服务器都信。路径点都不用上传的，我已经用这个方法干好几天了，系统算的是通过，所以就做了一个快速模式，还是不要用为好。
-
-#### 加密破解方法(面向开发者)：
-
-0. 这个加密的破解搞的头大，大一下课排满了，晚自习搞破解，要不然上周末应该就出来了(周六工程课进厂打工一天我"爱你"合工大)。
-1. 反编译是通过Frida把真正的dex文件hook出来的，使用安卓虚拟机+adb。这里抓到的大多数是系统和依赖的dex，5秒延迟开深度大概率可以得到云运动的dex文件。
-2. 使用dex2jar项目把dump出来的dex文件变成jar文件，然后使用jd-gui反编译找的加密代码。jadx的反编译不太行，用dex2jar的。
-3. so库使用IDA分析的，IDA不是Pro居然还不给我分析ARM文件，逆天。
-4. 2025/12/9: gmssl和hutool过验签要加一个04头，见 10punny 的 [PR](https://github.com/Zirconium233/yunForNewVersion/pull/75)
-
-### 最后：
-
-**这玩意随缘更新，有能力的推荐自己修改使用，把这个当成一个demo就好...**
-
-*免责声明：一切内容只能用于交流学习，24h内自觉卸载，否则后果自负。*
+# 云运动自动跑步脚本（develop：3.6.6 协议层重构，已通过两轮评审返修）
+
+**文档导航**：当前实际行为与操作方式见 [docs/USAGE.md](docs/USAGE.md)；
+协议构造、人脸子系统与偏差清单见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+本 README 顶部为 develop 现状汇报与最新配置教学；底部保留仍有价值的历史档案。
+
+状态：按 APK 3.6.6 反编译逐字段对齐；148 项离线测试全绿（禁网守卫下复证）；
+两轮评审返修（R1-R6 + S1-S3）通过。**未做账号实机验证**——离线口径为
+`offline_client_compatibility`，服务端接受性待实机。
+
+## 1. 相对 master 的功能性改动（服务器可见 / 行为可见）
+
+| 功能点 | master | develop |
+|---|---|---|
+| 请求身份 | uuid 固定读配置；utc/sign 整会话算一次复用 | 每请求随机大写 UUID + 新鲜 utc + 重算 sign（3.6.6 真机行为）；`legacy_uuid=1` 可回退旧协议 |
+| 业务 code | 只看 HTTP 200，响应仅打印 | `code≠200 → BusinessException` 传播即停，后续 split/finish 一律不发，报告 recordId 与最后确认位置；HTTP 层错误（结果未知）与业务拒绝严格区分，不自动重放 |
+| splitPoint 载荷 | StepNumber=里程差÷步幅（自造）；null 字段丢失 | Gson serializeNulls 字段序、null 保留；StepNumber=表格真实 runStep 差值（loader 不再丢 runStep/ts）；体级 gzip 仅该端点白名单 |
+| 结束链 | 直接 finish | `/run/isStandard`（同一 P1 体）状态检查先行 → 必要尾批（改为暂存至此补发）→ finish；检查失败/未知/返回 url,list → 后两者不发 |
+| 自动人脸 | 无（当年正倒在 3.6.4/3.6.6 人脸验证上，见 [issue#78](https://github.com/Zirconium233/yunForNewVersion/issues/78)） | 新增整套：窗口调度、比对上传、重试/等待状态机、faceTime+4s 预算、成功守卫（未确认窗口拒绝 finish） |
+| getRlStatus/采集 | 无 | `live_probe.py` 只读探测 getRlStatus；采集端点 `runFaceInfo` **有意不自动调用**（真人审核流，脚本代发=伪造身份材料） |
+| 响应解码 | 单一 SM4 | 明文 JSON / SM4 / SM4+gzip 三形态统一，异常即 DecodeException |
+| 登录后置 | 首个请求仍带旧 base_url/空 token | 登录后同步内存客户端（含学校地址探测结果）；输出脱敏 |
+| 其它 | — | `--dry-run` 全离线演练、config/task 路径 CLI 贯穿、history.py 记录查看器 |
+
+## 2. 自动人脸现状
+
+**真机 APK 发送什么**（JTFaceCompareActivity.java:724-740）：
+
+```json
+POST /run/appFace/runFaceInfoComparison
+{ "faceBaseData": "Base64_NO_WRAP(压缩后JPEG整帧)", "recordId": "<start响应的record>" }
+```
+
+图像是取景质量门（人脸尺寸/俯仰/偏航/滚转）通过后的**整帧**（不裁剪），经
+FaceImageCompressor：EXIF 摆正→宽>720 才缩→质量阶梯 80..20 压至 ≤150KB。
+比对基准在**服务端注册照**（`runFaceInfo` 采集 + 审核状态机：
+`getRlStatus.runFaceStudentStatus` Y=可跑 / N、N0=需（重新）采集 / N1=审核中禁跑）。
+
+**我们发送什么**：与上面逐字节同构（两键、同 b64 形态、同压缩链，含
+"限宽不限长边、150KB 硬目标"等 WIRE_AUDIT 修正）；图片来源为
+`--face-photo` / `--face-video` + 人工标注 JSON（内容哈希绑定 + 取景门复算 +
+start 前全量预检）。**限制如实声明**：检测模型（RetinaFace）未移植，标注必须
+人工提供；等待期复用同一张图、语音引导 4s、重试形态对齐 APK，但比对阈值在
+服务端，离线不可测。
+
+**第一次实机通过概率（分层估计，非单一数字）**：
+
+| 层 | 依据 | 首验估计 |
+|---|---|---|
+| 传输/信封/加密 | 与已可用端点同通道 + 148 测试/10 项字段护栏 | ~90% |
+| 业务受理（recordId 时机、学校人脸开关、两键体） | 键面逐字对照 APK | ~75% |
+| 比对本体 status=Y | 取决于账号人脸注册状态 | 状态 Y + 本人真照：~50-70%；未注册：≈0（先真机 APP 采集，N1 期间连 APP 都禁跑） |
+
+综合：L1 探测为 Y 且提供本人合格照片时，端到端首验约 **4-6 成**；未注册账号
+人脸任务现在不可能过——这与脚本代码质量无关，先用 `live_probe.py` 探状态。
+
+## 3. 代码结构与文件职能
+
+```
+├── main.py            CLI 入口 + Yun_For_New 会话编排：start/split/尾批暂存/
+│                      结束链(isStandard→尾批→finish)、人脸窗口接线与守卫、
+│                      build_face_runner 全量预检、dry-run
+├── yun_http.py        协议边界：DeviceProfile、SM2/SM4 信封、每请求 sign/uuid、
+│                      gzip 白名单、三形态解码、异常体系、YunClient
+├── yun_face.py        人脸子系统：照片/视频源、sha256 内容绑定、标注 Bundle、
+│                      取景质量门、APK 压缩链、窗口触发(W1)、FaceRunner、
+│                      FaceVerifier(预算状态机+双段超时裁剪)、compare_once
+├── live_probe.py      实机 L1 只读探测：login + getRlStatus，零写操作
+├── history.py         历史记录查看器（抓轨迹做打表数据 / 事后核验）
+├── tools/Login.py     登录（凭据来自 ini；token 脱敏；地址探测失败保留配置）
+├── tools/getUrl_Id.py 学校地址/ID 发现（当前网络环境不可达时可预填绕过）
+├── tools/drift.py / pace_changer.py / proxy.py   漂移 / 配速 / 抓包配置工具
+├── tools/EasyAutoRunServer/run.sh                多 config 批量并行（crontab 可用）
+├── tests/             148 项：yun_http(信封/字段序/序列化)、yun_face(窗口/压缩/
+│                      verifier/绑定)、main_phase_a(会话流程/dry-run)、
+│                      wire_alignment(10 项服务器视角护栏)、
+│                      rework_final(R1-R6+S1-S3)、phase_a_fixes
+├── docs/USAGE.md      用户文档（配置/CLI/人脸输入/失败分支表）
+├── docs/ARCHITECTURE.md 分层 + 线上载荷投影 + 偏差清单 §7(10 条) + 测试地图
+├── config.ini         唯一配置（见下方教学；实机期间禁提交含密码的副本！）
+├── dry_run_home.json  dry-run 离线夹具（数据已脱敏）
+└── tasks_fch|txl|xc/  打表任务表（runStep 保真）
+```
+
+## 4. 快速开始
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate            # Windows；Linux/macOS 用 source .venv/bin/activate
+pip install -r requirements.txt    # 测试再加 -r requirements-dev.txt
+pytest tests -q                    # 148 项，全程禁网可跑
+python main.py --dry-run           # 全离线演练（不登录、不发任何真实请求）
+python live_probe.py <跑步区域名>  # 实机第一步：登录+查人脸状态（只读）
+python main.py                     # 正式跑（先小步验证，见 docs/USAGE.md §6）
+```
+
+常用参数：`-f/-t` 指定 config/task 目录；`-a` 自动模式（map.json 路线，旧行为
+保留）；`-d` 轨迹漂移；`--face-photo/--face-video/--face-detection/--face-mirror`
+人脸源（见 §人脸输入）。
+
+## 5. 配置教学（2026 develop 版）
+
+所有配置在 `config.ini`。**开发/实机期间切勿把填了密码的 config.ini 提交进 git。**
+
+### [Login]（实机必填）
+- `username` / `password`：学号与密码。留空则运行时交互询问。登录响应里的
+  token 自动写回 `[User]`，**不再需要抓包填 token**。
+- 登录失败可能触发服务端锁定/验证码：首次失败即停，勿盲目重试。
+
+### [Yun]（多数保持默认；实机核对三项）
+- `school_host` / `school_id` / `school_login_url`：学校服务端三要素。地址
+  发现接口（`yun_host:8085`）在部分网络环境不可达——探测失败时脚本保留既有
+  配置，直接手填即可（合工大：`http://210.45.246.53:8080` / `100` /
+  `appLoginHGD`；其他学校抓包 `210.x.x.x:8080` 类 URL 照抄）。
+- `app_edition`：3.6.6 行为基准（脚本按此生成 3.6.6 形态请求）。
+- `legacy_uuid=1`（可选，[User] 段）：回退"固定 uuid + 会话级 sign"旧协议，
+  仅当服务端按新版本拒绝请求时排查用。
+- `md5key/publickey/privatekey/cipherkey*`：协议密钥，仓库内公共值，勿改。
+
+### [User]（全部留空）
+- token/device_id/device_name/uuid/utc/sign 由登录与每请求逻辑自动维护。
+  历史教程里"手填 4 件套"的方式仍兼容，但 3.6.6 起 uuid 每请求随机，
+  固定值只在 legacy 模式有意义。
+
+### [Run]（打表参数，按需微调）
+- `split_count` 每批点数（默认 10）；`min_distance`/`allow_overflow_distance`
+  里程约束；`cadence_min_offset`/`max_offset`、`strides` 步频步幅扰动；
+  `exclude_points` 围栏排除点。默认值可用，异常时先别动。
+
+### 人脸输入（跑带人脸窗口任务时）
+标注 JSON 与照片/视频放一起，`--face-detection` 指向它：
+
+```json
+{
+  "box": [100, 120, 260, 360],                    // 人脸框（原图像素坐标）
+  "points": [[130,180],[230,180],[180,240],[150,260],[210,260]],  // 五官点
+  "score": 0.9, "space": "image",
+  "source_sha256": "<照片或视频文件的SHA-256>",    // 内容绑定，必需
+  "bind_apply": {"after_exif": true, "mirrored": false}            // 坐标声明
+}
+```
+
+- 照片：整帧正面自拍，人脸占比/角度过取景门即可（可用图像查看器量坐标；
+  哈希用 `certutil -hashfile <文件> SHA256` 或 `python -c "import
+  hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" <文件>`）。
+- 视频：改用 `"frames": {"<帧号>": {box/points/score/space...}}` 逐帧标注，
+  `source_sha256` 绑定的是**视频文件**内容。
+- 任何绑定不符/预检不过 = start 之前就报错停止，不会创建服务端记录。
+- 完整语义（含失败分支表）见 docs/USAGE.md §4。
+
+### 抓包兜底（登录不可用时）
+新版无需 root：手机装 PCAPdroid（Google Play 搜索）→ 配 VPN 放行 → 云运动
+随便翻页 → 抓 `210.x.x.x:8080` 的请求 → headers 里 token/deviceId 抄进
+config.ini 对应项。图示版教程保留在下方历史档案与 [proxy.md](proxy.md)。
+
+## 6. 常见问题
+
+- 常见问题清单见 [questions.md](questions.md)；失败分支的机器可读含义见
+  docs/USAGE.md §7 表格（BusinessException=服务端明确拒绝：修数据/修时机；
+  传输结果未知：勿自动重发，先 history.py 查记录）。
+- finish 被"人脸完整性守卫"拦截：说明有窗口未弹或比对未确认——脚本有意
+  为之（不静默收尾）；服务端会留一条未完成记录，可在云运动 APP 内删除
+  （协议存在 `run/deleteCrsRunRecordById`，脚本未实现该操作）。
+
+---
+
+## 历史档案（仍有参考价值的内容）
+
+### 加密史一句话
+3.4.7 起云运动改用 SM2 包 SM4 信封（客户端只加密不签名回验，`04` 头 hex →
+Base64 才能被 hutool 验签，见 [PR#75](https://github.com/Zirconium233/yunForNewVersion/pull/75)）；
+现在该逻辑全部收敛在 `yun_http.py`，密钥每请求随机。客户端对 cipherKey 只有
+加密能力没有解密能力（服务端公钥设计如此）——所以"解密别人流量"走不通，
+读自己的记录用 `history.py`（api 细节见 [history.md](history.md)）。
+
+### 踩点/围栏一句话
+服务器对关键点 ManageList 的"踩点数"要求改过（2→3），任务表按
+`isFence=Y` 覆盖踩点即可——服务端对轨迹细节的信任度比想象中高，围栏点
+列表在 config `[Run] exclude_points` 可调。
+
+### 主要历史节点（完整记录 `git log --all`）
+- 2025-12 随机 SM4 key 通讯（10punny）；2024-12 登录功能合并（可不抓包）；
+  2024-10 屯溪路地图 + proxy.py 批量抓配置、EasyAutoRunServer 批量并行；
+  2024-09 起打表模式 / 时间戳 / 多图随机。
+- 项目曾于 3.6.4 人脸验证上线后停摆（[issue#78](https://github.com/Zirconium233/yunForNewVersion/issues/78)）；
+  develop 分支即该问题的完整解决方案（人脸链路重构 + 3.6.6 对齐）。
+
+### 抓包图示（原版保留）
+<img src="./image/googleplay.jpg" alt="image" style="zoom:50%;" />
+<img src="./image/VPN.jpg" alt="image" style="zoom:50%;" />
+<img src="./image/package.png" alt="image" style="zoom:50%;" />
+<img src="./image/header.jpg" alt="image" style="zoom:50%;" />
+
+效果展示（历史截图，3.4.x 时代）：肉眼难辨的轨迹与进度条
+<img src="./image/goodMap.jpg" alt="image" style="zoom:50%;" />
+<img src="./image/processBar.png" alt="image" style="zoom:50%;" />
