@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""人脸输入适配 + 上传 + 客户端状态机（docs/REVIEW_FACE_PLAN.md §二/§三 方案 1、2）。
+"""人脸输入适配 + 上传 + 客户端状态机（work_dir/develop_docs/REVIEW_FACE_PLAN.md §二/§三 方案 1、2）。
 
 静态依据（APK 3.6.6 反编译，work_dir/src/sources/com/yunzhi/tiyu/）：
 - 端点 API.java:412-416：注册 run/appFace/runFaceInfo（本模块不提供自动注册！），

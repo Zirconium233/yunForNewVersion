@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""docs/REVIEW_FACE_PLAN.md §一 阻断问题的回归测试（P1-1/P1-2/P1-3、P2、质量问题）。"""
+"""work_dir/develop_docs/REVIEW_FACE_PLAN.md §一 阻断问题的回归测试（P1-1/P1-2/P1-3、P2、质量问题）。"""
 import argparse
 import base64
 import configparser

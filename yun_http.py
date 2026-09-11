@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""A 阶段：最小“请求构造 / 响应解码”边界（docs/review_and_revised_plan.md §3-A）。
+"""A 阶段：最小“请求构造 / 响应解码”边界（work_dir/develop_docs/review_and_revised_plan.md §3-A）。
 
 设计约束（来自评审基线，优先于 work_dir 下原方案）：
 - 保留 requests 与既有 gmssl 加密实现；不引入自动重试。
@@ -373,7 +373,21 @@ class RequestContext:
     sm4_key_b64: str
 
     def headers(self, profile: DeviceProfile) -> Dict[str, str]:
+        """线上对齐（3.6.6 抓包审查）：与 APK 头部集合/取值逐一对应。
+
+        - 顺序与集合 = RetrofitService.java:108-110 应用拦截器按固定次序添加的
+          11 个自定义头（Content-Type 最先；uuid 在 utc 之前）；
+        - Content-Type 精确为 "application/json"（APK 就是该字符串，无 charset 后缀）；
+        - User-Agent/Accept-Encoding 是 OkHttp 网络层默认头
+          （okhttp3/internal/Util.java:102，userAgent="okhttp/4.9.1"），
+          由 _get_session() 统一注入，不混入业务头；
+        - Accept 与 Connection 均不发送：App 从不发 Accept（requests 默认头的
+          "Accept: */*" 是脚本可识别差异），OkHttp 在 HTTP/1.1 也不发 Connection
+          头（requests 默认的 "Connection: keep-alive" 同理），由共享 Session
+          清除默认头实现。
+        """
         return {
+            "Content-Type": "application/json",
             "token": profile.token,
             "isApp": "app",
             "deviceId": profile.device_id,
@@ -381,12 +395,8 @@ class RequestContext:
             "version": profile.app_edition,
             "sysVersion": profile.sys_version,  # 3.6.6 新增头（RetrofitService.java:108）
             "platform": profile.platform,
-            "Content-Type": "application/json; charset=utf-8",
-            "Connection": "Keep-Alive",
-            "Accept-Encoding": "gzip",
-            "User-Agent": _DEFAULT_UA,
-            "utc": self.utc,
             "uuid": self.uuid,
+            "utc": self.utc,
             "sign": self.sign,
         }
 
@@ -491,7 +501,51 @@ class _FakeResponse:
 
 
 def _real_transport(url: str, data: str, headers: dict, timeout) -> Any:
-    return requests.post(url=url, data=data, headers=headers, timeout=timeout)
+    return _get_session().post(url=url, data=data, headers=headers, timeout=timeout)
+
+
+_SESSION: Optional[requests.Session] = None
+
+
+def _get_session() -> requests.Session:
+    """进程共享 Session（可注入替换）：
+
+    - 头部：清除 requests 默认头（Accept: */*、Connection: keep-alive、
+      python-requests UA 均为 App 不会出现的可观测差异），只保留 OkHttp 网络层
+      等价的 User-Agent/Accept-Encoding；业务头仍按请求由 RequestContext 注入。
+    - Cookie：APK 的 OkHttpClient 配了 CookiesManager（RetrofitService.java:137），
+      服务端一旦下发 Cookie，真机后续请求都会携带；无 CookieJar 的裸请求是
+      可观测差异，因此这里用持久 CookieJar 对齐（Cookie 的具体内容取决于
+      服务端 Set-Cookie，无法也不应本地伪造）。
+    """
+    global _SESSION
+    if _SESSION is None:
+        s = requests.Session()
+        s.headers.clear()
+        s.headers.update({"User-Agent": _DEFAULT_UA, "Accept-Encoding": "gzip"})
+        _SESSION = s
+    return _SESSION
+
+
+# APK（Java GZIPOutputStream，hutool ZipUtil.gzip 的底层）gzip 容器头实测字节：
+# 1f 8b 08 00 | MTIME=0(4B) | XFL=00 OS=ff（桌面 JDK21 实测；Android libcore 与
+# OpenJDK 同源 ojluni，未在真机复测——静态推断）。Python gzip.compress 默认写
+# 当前 mtime、OS=0x0a，SM4 解密后这 5 个明文字节服务器可直接与真机样本比对。
+_GZIP_APK_HEADER = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff"
+
+
+def gzip_apk(raw: bytes) -> bytes:
+    """构造与 APK 头部字节一致的 gzip 容器（白名单接口的 content 前置压缩）。
+
+    deflate 本体仍由 zlib 产生（不同压缩器实现本就不同，解压后不可见）；
+    容器头/CRC/长度完全按 RFC 1952 + JDK 取值。解压语义与 gzip.compress 等价。
+    """
+    import struct
+    import zlib
+    co = zlib.compressobj(6, zlib.DEFLATED, -zlib.MAX_WBITS)
+    body = co.compress(raw) + co.flush()
+    crc = zlib.crc32(raw) & 0xFFFFFFFF
+    return _GZIP_APK_HEADER + body + struct.pack("<II", crc, len(raw) & 0xFFFFFFFF)
 
 
 class YunClient:

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""云运动脚本主入口（A 阶段改造，见 docs/review_and_revised_plan.md §3-A）。
+"""云运动脚本主入口（A 阶段改造，见 work_dir/develop_docs/review_and_revised_plan.md §3-A）。
 
 兼容承诺（旧调用方）：
 - CLI 参数保持 --config_path/-f、--task_path/-t、--auto_run/-a、--drift/-d；
@@ -227,7 +227,7 @@ def parse_args():
                         help='离线演练：本地 fixture + 假传输，不登录/不探测学校/不调高德/不 sleep/不写配置')
     parser.add_argument('--dry-home', dest='dry_home', type=str, default=None,
                         help='dry-run 用 getHomeRunInfo 响应 fixture（JSON 文件路径）')
-    # 人脸输入适配（docs/REVIEW_FACE_PLAN.md §三 方案1/2）：仅提供源时 Y 任务才启用离线管线
+    # 人脸输入适配（work_dir/develop_docs/REVIEW_FACE_PLAN.md §三 方案1/2）：仅提供源时 Y 任务才启用离线管线
     parser.add_argument('--face-photo', dest='face_photo', type=str, default=None,
                         help='人脸输入：本人照片路径（人像照，非证件扫描）')
     parser.add_argument('--face-video', dest='face_video', type=str, default=None,
@@ -386,6 +386,146 @@ def apply_login_result(token: str, device_id: str, device_name: str,
     if new_host:
         my_host = new_host
         _CLIENT.base_url = new_host
+
+
+# ------------------------------------------------- 线上载荷对齐（3.6.6 APK 取证）
+# 依据：module/running/model/UpPointsModel.java 与 UpPointModel.java（Gson 序列化，
+# GsonUtils.getGson() 配 serializeNulls+disableHtmlEscaping：null 字段保留、字段序
+# =声明序）、SportRunMapActivity.P1():2535-2600（finish 体，org.json 插入序）、
+# SportRunMapActivity.startRun():4820-4825（start 体，HashMap<String,String>）。
+# 线上审查发现的旧脚本明显字段差异全部在此收敛：
+#   1) split 体的 "time" → APK 实为 "times"（long，秒）；
+#   2) StepNumber/speeds/strides/runSteps 必须是数字（旧脚本发格式化字符串/浮点步数），
+#      且 APK 内部这些量互为派生（Y1:2945-2960），脚本按同一公式派生保持自洽；
+#   3) 点项只允许 UpPointModel 的 9 个字段，类型严格按 bean（旧脚本透传表格里的
+#      id/runRecordId 等额外键、数字写成字符串）；
+#   4) finish 体键序与取值格式按 P1()（sysEdition="Android_"+版本名；duration 字符串；
+#      remake 为 BaseCheckUtil.detect 的 "score|evidence"，干净设备实发 "0|{}"）；
+#   5) manageList 空时 APK 不写该键（P1:2560）。
+# 已知语义偏差（脚本无传感器，无法复现真机数值，字段格式已对齐）：
+#   StepNumber/runSteps 由里程/步幅估算（真机来自计步器）；simulateNum 恒 0（真机
+#   统计 mock 点，脚本点全部按真实位置发送）；remake 恒 "0|{}"（复现“未检出克隆/
+#   多开环境”的设备自检输出形态，不代表对运行环境的背书）。
+
+_SPLIT_BODY_ORDER = ("StepNumber", "a", "b", "c", "cardPointList", "crsRunRecordId",
+                     "mileage", "orientationNum", "runSteps", "schoolId",
+                     "simulateNum", "speeds", "strides", "times", "userName")
+_POINT_FIELD_ORDER = ("isFence", "isMock", "point", "runMileage", "runStatus",
+                      "runStep", "runTime", "speed", "ts")
+_dropped_point_keys = set()
+
+
+def _project_card_point(point):
+    """把表格/任务字典投影为 UpPointModel 的 9 字段，类型严格对齐 bean。"""
+    for extra in point:
+        if extra not in _POINT_FIELD_ORDER and extra not in _dropped_point_keys:
+            _dropped_point_keys.add(extra)
+            print(f"[wire] 点项含 APK bean 外字段，按 UpPointModel 裁剪（该键仅提示一次）: {extra!r}")
+
+    def _num(v, cast):
+        try:
+            return cast(float(v))
+        except (TypeError, ValueError):
+            return cast(0)
+
+    speed_raw = point.get("speed", "0.0")
+    speed = speed_raw if isinstance(speed_raw, str) else format(float(speed_raw), ".2f")
+    return {
+        "isFence": str(point.get("isFence", "Y")),
+        "isMock": bool(point.get("isMock", False)),
+        "point": str(point.get("point", "")),
+        "runMileage": _num(point.get("runMileage", 0), float),   # bean: double
+        "runStatus": str(point.get("runStatus", "1")),
+        "runStep": _num(point.get("runStep", 0), int),           # bean: int
+        "runTime": _num(point.get("runTime", 0), int),           # bean: long
+        "speed": speed,                                          # bean: String
+        "ts": str(point.get("ts", "")),
+    }
+
+
+def _build_split_body(record_id, user_name, school_id, points, strides_cfg):
+    """splitPointCheating/splitPoints 体（UpPointsModel Gson 形态，声明序+null 保留）。"""
+    pts = [_project_card_point(p) for p in points]
+    mileage = pts[-1]["runMileage"] - pts[0]["runMileage"]        # 米，double
+    times = pts[-1]["runTime"] - pts[0]["runTime"]                # 秒，long
+    s_cfg = float(strides_cfg or 0)
+    step_number = int(round(mileage / s_cfg)) if s_cfg > 0 else 0
+    minutes = times / 60.0
+    # 与 Y1() 同一组派生公式（Y1:2947-2959）：speeds 是配速 min/km。
+    speeds = minutes / (mileage / 1000.0) if (times > 0 and mileage > 10.0) else 0.0
+    run_steps = step_number / minutes if minutes != 0 else 0.0
+    strides_val = (mileage / step_number) if step_number != 0 else 0.0
+    body = {
+        "StepNumber": step_number,                               # bean: int
+        "a": 0,
+        "b": None,                                               # serializeNulls → 显式 null
+        "c": None,
+        "cardPointList": pts,
+        "crsRunRecordId": str(record_id),                        # bean: String
+        "mileage": mileage,
+        "orientationNum": 0,
+        "runSteps": run_steps,
+        "schoolId": str(school_id),                              # bean: String
+        "simulateNum": 0,
+        "speeds": speeds,
+        "strides": strides_val,
+        "times": times,                                          # 键名是 times，不是 time
+        "userName": str(user_name),
+    }
+    assert tuple(body) == _SPLIT_BODY_ORDER
+    return body
+
+
+def _sys_edition_field():
+    """finish 体 sysEdition：APK 固定发 "Android_"+版本名（P1:2574-2577）。
+
+    配置 sys_edition/sys_version 存裸版本名（如 "14"，头部 sysVersion 用裸值）；
+    已带 Android_ 前缀的配置值原样透传，避免双前缀。
+    """
+    v = str(my_sys_version or my_sys_edition or "")
+    if not v:
+        return v
+    return v if v.startswith("Android_") else "Android_" + v
+
+
+def _norm_manage_list(manage_list):
+    """manageList 项严格按 P1:2561-2567 的 {point, marked, index}；空则整体省略键。"""
+    out = []
+    for item in (manage_list or []):
+        out.append({
+            "point": str(item.get("point", "")),
+            "marked": str(item.get("marked", "")),
+            "index": int(float(item.get("index", 0))),
+        })
+    return out
+
+
+def _build_finish_body(record_mileage_km, recode_cadence, recode_pace, recode_dislikes,
+                       manage_list, ra_run_area, ra_id, ra_type, record_id,
+                       duration_s, record_start_time):
+    """finish 体（P1() org.json 插入序；全部字符串值；空 manageList 不写键）。"""
+    body = {}
+    ml = _norm_manage_list(manage_list)
+    if ml:
+        body["manageList"] = ml
+    body["recordMileage"] = format(float(record_mileage_km), ".2f")
+    body["recodeCadence"] = str(int(float(recode_cadence)))
+    body["recodePace"] = format(float(recode_pace), ".2f")
+    body["deviceName"] = str(my_device_name or "")
+    body["sysEdition"] = _sys_edition_field()
+    body["appEdition"] = str(my_app_edition or "")
+    body["raIsStartPoint"] = "Y"
+    body["raIsEndPoint"] = "Y"
+    body["raRunArea"] = str(ra_run_area)
+    body["recodeDislikes"] = str(int(float(recode_dislikes)))
+    body["raId"] = str(ra_id)
+    body["raType"] = str(ra_type)
+    body["id"] = str(record_id)
+    body["duration"] = str(int(round(float(duration_s))))
+    body["recordStartTime"] = str(record_start_time)
+    # P1:2588-2589 BaseCheckUtil.detect 的 "score|evidence"；干净设备 = "0|{}"。
+    body["remake"] = "0|{}"
+    return body
 
 
 class Yun_For_New:
@@ -595,10 +735,11 @@ class Yun_For_New:
         })
 
     def start(self):
+        # APK startRun 走 HashMap<String,String>（:4821-4824）：三个字段都是字符串。
         data = {
-            'raRunArea': self.raRunArea,
-            'raType': self.raType,
-            'raId': self.raId
+            'raRunArea': str(self.raRunArea),
+            'raType': str(self.raType),
+            'raId': str(self.raId)
         }
         j = self.client.post_json('/run/start', json.dumps(data),
                                   raise_on_business_code=True)
@@ -684,26 +825,11 @@ class Yun_For_New:
                 "结果未知，不要盲目重发，请先查询服务端记录。")
 
     def split(self, points):
-        data = {
-            "StepNumber": int(points[9]['runMileage'] - points[0]['runMileage']) / self.strides,
-            'a': 0,
-            'b': None,
-            'c': None,
-            "mileage": points[9]['runMileage'] - points[0]['runMileage'],
-            "orientationNum": 0,
-            "runSteps": random.uniform(self.raCadenceMin, self.raCadenceMax),
-            'cardPointList': points,
-            "simulateNum": 0,
-            "time": points[9]['runTime'] - points[0]['runTime'],
-            'crsRunRecordId': self.crsRunRecordId,
-            "speeds": format((min_consume + max_consume) / 2, '.2f'),
-            'schoolId': self.schoolId,
-            "strides": self.strides,
-            'userName': self.userName
-        }
+        data = _build_split_body(self.crsRunRecordId, self.userName, self.schoolId,
+                                 points, self.strides)
         # 特殊接口：gzip 后再 SM4（合工大抓包验证过；其他学校未知）
         resp = self.client.post("/run/splitPointCheating",
-                                raw_bytes=gzip.compress(json.dumps(data).encode("utf-8")))
+                                raw_bytes=yun_http.gzip_apk(json.dumps(data).encode("utf-8")))
         print('  ' + resp)
 
     def do(self):
@@ -770,72 +896,45 @@ class Yun_For_New:
             points = []
 
     def split_by_points_map(self, points):
-        data = {
-            "StepNumber": int(float(points[-1]['runMileage']) - float(points[0]['runMileage'])) / self.strides,
-            'a': 0,
-            'b': None,
-            'c': None,
-            "mileage": float(points[-1]['runMileage']) - float(points[0]['runMileage']),
-            "orientationNum": 0,
-            "runSteps": random.uniform(self.raCadenceMin, self.raCadenceMax),
-            'cardPointList': points,
-            "simulateNum": 0,
-            "time": float(points[-1]['runTime']) - float(points[0]['runTime']),
-            'crsRunRecordId': self.crsRunRecordId,
-            "speeds": self.task_map['data']['recodePace'],
-            'schoolId': self.schoolId,
-            "strides": self.strides,
-            'userName': self.userName
-        }
+        data = _build_split_body(self.crsRunRecordId, self.userName, self.schoolId,
+                                 points, self.strides)
         resp = self.client.post("/run/splitPointCheating",
-                                raw_bytes=gzip.compress(json.dumps(data).encode("utf-8")))
+                                raw_bytes=yun_http.gzip_apk(json.dumps(data).encode("utf-8")))
         print('  ' + resp)
 
     def finish_by_points_map(self):
         print('发送结束信号...')
-        data = {
-            'recordMileage': self.task_map['data']['recordMileage'],
-            'recodeCadence': self.task_map['data']['recodeCadence'],
-            'recodePace': self.task_map['data']['recodePace'],
-            'deviceName': my_device_name,
-            'sysEdition': my_sys_version or my_sys_edition,
-            'appEdition': my_app_edition,
-            'raIsStartPoint': 'Y',
-            'raIsEndPoint': 'Y',
-            'raRunArea': self.raRunArea,
-            'recodeDislikes': str(self.task_map['data']['recodeDislikes']),
-            'raId': str(self.raId),
-            'raType': self.raType,
-            'id': str(self.crsRunRecordId),
-            'duration': self.task_map['data']['duration'],
-            'recordStartTime': self.recordStartTime,
-            'manageList': self.task_map['data']['manageList'],
-            'remake': '1'
-        }
+        data = _build_finish_body(
+            record_mileage_km=self.task_map['data']['recordMileage'],
+            recode_cadence=self.task_map['data']['recodeCadence'],
+            recode_pace=self.task_map['data']['recodePace'],
+            recode_dislikes=self.task_map['data']['recodeDislikes'],
+            manage_list=self.task_map['data']['manageList'],
+            ra_run_area=self.raRunArea,
+            ra_id=self.raId,
+            ra_type=self.raType,
+            record_id=self.crsRunRecordId,
+            duration_s=self.task_map['data']['duration'],
+            record_start_time=self.recordStartTime,
+        )
         resp = self.client.post("/run/finish", json.dumps(data))
         print(resp)
 
     def finish(self):
         print('发送结束信号...')
-        data = {
-            'recordMileage': format(self.now_dist / 1000, '.2f'),
-            'recodeCadence': str(random.randint(self.raCadenceMin, self.raCadenceMax)),
-            'recodePace': format(self.now_time / 60 / (self.now_dist / 1000), '.2f'),
-            'deviceName': my_device_name,
-            'sysEdition': my_sys_version or my_sys_edition,
-            'appEdition': my_app_edition,
-            'raIsStartPoint': 'Y',
-            'raIsEndPoint': 'Y',
-            'raRunArea': self.raRunArea,
-            'recodeDislikes': str(self.myLikes),
-            'raId': str(self.raId),
-            'raType': self.raType,
-            'id': str(self.crsRunRecordId),
-            'duration': str(self.now_time),
-            'recordStartTime': self.recordStartTime,
-            'manageList': self.manageList,
-            'remake': '1'
-        }
+        data = _build_finish_body(
+            record_mileage_km=self.now_dist / 1000,
+            recode_cadence=random.randint(self.raCadenceMin, self.raCadenceMax),
+            recode_pace=self.now_time / 60 / (self.now_dist / 1000),
+            recode_dislikes=self.myLikes,
+            manage_list=self.manageList,
+            ra_run_area=self.raRunArea,
+            ra_id=self.raId,
+            ra_type=self.raType,
+            record_id=self.crsRunRecordId,
+            duration_s=self.now_time,
+            record_start_time=self.recordStartTime,
+        )
         resp = self.client.post("/run/finish", json.dumps(data))
         print(resp)
 

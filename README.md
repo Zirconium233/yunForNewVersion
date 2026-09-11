@@ -1,5 +1,9 @@
 ### 寄了
 
+**文档导航（develop）**：当前实际行为与操作方式见 [docs/USAGE.md](docs/USAGE.md)；
+协议构造与模块框架见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。下文为历史说明，
+与 develop 现状不一致处以 docs/ 两份文档为准。
+
 没想到这套AI时代之前的代码，能在无维护的情况撑一年，最后倒在了3.6.4的人脸上面，详见[issue](https://github.com/Zirconium233/yunForNewVersion/issues/78) 
 
 学长已经大四了，云运动里面没有任何跑步任务，连包的抓不了，已经失去维护项目的条件了 T_T

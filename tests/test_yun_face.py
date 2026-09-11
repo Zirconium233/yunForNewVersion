@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """yun_face 测试：取景质量门、图像处理规则、重试状态机、距离窗口调度、上传协议分层。
 
-按 docs/REVIEW_FACE_PLAN.md §四 的层次表组织；全部离线（FakeTransport/注入动作），
+按 work_dir/develop_docs/REVIEW_FACE_PLAN.md §四 的层次表组织；全部离线（FakeTransport/注入动作），
 断言的是“处理规则/坐标映射/状态机/信封”一致，不是字节一致或服务端接受。
 """
 import argparse
