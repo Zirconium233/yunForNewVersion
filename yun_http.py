@@ -53,14 +53,50 @@ class YunError(RuntimeError):
     """本模块所有异常的基类。"""
 
 
+def safe_snippet(text: Any, limit: int = 200) -> str:
+    """错误消息里不直接携带服务器响应片段（可能回显 token 等），统一脱敏。
+
+    JSON 体只保留“脱敏后”的结构；非 JSON 体仅报告字节数与校验前缀。
+    """
+    s = "" if text is None else str(text)
+    if not s:
+        return "<empty body>"
+    t = s.strip()
+    if t[:1] in "{[":
+        try:
+            return json.dumps(redact(json.loads(t)), ensure_ascii=False)[:limit]
+        except (json.JSONDecodeError, ValueError):
+            pass
+    import hashlib
+    digest = hashlib.sha256(s.encode("utf-8", "replace")).hexdigest()[:8]
+    return f"<非 JSON 响应 {len(s.encode('utf-8', 'replace'))}B sha256:{digest}>"
+
+
 class HttpStatusException(YunError):
-    """HTTP 层错误（非 200）。对状态改变请求而言这是“结果未知”，不可自动重放。"""
+    """HTTP 层错误（非 200）。对状态改变请求而言这是“结果未知”，不可自动重放。
+
+    评审质量问题：消息不再直接嵌入响应片段；body 仅以脱敏摘要呈现。
+    """
 
     def __init__(self, status: int, url: str, snippet: str = ""):
-        super().__init__(f"HTTP {status} @ {url}: {snippet[:200]}")
+        super().__init__(f"HTTP {status} @ {url}: {safe_snippet(snippet)}")
         self.status = status
         self.url = url
-        self.snippet = snippet
+        self.snippet = safe_snippet(snippet)
+
+
+class TransportOutcomeUnknown(HttpStatusException):
+    """客户端侧传输失败（读超时/连接失败）。
+
+    文案是本脚本自己组织的，不是服务器回显，因此不经过响应脱敏；
+    语义仍是“结果未知”，禁止自动重发。
+    """
+
+    def __init__(self, url: str, detail: str):
+        YunError.__init__(self, f"HTTP -1 @ {url}: {detail}")
+        self.status = -1
+        self.url = url
+        self.snippet = detail
 
 
 class DecodeException(YunError):
@@ -78,7 +114,20 @@ class BusinessException(YunError):
 
 
 class FaceRequiredError(YunError):
-    """识别到人脸核验要求：A 阶段策略是停止自动流程，提示走官方 App。"""
+    """识别到人脸核验要求：策略是停止自动流程（无照片源时提示走官方 App）。"""
+
+
+class RunNotPermittedError(YunError):
+    """服务端业务性拒绝开始/继续跑步（如 canSport="N"），与“需要人脸”是不同状态。
+
+    评审 P1：拒绝发生时 recordId 可能已经下发（APK 先保存 id 再判定，
+    SportRunMapActivity.java:783-799），必须随异常带出以便处理“已开始但不可继续”。
+    """
+
+    def __init__(self, message: str, record_id: Any = None, raw: Any = None):
+        super().__init__(message)
+        self.record_id = record_id
+        self.raw = raw
 
 
 # ---------------------------------------------------------------- 脱敏
@@ -212,16 +261,20 @@ def _sm2_encrypt_b64(plain: str, public_key_hex: str, k: int) -> str:
 class SM2Box:
     """SM2 信封封装器。
 
-    两侧都使用本模块的仿射点运算实现：gmssl 3.2.2 的 CryptSM2.encrypt 存在偶发
-    _add_point(None) 崩溃（上游缺陷，本地实测可复现），decrypt 自回环同样输出乱码；
-    且仓库默认密钥对注释自证“私钥失效”（与公钥不匹配），不能用于回环验证。
-    本实现在固定 k 下与 gmssl.encrypt 的 C1/C2/C3 逐位一致（tests/sm2_ref 交叉验证），
-    即保持服务端实测接受的 wire 格式（04||C1||C3||C2 + base64）。
+    加密生产路径 = gmssl 成熟实现（评审：密码实现处置）。gmssl 3.2.2 的
+    CryptSM2.encrypt 存在已实测的上游缺陷（偶发 _add_point(None) TypeError，
+    与密钥配对无关、固定 k 可复现），因此每次尝试都是“gmssl 的一次完整加密”，
+    内部崩溃时换新随机数重试，连续失败达到上限才退回本模块仿射实现并记 WARNING。
+    退回实现与 gmssl 输出在固定 k 下逐位一致（tests 多样本交叉验证），wire 不变。
+    解密：gmssl 3.2.2 自回环输出乱码（上游缺陷），本模块只有离线工具用到解密，
+    使用仿射参考实现；线上协议只要求加密方向。
     """
+
+    _GMSSTL_ATTEMPTS = 3
 
     def __init__(self, public_key: bytes, private_key: Optional[bytes] = None, rng=None):
         self._pub_hex = _bytes_to_hex(public_key[1:])
-        self._crypt = sm2.CryptSM2(  # 保留旧属性名以兼容外部引用
+        self._crypt = sm2.CryptSM2(  # 生产加密走这里（保留旧属性名以兼容外部引用）
             public_key=self._pub_hex,
             private_key=_bytes_to_hex(private_key) if private_key else "",
             mode=1,
@@ -229,13 +282,32 @@ class SM2Box:
         )
         self._private_hex = _bytes_to_hex(private_key) if private_key else None
         self._rng = rng
+        self.fallback_count = 0  # 观测用：仿射兜底被触发的次数
+
+    def _random_k(self) -> int:
+        n = 0xFFFFFFFEFFFFFFFFFFFFFFFFFFFFFFFF7203DF6B21C6052B53BBF40939D54123
+        if self._rng is not None:
+            return self._rng.randrange(1, n)
+        import secrets
+        return secrets.randbelow(n - 1) + 1
 
     def encrypt_b64(self, text: str) -> str:
-        import secrets
-
-        n = 0xFFFFFFFEFFFFFFFFFFFFFFFFFFFFFFFF7203DF6B21C6052B53BBF40939D54123
-        k = (self._rng.randrange(1, n) if self._rng else secrets.randbelow(n - 1) + 1)
-        return _sm2_encrypt_b64(text, self._pub_hex, k)
+        # 1) 成熟实现优先：gmssl 每次内部自行取随机 k
+        last_exc: Optional[Exception] = None
+        for _ in range(self._GMSSTL_ATTEMPTS):
+            try:
+                # 与仓库原始 encrypt_sm2 同构：gmssl 输出不含 04 未压缩点前缀，
+                # 线上 wire = base64(0x04 || C1||C3||C2)（mode=1 布局）。
+                ct = self._crypt.encrypt(text.encode("utf-8"))
+                return b64encode(b"\x04" + ct).decode()
+            except TypeError as exc:  # gmssl 上游缺陷：_add_point(None)
+                last_exc = exc
+                logger.warning("gmssl SM2 encrypt 内部错误（换新随机数重试）: %s", exc)
+        # 2) 兜底：仿射实现（与 gmssl 逐位一致，见模块说明与 tests）
+        self.fallback_count += 1
+        logger.warning("gmssl SM2 encrypt 连续 %d 次失败，退回仿射参考实现（结果 wire 格式相同）；最后错误: %s",
+                       self._GMSSTL_ATTEMPTS, last_exc)
+        return _sm2_encrypt_b64(text, self._pub_hex, self._random_k())
 
     def decrypt_b64(self, text_b64: str) -> bytes:
         if not self._private_hex:
@@ -362,7 +434,8 @@ class FakeTransport:
                  responder: Callable[[str, dict], dict],
                  sm2box: Optional[SM2Box] = None,
                  fixed_pair: Optional[Tuple[str, str]] = None,
-                 fallback_key_b64: Optional[str] = None):
+                 fallback_key_b64: Optional[str] = None,
+                 require_verified_envelope: bool = False):
         # fixed_pair = (cipherkey_encrypted, cipherkey_b64)：固定信封路线的回包加密依据
         # fallback_key_b64：配置了固定 SM4 key 但信封仍是随机 SM2 封装（仓库默认密钥对公私钥不
         # 匹配、本地无法解出）时的离线兜底；生产上服务端持有配对私钥。
@@ -370,11 +443,15 @@ class FakeTransport:
         self._box = sm2box
         self._fixed = {fixed_pair[0]: fixed_pair[1]} if fixed_pair else {}
         self._fallback = fallback_key_b64
+        # 评审：FakeTransport 不能只“凭 fallback key 造回包”。开启后，
+        # 凡是不能用真实私钥/fixed_pair 解开 cipherKey 的请求直接断言失败。
+        self.require_verified_envelope = require_verified_envelope
         self.calls: list = []
 
     def __call__(self, url: str, data: str, headers: dict, timeout) -> Any:
         envelope = json.loads(data)
         cipher_key = envelope.get("cipherKey", "")
+        verified = True  # SM4 key 是否由请求信封本身解出（而非离线兜底假设）
         if cipher_key in self._fixed:
             sm4_key_b64 = self._fixed[cipher_key]
         else:
@@ -383,14 +460,27 @@ class FakeTransport:
                     raise YunError("缺少 sm2box")
                 sm4_key_b64 = self._box.decrypt_b64(cipher_key).decode()
             except Exception:
+                if self.require_verified_envelope:
+                    raise AssertionError("信封不可用持有的私钥验证（require_verified_envelope）")
                 if not self._fallback:
                     raise AssertionError("FakeTransport 无法解出 SM4 key：缺少可解私钥/fixed_pair/fallback")
                 sm4_key_b64 = self._fallback
+                verified = False
         router = urlparse(url).path or url
+        # 解开业务体：证明“请求内容”可见并可断言（评审：假回包成功≠信封正确）
+        try:
+            plain = decode_response(envelope.get("content", ""), b64decode(sm4_key_b64))
+            try:
+                business = json.loads(plain)
+            except (json.JSONDecodeError, ValueError):
+                business = {"_raw": plain}
+        except DecodeException as exc:
+            business = {"_undecodable": str(exc)}
         obj = self._responder(router, envelope)
         body = encrypt_sm4(json.dumps(obj, ensure_ascii=False), b64decode(sm4_key_b64))
         self.calls.append({"router": router, "url": url, "headers": headers,
-                           "envelope": envelope, "sm4_key_b64": sm4_key_b64})
+                           "envelope": envelope, "sm4_key_b64": sm4_key_b64,
+                           "envelope_verified": verified, "business": business})
         return _FakeResponse(200, body)
 
 
@@ -414,21 +504,27 @@ class YunClient:
                  rng: Optional[_random_module.Random] = None,
                  now: Optional[Callable[[], int]] = None,
                  sleep: Optional[Callable[[float], None]] = None,
-                 timeout: Tuple[float, float] = DEFAULT_TIMEOUT):
+                 timeout: Tuple[float, float] = DEFAULT_TIMEOUT,
+                 legacy_uuid: bool = False):
         self.profile = profile
         self.base_url = base_url
         self.transport = transport or _real_transport
         self.rng = rng
         self._now = now or (lambda: int(time.time()))
+        self.now = self._now  # 公开别名：人脸窗口计时等调用方读取注入时钟
         self.sleep = sleep or time.sleep
         self.timeout = timeout
+        # 评审 P2：3.6.6 对齐模式默认每请求随机大写 UUID
+        # （RetrofitService.java:68）；沿用配置固定 uuid 的旧路线需
+        # 显式 legacy_uuid=True，不再是隐式默认。
+        self.legacy_uuid = legacy_uuid
         self.last_ctx: Optional[RequestContext] = None
         self.sent: list = []  # 每次请求的 (router/url, ctx)；输出前请 redact headers
 
     # ---- 上下文：每请求新 uuid(未固定时)/utc/sign/key 三者一致绑定 ----
     def new_context(self, fixed_envelope: bool = False) -> RequestContext:
         p = self.profile
-        rid = p.uuid or str(_uuid.uuid4()).upper()
+        rid = p.uuid if (self.legacy_uuid and p.uuid) else str(_uuid.uuid4()).upper()
         utc = str(self._now())
         sign = md5_sign(p.platform, utc, rid, p.md5key)
         if fixed_envelope:
@@ -468,7 +564,7 @@ class YunClient:
                                   headers=headers, timeout=self.timeout)
         except requests.RequestException as exc:
             # 只报告，不重试：读超时可能发生在服务器已提交之后。
-            raise HttpStatusException(-1, url, f"传输失败(结果未知，勿自动重发): {exc}") from exc
+            raise TransportOutcomeUnknown(url, f"传输失败(结果未知，勿自动重发): {exc}") from exc
         self.last_ctx = ctx
         self.sent.append({"router": router, "url": url, "uuid": ctx.uuid, "utc": ctx.utc})
         if resp.status_code != 200:
@@ -483,7 +579,7 @@ class YunClient:
         try:
             obj = json.loads(text)
         except json.JSONDecodeError as exc:
-            raise DecodeException(f"响应不是 JSON: {text[:120]!r}") from exc
+            raise DecodeException(f"响应不是 JSON: {safe_snippet(text)}") from exc
         if raise_on_business_code and obj.get("code") != 200:
             raise BusinessException(obj.get("code"), obj.get("msg", ""), obj)
         return obj

@@ -119,7 +119,12 @@ class Login():
         }, ensure_ascii=False)
 
         profile = yun_http.profile_from_conf(conf)
-        profile = replace(profile, token="", device_id=uuid, device_name=DeviceName)
+        # 评审 P2：登录请求的身份字段必须与实际使用的设备配置一致——
+        # deviceId 用本次真正写回/沿用的 DeviceId（而不是配置里的旧 uuid），
+        # sysVersion 反映本次实际输入的 sys_edition。
+        login_sys_version = conf.get("User", "sys_version", fallback="") or sys_edition
+        profile = replace(profile, token="", device_id=DeviceId,
+                          device_name=DeviceName, sys_version=login_sys_version)
         client = YunClient(profile, base_url=schoolHost, transport=transport)
         try:
             result = client.post_json("/login/" + school_login_url, body,

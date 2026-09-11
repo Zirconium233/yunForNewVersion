@@ -42,8 +42,11 @@ from Crypto.Util.Padding import pad, unpad
 from tools.Login import Login
 
 import yun_http
+import yun_face
+from yun_face import FaceRunStopError  # noqa: F401  (main 的 except 分支使用)
 from yun_http import (
     BusinessException,
+    RunNotPermittedError,
     DecodeException,
     DeviceProfile,
     FakeTransport,
@@ -141,6 +144,8 @@ def set_args(conf_path: str):
     # 用户信息，包括设备信息
     my_token = conf.get("User", 'token')
     my_device_id = conf.get("User", "device_id")
+    # 评审 P1：device_name 必须真正加载（旧版声明了全局却没有赋值，入口打印 TypeError）
+    my_device_name = conf.get("User", "device_name", fallback="")
     my_key = conf.get("User", "map_key")  # 高德地图开发者密钥
     my_sys_edition = conf.get("User", "sys_edition")  # 安卓大版本（body sysEdition 旧来源）
     # sysVersion 头来自 3.6.6 证据；取值统一走设备配置，缺省沿用 sys_edition，不强制示例值
@@ -170,7 +175,9 @@ def set_args(conf_path: str):
     md5key = conf.get("Yun", "md5key")
     platform = conf.get("Yun", "platform")
 
-    _CLIENT = YunClient(build_profile(conf), base_url=my_host)
+    # 评审 P2：默认按 3.6.6 行为“每请求随机 UUID”；旧协议兼容开关显式配置
+    legacy_uuid = str(conf.get("User", "legacy_uuid", fallback="")).strip().lower() in ("1", "true", "yes", "y")
+    _CLIENT = YunClient(build_profile(conf), base_url=my_host, legacy_uuid=legacy_uuid)
 
     return {
         "my_token": my_token,
@@ -220,6 +227,15 @@ def parse_args():
                         help='离线演练：本地 fixture + 假传输，不登录/不探测学校/不调高德/不 sleep/不写配置')
     parser.add_argument('--dry-home', dest='dry_home', type=str, default=None,
                         help='dry-run 用 getHomeRunInfo 响应 fixture（JSON 文件路径）')
+    # 人脸输入适配（docs/REVIEW_FACE_PLAN.md §三 方案1/2）：仅提供源时 Y 任务才启用离线管线
+    parser.add_argument('--face-photo', dest='face_photo', type=str, default=None,
+                        help='人脸输入：本人照片路径（人像照，非证件扫描）')
+    parser.add_argument('--face-video', dest='face_video', type=str, default=None,
+                        help='人脸输入：自拍视频路径，确定性抽帧（需可选依赖 opencv-python）')
+    parser.add_argument('--face-detection', dest='face_detection', type=str, default=None,
+                        help='人工标注检测结果 JSON（box+5 点+score）；缺省时取景质量门无法执行并按失败处理')
+    parser.add_argument('--face-mirror', dest='face_mirror', action='store_true',
+                        help='声明输入已是镜像翻转（照片源默认不镜像，无前置相机标志）')
     return parser.parse_args()
 
 
@@ -272,6 +288,10 @@ def default_post(router, data, headers=None, m_host=None, isBytes=False, gen_sig
     每请求上下文（uuid/utc/sign/SM4 key）在 yun_http.RequestContext 内绑定。
     """
     client = default_client()
+    if headers is not None and gen_sign:
+        # 评审：headers 参数在常规签名路径会被忽略——显式报错，不再静默丢弃
+        raise ValueError("default_post(headers=...) 仅在 gen_sign=False 兼容路径生效；"
+                         "gen_sign=True 时头部由 RequestContext 统一构造")
     if not gen_sign:
         # 旧路线：使用配置文件里预生成的 utc/sign（登录前探测等场景）
         ctx = RequestContext(uuid=my_uuid or "", utc=my_utc, sign=my_sign,
@@ -328,10 +348,55 @@ def noTokenLogin(conf_path: str = None):
         exit()
 
 
+def apply_login_result(token: str, device_id: str, device_name: str,
+                       uuid_value: str, sys_edition: str, conf_path: str = None):
+    """评审 P1：登录成功后，无论用户是否选择写盘，都必须立即更新内存态。
+
+    更新旧全局快照 + 已构建的 _CLIENT（token/设备身份/版本），并同步 Login
+    阶段发现的新学校地址（Login 无条件写回 school_host，这里以实际配置文件为准
+    重读），否则“登录后首个请求”仍会携带空 token 和旧 base_url。
+    """
+    global my_token, my_device_id, my_device_name, my_uuid, my_sys_edition
+    global my_host, _CLIENT
+    my_token = token
+    my_device_id = device_id
+    my_device_name = device_name
+    my_uuid = uuid_value
+    my_sys_edition = sys_edition
+
+    # 学校地址同步：Login 内部已把探测结果写入实际配置文件，这里以文件为准重读
+    conf_path = conf_path or project_resource("config.ini")
+    try:
+        conf = configparser.ConfigParser()
+        conf.read(conf_path, encoding="utf-8")
+        new_host = conf.get("Yun", "school_host", fallback=my_host or "")
+        sys_version = conf.get("User", "sys_version", fallback="") or sys_edition
+    except Exception:
+        new_host = my_host or ""
+        sys_version = sys_edition
+
+    if _CLIENT is None:
+        _CLIENT = default_client()
+    from dataclasses import replace as _dc_replace
+    _CLIENT.profile = _dc_replace(
+        _CLIENT.profile,
+        token=token, device_id=device_id, device_name=device_name,
+        uuid=uuid_value, sys_version=sys_version,
+    )
+    if new_host:
+        my_host = new_host
+        _CLIENT.base_url = new_host
+
+
 class Yun_For_New:
 
-    def __init__(self, auto_generate_task=False, client: YunClient = None, home_info=None):
-        """home_info: getHomeRunInfo 响应 dict（离线注入用）。不传才发真实请求。"""
+    def __init__(self, auto_generate_task=False, client: YunClient = None, home_info=None,
+                 face_runner=None):
+        """home_info: getHomeRunInfo 响应 dict（离线注入用）。不传才发真实请求。
+
+        face_runner: yun_face.FaceRunner。提供时 runFaceStatus=Y 不再直接停止，
+        而是由距离窗口触发人脸执行；不提供时保持 A 阶段停止门行为。
+        """
         self.client = client or default_client()
         if home_info is not None:
             obj = home_info if isinstance(home_info, dict) else json.loads(home_info)
@@ -346,14 +411,17 @@ class Yun_For_New:
                 raise BusinessException(obj.get('code'), 'cralist 为空，没有可用跑步任务', obj)
             data = cralist[0]
 
-        # A 阶段人脸停止门（评审 2.3 / §3-A.6）：只识别、不模拟。
-        # 仅 runFaceStatus == 'N' 视为无核验要求；'Y' 停止并提示走官方 App；
-        # 缺失/未知值不假设已通过，同样停止。
+        # 人脸开关（评审 P2 + §二.4）：启用开关是任务 runFaceStatus
+        # （SportRunMapActivity.java:4314），faceTime 只是窗口参数。
+        # 'N' 放行；'Y' 且无照片源 → 停止（A 阶段行为保持）；缺失/未知不假设通过。
         face_status = str(data.get('runFaceStatus', '')).strip().upper()
+        self.face_runner = face_runner
+        self._face_trigger = None
         if face_status == 'Y':
-            raise FaceRequiredError(
-                "该跑步任务要求人脸核验（runFaceStatus=Y）。自动流程已停止，"
-                "请使用官方 App 完成人脸注册/核验。")
+            if face_runner is None:
+                raise FaceRequiredError(
+                    "该跑步任务要求人脸核验（runFaceStatus=Y）。自动流程已停止；"
+                    "可使用官方 App，或提供 --face-photo/--face-video 启用离线人脸管线。")
         elif face_status != 'N':
             raise FaceRequiredError(
                 f"人脸核验状态缺失或未知（runFaceStatus={data.get('runFaceStatus')!r}），"
@@ -534,21 +602,86 @@ class Yun_For_New:
         }
         j = self.client.post_json('/run/start', json.dumps(data),
                                   raise_on_business_code=True)
-        # A.6 停止门：服务端明示不可跑或带人脸要求时，不再继续
-        d = j['data']
-        if d.get('canSport') is False:
+        d = j.get('data') or {}
+        # 评审 P1：APK 先保存 recordId/开始时间/人脸窗口参数，再判 canSport
+        # （SportRunMapActivity.java:783-786）。即便后续拒绝/要求人脸，
+        # “已经下发的 recordId”也必须留存在异常里，供处理已开始但不可继续的状态。
+        self.crsRunRecordId = d.get('id')
+        self.recordStartTime = d.get('recordStartTime')
+        self.userName = d.get('studentId')
+
+        # canSport 是客户端字符串状态："N"=拒绝（TextUtils.equals("N",…) :790）。
+        # 业务拒绝与人脸要求是两类状态（评审 P1），分开抛出。
+        can = str(d.get('canSport', '') or '').strip().upper()
+        if can == 'N':
+            raise RunNotPermittedError(
+                "服务端拒绝开始跑步（canSport=N）：" + str(d.get('warnContent', '')),
+                record_id=self.crsRunRecordId, raw=d)
+
+        # 评审 P2：faceTime 是窗口参数不是启用开关；开关只在 runFaceStatus。
+        # APK 对 faceTime 有 10s 下界（:787-788）；Y 任务缺窗口参数不得默认通过。
+        ft_raw = d.get('faceTime')
+        try:
+            self.faceTime = int(ft_raw) if ft_raw not in (None, '') else None
+        except (TypeError, ValueError):
+            self.faceTime = None
+        if self.faceTime is not None and self.faceTime < yun_face.FACE_TIME_FLOOR:
+            self.faceTime = yun_face.FACE_TIME_FLOOR
+        self.randomList = d.get('randomList')
+
+        if self.runFaceStatus == 'Y':
+            if not self.randomList:
+                raise FaceRequiredError(
+                    "runFaceStatus=Y 但 start 响应缺少 randomList 窗口参数，"
+                    "不默认放行，自动流程已停止。")
+            self._face_trigger = yun_face.WindowTrigger(
+                yun_face.windows_from_random_list(self.crsRunRecordId, self.randomList))
+            print(f"云运动任务创建成功！（runFaceStatus=Y，"
+                  f"待触发人脸窗口 {len(self._face_trigger.windows)} 个）\n")
+        else:
+            if self.faceTime not in (None, 0):
+                print(f"提示：响应 faceTime={self.faceTime}，但任务 runFaceStatus=N；"
+                      "APK 逻辑人脸窗口不启用，本流程不会发送人脸请求")
+            if self.faceTime is None:
+                print("提示：响应未含 faceTime（任务开关为 N，按无人脸窗口处理；"
+                      "服务端行为未经线上验证）")
+            print("云运动任务创建成功！\n")
+
+    def _face_on_mileage(self, meters: float):
+        """W1 等价挂钩：每次 splitPoint 成功后用累计里程(米)推进距离窗口。
+
+        触发即执行整次人脸（语音引导→图像管线→上传状态机）。失败策略是停止
+        并保留现场；APK 在此处会走 checkRunState 自动提交（T1 :2798），本脚本
+        不自动提交——该偏差在 docs 中显式记录。
+        """
+        trigger = getattr(self, "_face_trigger", None)
+        if trigger is None:
+            return
+        window = trigger.on_distance(meters / 1000.0)
+        if window is None:
+            return
+        runner = self.face_runner
+        if runner is None:
             raise FaceRequiredError(
-                "服务端拒绝开始跑步（canSport=false）：" + str(d.get('warnContent', '')))
-        face_time = d.get('faceTime')
-        if face_time not in (None, 0, '0', ''):
-            raise FaceRequiredError(
-                f"开始响应 faceTime={face_time}，跑步中会要求人脸核验；A 阶段不模拟人脸，自动流程停止。")
-        if face_time is None:
-            print("提示：响应未含 faceTime（按无人脸处理，服务端行为未经线上验证）")
-        self.recordStartTime = d['recordStartTime']
-        self.crsRunRecordId = d['id']
-        self.userName = d['studentId']
-        print("云运动任务创建成功！\n")
+                f"人脸核验窗口 {window.id_str} 已触发（runFaceStatus=Y），"
+                "但未提供照片/视频源；自动流程停止，请使用官方 App 完成核验。")
+        window.voice_second = self.client.now()
+        print(f"[face] 窗口 {window.id_str} 触发 @ {meters / 1000.0:.3f} km")
+        outcome = runner.run_window(window, self.client, self.crsRunRecordId)
+        trigger.in_flight = False
+        if outcome.state == "success":
+            print("[face] 比对通过（data.status=Y），跑步继续")
+        elif outcome.state == "compare_failed":
+            raise FaceRunStopError(
+                f"人脸比对未通过（{outcome.msg or outcome.detail}）。"
+                "APK 行为会自动提交本次跑步数据（T1/checkRunState），"
+                "本脚本策略：不自动提交，保留现场由人工决定。")
+        elif outcome.state == "session_terminated":
+            print("[face] 会话已终止，本次比对结果按迟到回调丢弃")
+        else:
+            raise FaceRunStopError(
+                f"人脸上传未确认成功（{outcome.msg or outcome.detail}）；"
+                "结果未知，不要盲目重发，请先查询服务端记录。")
 
     def split(self, points):
         data = {
@@ -624,6 +757,7 @@ class Yun_For_New:
             count += 1
             if count == split_count:
                 self.split_by_points_map(points)
+                self._face_on_mileage(float(points[-1]['runMileage']))
                 sleep_time = self.task_map['data']['duration'] / len(self.task_map['data']['pointsList']) * split_count
                 print(f" 等待{sleep_time:.2f}秒.")
                 self.client.sleep(sleep_time)
@@ -631,6 +765,7 @@ class Yun_For_New:
                 points = []
         if count != 0:
             self.split_by_points_map(points)
+            self._face_on_mileage(float(points[-1]['runMileage']))
             count = 0
             points = []
 
@@ -705,7 +840,8 @@ class Yun_For_New:
         print(resp)
 
 
-def dry_run_responder(home_fixture: dict):
+def dry_run_responder(home_fixture: dict, face_status: str = "Y",
+                      face_windows=(), face_compare_status: str = "Y"):
     """dry-run 假传输回包：只覆盖打表链路的只读/状态接口形态，绝不联网。"""
     def responder(router: str, envelope: dict) -> dict:
         if router.endswith("/run/getHomeRunInfo"):
@@ -713,12 +849,51 @@ def dry_run_responder(home_fixture: dict):
         if router.endswith("/run/start"):
             return {"code": 200, "msg": "dry-run", "data": {
                 "recordStartTime": "2000-01-01 00:00:00", "id": 900001,
-                "studentId": "DRYRUN001", "faceTime": 0, "canSport": True}}
+                "studentId": "DRYRUN001",
+                # APK 形态：canSport 为字符串（"N"=拒绝）；faceTime 为窗口参数秒
+                "faceTime": 20 if face_windows else 0,
+                "randomList": list(face_windows),
+                "canSport": "Y"}}
+        if router.endswith("/run/appFace/runFaceInfoComparison"):
+            # 比对结果分层：外层 code + data.status（§二.3）
+            return {"code": 200, "msg": "dry-run",
+                    "data": {"status": face_compare_status, "msg": "dry-run"}}
         if router.endswith("/run/finish"):
             return {"code": 200, "msg": "dry-run", "data": None}
         # splitPointCheating 等默认成功
         return {"code": 200, "msg": "dry-run", "data": None}
     return responder
+
+
+def build_face_runner(args, sleep=None):
+    """按 CLI 输入构建 yun_face.FaceRunner；未提供源返回 None。
+
+    用 getattr 读取 face_* 参数，兼容旧调用方自造的 argparse.Namespace。
+    """
+    face_photo = getattr(args, "face_photo", None)
+    face_video = getattr(args, "face_video", None)
+    face_mirror = bool(getattr(args, "face_mirror", False))
+    if not (face_photo or face_video):
+        if face_mirror:
+            raise ValueError("--face-mirror 需要配合 --face-photo/--face-video 使用")
+        return None
+    if face_photo and face_video:
+        raise ValueError("--face-photo 与 --face-video 二选一（同一时刻只有一个输入源）")
+    detection = None
+    face_detection = getattr(args, "face_detection", None)
+    if face_detection:
+        detection = yun_face.load_detection_json(resolve_cli_path(face_detection))
+    else:
+        print("[face] 未提供 --face-detection 标注：取景质量门将因无检测结果按失败处理"
+              "（不以“图里有人脸”替代客户端姿态门）。")
+    if face_video:
+        source = yun_face.VideoFrameSource(resolve_cli_path(face_video),
+                                           mirror=face_mirror)
+    else:
+        source = yun_face.PhotoSource(resolve_cli_path(face_photo),
+                                      mirror=face_mirror)
+    return yun_face.FaceRunner(source, detection=detection,
+                               sleep=sleep or time.sleep)
 
 
 def run_dry(cfg_path: str, task_path: str, args):
@@ -732,9 +907,20 @@ def run_dry(cfg_path: str, task_path: str, args):
     with open(home_path, 'r', encoding='utf-8') as f:
         home_fixture = json.load(f)
 
+    # 人脸演练参数从 fixture 读取（脱敏离线样本自有字段）
+    hdata = (home_fixture.get('data') or {})
+    hstatus = ""
+    try:
+        hstatus = str(hdata['cralist'][0].get('runFaceStatus', '')).strip().upper()
+    except (KeyError, IndexError, TypeError):
+        pass
+    face_windows = list(hdata.get('dry_face_windows') or []) if hstatus == 'Y' else []
+    face_compare = str(hdata.get('dry_face_compare_status', 'Y'))
+
     profile = build_profile(_CONF)
     fake = FakeTransport(
-        dry_run_responder(home_fixture),
+        dry_run_responder(home_fixture, face_windows=face_windows,
+                          face_compare_status=face_compare),
         sm2box=SM2Box(PUBLIC_KEY, PRIVATE_KEY),
         fixed_pair=((profile.cipherkey_encrypted, profile.cipherkey)
                     if profile.cipherkey_encrypted else None),
@@ -744,8 +930,10 @@ def run_dry(cfg_path: str, task_path: str, args):
     )
     client = YunClient(profile, base_url=my_host, transport=fake,
                        rng=random.Random(20260911), sleep=lambda s: None)
+    face_runner = build_face_runner(args, sleep=lambda s: None)
     try:
-        yun = Yun_For_New(auto_generate_task=False, client=client, home_info=None)
+        yun = Yun_For_New(auto_generate_task=False, client=client, home_info=None,
+                          face_runner=face_runner)
         yun.start()
         yun.do_by_points_map(path=task_path, random_choose=True, isDrift=args.drift)
         yun.finish_by_points_map()
@@ -753,8 +941,14 @@ def run_dry(cfg_path: str, task_path: str, args):
         print("[dry-run 停止门] " + str(e))
         raise
     routers = [c["router"] for c in fake.calls]
+    verified = sum(1 for c in fake.calls if c.get("envelope_verified"))
+    undec = sum(1 for c in fake.calls if "_undecodable" in (c.get("business") or {}))
     print(f"[dry-run 完成] 共构造 {len(fake.calls)} 个请求，全部走假传输（无真实网络）：{routers}")
-    print("[dry-run 声明] 以上仅证明本地构造与静态证据一致；服务端是否接受、成绩是否有效均未验证。")
+    print(f"[dry-run 信封] 可用持有私钥直接验证的信封 {verified}/{len(fake.calls)}；"
+          f"业务体不可解码 {undec} 个（兜底 key 路线下按等效假设构造回包，不宣称信封已验证）")
+    print("[dry-run 声明] 产物名称：offline_client_compatibility。"
+          "以上仅证明本地构造与静态证据一致（非 face_passed_live）；"
+          "服务端是否接受、成绩是否有效、人脸是否通过均未验证。")
     return client  # 供测试/审阅者检查 fake.calls
 
 
@@ -777,7 +971,8 @@ def main(run=True):
             result = noTokenLogin(cfg_path)
             if result is None:
                 return
-            my_token, my_device_id, my_device_name, my_uuid, my_sys_edition = result
+            # 评审 P1：登录后同步内存客户端（含新学校地址），不只更新全局值
+            apply_login_result(*result, conf_path=cfg_path)
 
         print("确定数据无误：")
     # A.4：默认输出脱敏（token/uuid/sign/map_key 掩码）
@@ -819,13 +1014,15 @@ def main(run=True):
                         driftChoice = True
                     else:
                         driftChoice = False
-                    Yun = Yun_For_New(auto_generate_task=False)
+                    Yun = Yun_For_New(auto_generate_task=False,
+                                      face_runner=build_face_runner(args))
                     Yun.start()
                     Yun.do_by_points_map(path=path, isDrift=driftChoice)
                     Yun.finish_by_points_map()
                 else:
                     path = task_path
-                    Yun = Yun_For_New(auto_generate_task=False)
+                    Yun = Yun_For_New(auto_generate_task=False,
+                                      face_runner=build_face_runner(args))
                     Yun.start()
                     Yun.do_by_points_map(path=path, random_choose=True, isDrift=args.drift)
                     Yun.finish_by_points_map()
@@ -843,6 +1040,13 @@ def main(run=True):
                     Yun.finish()
         else:
             print("退出。")
+    except RunNotPermittedError as e:
+        # 评审 P1：业务拒绝 ≠ 人脸要求；recordId 已下发时明示，便于查服务端记录
+        rid = f"（已下发 recordId={e.record_id}）" if e.record_id else "（无 recordId）"
+        print(f"[业务拒绝] {e} {rid}")
+        print("[业务拒绝] 请先在服务端确认该记录状态，不要盲目重发开始请求。")
+    except FaceRunStopError as e:
+        print("[人脸停止] " + str(e))
     except FaceRequiredError as e:
         print("[停止] " + str(e))
         print("[停止] A 阶段策略：识别人脸要求后不模拟、不猜测，请使用官方 App 完成核验。")

@@ -4,3 +4,5 @@ tqdm
 schedule
 mitmproxy
 pycryptodome
+pillow  # 人脸输入适配 yun_face（图像解码/EXIF/缩放/质量阶梯）
+# 可选：方案 2 视频抽帧需要 opencv-python（未列入必装，import 失败会明确报错而非假装支持）

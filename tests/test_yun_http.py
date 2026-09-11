@@ -84,6 +84,47 @@ def test_sm2_wire_matches_gmssl_for_fixed_k(monkeypatch):
     assert ref.decrypt_b64(mine, h(PRIV)).decode() == msg
 
 
+def test_sm2_wire_matches_gmssl_for_many_k(monkeypatch):
+    """评审：单 k 一致不足以支撑替换密码实现——多样本钉死 gmssl≡仿射。
+
+    同时验证生产路径 SM2Box.encrypt_b64（gmssl 主路径）的密文可被独立参考
+    实现解回，即“成熟实现为主、参考实现为验证尺”的分工成立。
+    """
+    import random
+    import gmssl.sm2 as gm_sm2
+    import tests.sm2_ref as ref
+
+    def h(b):
+        return hex(int.from_bytes(b, "big"))[2:].upper()
+
+    n = 0xFFFFFFFEFFFFFFFFFFFFFFFFFFFFFFFF7203DF6B21C6052B53BBF40939D54123
+    msg = "KEY0123456789abcdefghij=="
+    checked = skipped = 0
+    for seed in range(24):
+        k = random.Random(seed).randrange(1, n)
+        kh = "%064x" % k
+
+        def fake_random_hex(length, _kh=kh):
+            return _kh[-length:] if length <= 64 else _kh + "0" * (length - 64)
+        monkeypatch.setattr(gm_sm2.func, "random_hex", fake_random_hex)
+        c = gm_sm2.CryptSM2(public_key=h(PUB[1:]), private_key="", mode=1, asn1=True)
+        try:
+            e = c.encrypt(msg.encode("utf-8"))
+        except TypeError:
+            skipped += 1  # gmssl 3.2.2 上游缺陷（_add_point(None)），生产路径内部换 k 重试
+            continue
+        gmssl_wire = base64.b64encode(bytes.fromhex("04" + e.hex().upper())).decode()
+        assert yh._sm2_encrypt_b64(msg, h(PUB[1:]), k) == gmssl_wire, f"k={kh}"
+        checked += 1
+    assert checked >= 18  # 崩溃率约 1/60，允许极个别跳过
+    # 生产路径：gmssl 主路径密文，由独立仿射参考实现解回（外部验证，非自回环）
+    box = yh.SM2Box(PUB, PRIV)
+    for i in range(10):
+        ct = box.encrypt_b64(msg + str(i))
+        assert ref.decrypt_b64(ct, h(PRIV)).decode() == msg + str(i)
+    assert box.fallback_count == 0  # 常规情况下无需退回仿射兜底
+
+
 # ---------------------------------------------------------------- 响应解码
 def test_decode_response_three_forms():
     key = base64.b64decode(SM4_KEY_B64)
@@ -160,15 +201,38 @@ def test_random_key_profile_binds_per_request():
 
 
 def test_fixed_cipherkey_profile_shares_key_like_apk():
-    """本样本 APK 是共享 SM4 对象、每请求重新封装：固定 key 路线 key 恒定。"""
+    """本样本 APK 是共享 SM4 对象、每请求重新封装：固定 key 路线 key 恒定。
+
+    评审 P2 后默认“每请求随机 UUID”（3.6.6 对齐）；沿用配置 uuid 需显式
+    legacy_uuid=True（旧协议兼容开关）。
+    """
     profile = _profile(cipherkey=SM4_KEY_B64, uuid="FIXED-UUID-1")
     fake = _fake()
-    client = yh.YunClient(profile, base_url="http://school.invalid:8080", transport=fake)
+    client = yh.YunClient(profile, base_url="http://school.invalid:8080", transport=fake,
+                          legacy_uuid=True)
     client.post("/run/a", "{}")
     client.post("/run/b", "{}")
     c1, c2 = fake.calls
     assert c1["sm4_key_b64"] == c2["sm4_key_b64"] == SM4_KEY_B64
     assert c1["headers"]["uuid"] == "FIXED-UUID-1"
+
+
+def test_default_uuid_is_random_per_request():
+    """评审 P2：默认（对齐 3.6.6）每请求随机大写 UUID，配置 uuid 不再被优先使用。"""
+    profile = _profile(uuid="FIXED-UUID-1")
+    fake = _fake()
+    client = yh.YunClient(profile, base_url="http://school.invalid:8080", transport=fake)
+    client.post("/run/a", "{}")
+    client.post("/run/b", "{}")
+    u1, u2 = (c["headers"]["uuid"] for c in fake.calls)
+    assert u1 != u2
+    assert "FIXED-UUID-1" not in (u1, u2)
+    for u in (u1, u2):
+        assert u == u.upper() and len(u) == 36
+    # sign 与当次 uuid/utc 绑定
+    for c in fake.calls:
+        assert c["headers"]["sign"] == yh.md5_sign(profile.platform, c["headers"]["utc"],
+                                                   c["headers"]["uuid"], profile.md5key)
 
 
 def test_fixed_envelope_uses_precomputed_cipherkey():
