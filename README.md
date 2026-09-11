@@ -4,9 +4,9 @@
 协议构造、人脸子系统与偏差清单见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 本 README 顶部为 develop 现状汇报与最新配置教学；底部保留仍有价值的历史档案。
 
-状态：按 APK 3.6.6 反编译逐字段对齐；148 项离线测试全绿（禁网守卫下复证）；
+状态：按 APK 3.6.6 反编译逐字段对齐；155 项离线测试全绿（禁网守卫下复证）；
 两轮评审返修（R1-R6 + S1-S3）通过。**未做账号实机验证**——离线口径为
-`offline_client_compatibility`，服务端接受性待实机。
+`offline_client_compatibility`，服务端接受性待实机（受控实测范围见 docs/USAGE.md §8）。
 
 ## 1. 相对 master 的功能性改动（服务器可见 / 行为可见）
 
@@ -17,7 +17,7 @@
 | splitPoint 载荷 | StepNumber=里程差÷步幅（自造）；null 字段丢失 | Gson serializeNulls 字段序、null 保留；StepNumber=表格真实 runStep 差值（loader 不再丢 runStep/ts）；体级 gzip 仅该端点白名单 |
 | 结束链 | 直接 finish | `/run/isStandard`（同一 P1 体）状态检查先行 → 必要尾批（改为暂存至此补发）→ finish；检查失败/未知/返回 url,list → 后两者不发 |
 | 自动人脸 | 无（当年正倒在 3.6.4/3.6.6 人脸验证上，见 [issue#78](https://github.com/Zirconium233/yunForNewVersion/issues/78)） | 新增整套：窗口调度、比对上传、重试/等待状态机、faceTime+4s 预算、成功守卫（未确认窗口拒绝 finish） |
-| getRlStatus/采集 | 无 | `live_probe.py` 只读探测 getRlStatus；采集端点 `runFaceInfo` **有意不自动调用**（真人审核流，脚本代发=伪造身份材料） |
+| getRlStatus/采集 | 无 | `live_probe.py` 准入探测 getRlStatus（不创建跑步记录）；采集端点 `runFaceInfo` **有意不自动调用**（真人审核流，脚本代发=伪造身份材料） |
 | 响应解码 | 单一 SM4 | 明文 JSON / SM4 / SM4+gzip 三形态统一，异常即 DecodeException |
 | 登录后置 | 首个请求仍带旧 base_url/空 token | 登录后同步内存客户端（含学校地址探测结果）；输出脱敏 |
 | 其它 | — | `--dry-run` 全离线演练、config/task 路径 CLI 贯穿、history.py 记录查看器 |
@@ -47,7 +47,7 @@ start 前全量预检）。**限制如实声明**：检测模型（RetinaFace）
 
 | 层 | 依据 | 首验估计 |
 |---|---|---|
-| 传输/信封/加密 | 与已可用端点同通道 + 148 测试/10 项字段护栏 | ~90% |
+| 传输/信封/加密 | 与已可用端点同通道 + 155 测试/10 项字段护栏 | ~90% |
 | 业务受理（recordId 时机、学校人脸开关、两键体） | 键面逐字对照 APK | ~75% |
 | 比对本体 status=Y | 取决于账号人脸注册状态 | 状态 Y + 本人真照：~50-70%；未注册：≈0（先真机 APP 采集，N1 期间连 APP 都禁跑） |
 
@@ -65,16 +65,16 @@ start 前全量预检）。**限制如实声明**：检测模型（RetinaFace）
 ├── yun_face.py        人脸子系统：照片/视频源、sha256 内容绑定、标注 Bundle、
 │                      取景质量门、APK 压缩链、窗口触发(W1)、FaceRunner、
 │                      FaceVerifier(预算状态机+双段超时裁剪)、compare_once
-├── live_probe.py      实机 L1 只读探测：login + getRlStatus，零写操作
+├── live_probe.py      实机 L1 准入探测：login + getRlStatus，不创建跑步记录（登录非零状态变更；退出码 0=Y/2=缺配置/3=登录未完成/4=业务失败/5=非Y）
 ├── history.py         历史记录查看器（抓轨迹做打表数据 / 事后核验）
 ├── tools/Login.py     登录（凭据来自 ini；token 脱敏；地址探测失败保留配置）
 ├── tools/getUrl_Id.py 学校地址/ID 发现（当前网络环境不可达时可预填绕过）
 ├── tools/drift.py / pace_changer.py / proxy.py   漂移 / 配速 / 抓包配置工具
 ├── tools/EasyAutoRunServer/run.sh                多 config 批量并行（crontab 可用）
-├── tests/             148 项：yun_http(信封/字段序/序列化)、yun_face(窗口/压缩/
+├── tests/             155 项：yun_http(信封/字段序/序列化)、yun_face(窗口/压缩/
 │                      verifier/绑定)、main_phase_a(会话流程/dry-run)、
 │                      wire_alignment(10 项服务器视角护栏)、
-│                      rework_final(R1-R6+S1-S3)、phase_a_fixes
+│                      rework_final(R1-R6+S1-S3)、live_probe(探测只读性与退出码)、phase_a_fixes
 ├── docs/USAGE.md      用户文档（配置/CLI/人脸输入/失败分支表）
 ├── docs/ARCHITECTURE.md 分层 + 线上载荷投影 + 偏差清单 §7(10 条) + 测试地图
 ├── config.ini         唯一配置（见下方教学；实机期间禁提交含密码的副本！）
@@ -88,9 +88,9 @@ start 前全量预检）。**限制如实声明**：检测模型（RetinaFace）
 python -m venv .venv
 .venv\Scripts\activate            # Windows；Linux/macOS 用 source .venv/bin/activate
 pip install -r requirements.txt    # 测试再加 -r requirements-dev.txt
-pytest tests -q                    # 148 项，全程禁网可跑
+pytest tests -q                    # 155 项，全程可禁网跑（conftest 断网守卫）
 python main.py --dry-run           # 全离线演练（不登录、不发任何真实请求）
-python live_probe.py <跑步区域名>  # 实机第一步：登录+查人脸状态（只读）
+python live_probe.py <跑步区域名>  # 实机第一步：查人脸准入（不建跑步记录；登录会更新会话/本地配置，可能使手机APP会话失效）
 python main.py                     # 正式跑（先小步验证，见 docs/USAGE.md §6）
 ```
 
