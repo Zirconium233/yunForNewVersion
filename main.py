@@ -1246,11 +1246,12 @@ def build_face_runner(args, sleep=None, frame_provider=None):
         try:
             v_img, v_meta = source.select(
                 lambda img, idx: runner._gate_for_video(img, idx))
-            runner.build_face_image(v_img, v_meta)
+            v_face = runner.build_face_image(v_img, v_meta)
         except yun_face.FaceInputError as exc:
             raise yun_face.FaceInputError(
                 f"视频源预检失败（不存在解码成功且标注/质量门通过的帧）：{exc} —— "
                 "未发出任何请求") from exc
+        runner.prepared = (v_img, v_meta, v_face)
         return runner
     else:
         pp = resolve_cli_path(face_photo)

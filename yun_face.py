@@ -483,7 +483,7 @@ class FaceVerifier:
         self._ext_sleep(seconds)
 
     # ---- 发起与回调 ----
-    def _attempt(self, face_data: bytes) -> Optional[FaceOutcome]:
+    def _attempt(self, face_data: bytes, phase_deadline=None) -> Optional[FaceOutcome]:
         """a0()：先查会话终止（:711-714），终止则丢弃本次上传。"""
         if self._terminated():
             self.trace.append("attempt skipped: session terminated")
@@ -493,6 +493,9 @@ class FaceVerifier:
             return self._expired_outcome()
         restore = None
         rem = self.remaining()
+        if phase_deadline is not None:
+            phase_rem = max(0.0, phase_deadline - self._now())
+            rem = phase_rem if rem is None else min(rem, phase_rem)
         if rem is not None:
             # 二返修 S3：极小预算直接停发，不用固定下限把预算撑大；
             # 连接与读取两段都按剩余预算裁剪（timeout 参数≠整体截止，
@@ -582,9 +585,9 @@ class FaceVerifier:
             if self.expired() or self._now() >= end:
                 break
             self.trace.append(f"pending resend elapsed={self._now() - start:.1f}s")
-            outcome = wrap(self._attempt(face_data))
+            outcome = wrap(self._attempt(face_data, phase_deadline=end))
             if outcome is not None and outcome.state == "success" and \
-                    self._now() > end:
+                    self._now() >= end:
                 # 二返修 S3：请求返回早于窗口总截止也不够——越过
                 # 等待阶段预算（pending_seconds）的成功不采信。
                 self.trace.append("success beyond pending-phase budget dropped")
@@ -938,7 +941,7 @@ class FaceRunner:
             # 窗口执行直接复用缓存输入，不再中途撞上必然失败的预处理。
             image, meta, face = prepared
             self._last_meta = meta
-            self._log("[face] 使用预检完成的有效输入（照片缓存复用）")
+            self._log("[face] 使用预检完成的有效输入（照片或视频帧缓存复用）")
         else:
             image, meta = (self.source.select(lambda img, idx: self._gate_for_video(img, idx))
                            if isinstance(self.source, VideoFrameSource)

@@ -618,12 +618,24 @@ class TestS2PreflightBeforeStart:
             M.build_face_runner(self._args(video=str(vid), det=str(det)),
                                 frame_provider=lambda p: iter(self._frames()))
 
-    def test_valid_video_frames_input_builds(self, tmp_path):
+    def test_valid_video_frames_input_builds(self, tmp_path, monkeypatch):
         vid = self._vid(tmp_path)
         det = self._frames_det(tmp_path, vid)
         runner = M.build_face_runner(self._args(video=str(vid), det=str(det)),
                                      frame_provider=lambda p: iter(self._frames()))
         assert runner is not None and runner.detection.get(1) is not None
+        assert runner.prepared is not None
+        expected = runner.prepared[2].data
+        vid.write_bytes(b"changed after preflight")
+        def no_read(*args, **kwargs):
+            pytest.fail("window must reuse the validated video frame")
+        monkeypatch.setattr(runner.source, "select", no_read)
+        sent = []
+        window = yf.windows_from_random_list(7, [0.5])[0]
+        out = runner.run_window(window, StubClient(), 7,
+            verifier_cfg=yf.VerifierConfig(attempt_fn=lambda data:
+                (sent.append(data) or yf.FaceOutcome("success"))))
+        assert out.state == "success" and sent == [expected]
 
     def test_valid_photo_caches_prepared_input(self, tmp_path):
         photo, det = photo_pair(tmp_path)
@@ -672,7 +684,8 @@ class TestS3RequestTimeoutBudget:
         assert seen == []                              # 一个请求都没发
         assert any("below send floor" in x for x in v.trace)
 
-    def test_pending_success_beyond_phase_budget_dropped(self):
+    @pytest.mark.parametrize("request_seconds", [7.0, 8.0])
+    def test_pending_success_beyond_phase_budget_dropped(self, request_seconds):
         # 无窗口 deadline：等待阶段预算(pending_seconds)独立生效——请求耗时
         # 使返回越过阶段截止的成功不采信（二返修 S3）。
         t = [1000.0]
@@ -682,7 +695,8 @@ class TestS3RequestTimeoutBudget:
             state["n"] += 1
             if state["n"] == 1:
                 raise yh.HttpStatusException(500, "u", "x")   # 首传失败→等待态
-            t[0] += 8.0                                        # 慢请求 8s
+            assert c2.timeout[0] <= 7.0 and c2.timeout[1] <= 7.0
+            t[0] += request_seconds  # 恰好截止或越界均不可采信
             return {"code": 200, "msg": "ok",
                     "data": {"status": "Y", "msg": "ok"}}
         c = StubClient()
@@ -867,5 +881,4 @@ class TestR6DetectionBinding:
         with pytest.raises(yf.FaceInputError, match="mirrored"):
             M.build_face_runner(self._args(photo=str(photo), det=str(det),
                                            mirror=True))
-
 

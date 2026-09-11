@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
-"""实机验收 L1 只读探测：登录 + run/getRlStatus，绝不含任何写操作。
+"""实机验收 L1 准入探测：登录 + run/getRlStatus，不创建跑步记录。
 
 只发两类请求：
   1) /login/<school_login_url>（tools.Login 既有实现，凭据取自 config.ini
      [Login]，登录失败可能触发服务端锁定/验证码——首次失败即停，勿重试）；
   2) /run/getRlStatus  {"raRunArea": <命令行参数>}（APK 证据：
      NewRunningFragment.java:929-932 构造，:640-698 消费 runFaceStudentStatus）。
-不发 start/split/finish/isStandard/face——无任何服务端状态改变。
+不发 start/split/finish/isStandard/face。登录会更新会话及本地配置，可能使
+手机端会话失效，因此此脚本并非零状态变更。
 
 用法：在 config.ini 填好 [Login] username/password 与 Yun 段
 （school_host/school_id/school_login_url 需预填；本机到 yun_host:8085
@@ -50,11 +51,17 @@ def run(ra_run_area, conf_path=None):
                            raise_on_business_code=False)
     print("[L1] getRlStatus 原样响应（脱敏）：")
     print("  " + json.dumps(redact(obj), ensure_ascii=False))
-    data = (obj or {}).get("data") or {}
+    if not isinstance(obj, dict) or obj.get("code") != 200:
+        print("[L1] 业务请求失败：不解释准入状态，停止")
+        return 4
+    data = obj.get("data")
+    if not isinstance(data, dict):
+        print("[L1] 准入响应缺少有效 data：停止")
+        return 4
     status = data.get("runFaceStudentStatus")
     print(f"[L1] runFaceStudentStatus={status!r}")
     print("[L1] " + interpret(status))
-    return 0
+    return 0 if status == "Y" else 5
 
 
 if __name__ == "__main__":
