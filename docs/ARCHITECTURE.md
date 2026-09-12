@@ -44,7 +44,7 @@ dry_run_home.json  --dry-run 的 getHomeRunInfo 假响应
 
 **两层重试语义**：通用 HTTP 层（yun_http）对任何失败都不自动重放，调用方按“结果未知”报告；唯一的例外是人脸比对业务状态机（FaceVerifier，APK L()/Z() 等价），且其重试受窗口单调时钟预算约束、终端结果（compare_failed/expired）绝不重试。
 
-**业务 code 即终端（返修 R3）**：split/finish 解析 HTTP 200 里的业务 code，code!=200 → `BusinessException` 传播即停止——后续 split/finish 一律不再发送，报告保留 recordId 与最后确认位置。结束链顺序（二返修 S1 修正）：先以同一 P1 体调 `run/isStandard` 做状态检查（API.java:343-344；SportRunMapActivity.java:2798 T1 先 checkRunState，b0 回调 :481-514 仅 code=200 才决定 sendLastPoints 或 S1，S1 :2775 才 runToFinish）→ 通过后补发缓存的尾批 → 最后发 finish；检查失败/未知/返回 url/list 的未移植分支 → 尾批与 finish 均不发送。此前"finish 后查询"的顺序与依据（:1836）不成立，已撤回。
+**业务 code 即终端（返修 R3）**：split/finish 解析 HTTP 200 里的业务 code，code!=200 → `BusinessException` 传播即停止——后续 split/finish 一律不再发送，报告保留 recordId 与最后确认位置。结束链顺序（二返修 S1 修正）：先以同一 P1 体调 `run/isStandard` 做状态检查（API.java:343-344；SportRunMapActivity.java:2798 T1 先 checkRunState，b0 回调 :481-514 仅 code=200 才决定 sendLastPoints 或 S1，S1 :2775 才 runToFinish）→ 通过后补发缓存的尾批 → 最后发 finish；检查失败、data 无效、isStandard 非 Y 或 isCheat=Y → 尾批与 finish 均不发送。此前"finish 后查询"的顺序与依据（:1836）不成立，已撤回。
 
 ## 3. 线上载荷投影（服务器可见字段对齐层）
 
@@ -149,7 +149,7 @@ recover_unfinished                o2(:3337-3368) 断点恢复分类（纯函数�
 8. finish 前的“窗口完整性检查”（实际经过范围内存在未弹/未确认窗口即拒绝 finish）是比 APK 更严格的脚本策略；APK 对应路径会走提交链。
 9. 窗口触发时序：每批上传后批内逐点评估，非 APK 的按轨迹时间独立推进；
    同批内弹窗时刻受批次节奏影响（漏窗防护已兜底，时序差异如实记录）。
-10. 结束链 isStandard 返回 url/list 的后续处理分支不支持：明确停止不猜测。
+10. 结束检查 url/list 仅供展示；isCheat=Y 优先停止，仅 isStandard=Y 自动结束。非 Y 停止是脚本策略，不代表客户端所有结束分支。
 
 ## 8. 维护提示
 

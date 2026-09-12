@@ -1103,8 +1103,9 @@ class Yun_For_New:
           尾批与 finish 一律不再发送。
         - code=200 → RunStateBean 字段原样呈报（isStandard/isCheat/msg；
           判定语义未线上验证，不据此宣称成绩有效）。
-        - url/list 非空 = 服务端给出本脚本未移植的分支（补拍/复核等）：
-          明确停止，不发尾批不 finish，不假装支持。
+        - url/list 为状态图片和检查明细，不构成阻断条件。
+        - isCheat=Y 优先停止；仅 isStandard=Y 允许自动结束。
+          非 Y 停止是脚本的保守策略，不代表客户端所有结束分支。
         """
         try:
             obj = self._post_checked("/run/isStandard", json.dumps(data))
@@ -1112,14 +1113,22 @@ class Yun_For_New:
             print(f"[isStandard] 状态检查失败/未知（{type(exc).__name__}）："
                   "不发送尾批、不发送 finish。本次未走结束链结束。")
             raise
-        d = obj.get("data") or {}
+        d = obj.get("data")
+        if not isinstance(d, dict):
+            raise DecodeException("run/isStandard data 缺失或不是对象：不发送尾批/finish")
         print(f"[isStandard 预检] isStandard={d.get('isStandard')!r} "
               f"isCheat={d.get('isCheat')!r} msg={d.get('msg')!r}"
               "（字段=RunStateBean；服务端判定语义未线上验证，原样呈报）")
-        if d.get("url") or d.get("list"):
+        print("[isStandard 展示字段] " + json.dumps(
+            redact({"url": d.get("url"), "list": d.get("list")}), ensure_ascii=False))
+        if d.get("isCheat") == "Y":
             raise FaceRunStopError(
-                "run/isStandard 返回 url/list（服务端要求后续处理的分支），该分支"
-                "暂不支持：明确停止，不发送尾批、不发送 finish。")
+                "run/isStandard 返回 isCheat=Y：服务端明确标记作弊，"
+                "停止自动结束，不发送尾批、不发送 finish。")
+        if d.get("isStandard") != "Y":
+            raise FaceRunStopError(
+                f"run/isStandard 未确认达标（isStandard={d.get('isStandard')!r}）："
+                "停止自动结束，不发送尾批、不发送 finish。")
         return d
 
 

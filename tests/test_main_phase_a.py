@@ -38,6 +38,8 @@ def _responder(router, envelope):
         return {"code": 200, "msg": "ok", "data": {"recordStartTime": "2000-01-01 00:00:00",
                                                    "id": 42, "studentId": "U1", "faceTime": 0,
                                                    "canSport": True}}
+    if router.endswith("/run/isStandard"):
+        return {"code": 200, "data": {"isStandard": "Y", "isCheat": "N"}}
     return {"code": 200, "msg": "ok", "data": None}
 
 

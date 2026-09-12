@@ -4,9 +4,36 @@
 协议构造、人脸子系统与偏差清单见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 本 README 顶部为 develop 现状汇报与最新配置教学；底部保留仍有价值的历史档案。
 
-状态：按 APK 3.6.6 反编译逐字段对齐；155 项离线测试全绿（禁网守卫下复证）；
-两轮评审返修（R1-R6 + S1-S3）通过。**未做账号实机验证**——离线口径为
-`offline_client_compatibility`，服务端接受性待实机（受控实测范围见 docs/USAGE.md §8）。
+## develop 实测反馈与结束流程修正（2026-09-12）
+
+当前分支保留用于受控验证，**等待更多可复现成功反馈后再考虑合并 master**。
+维护者的自动测试均为离线测试，不能替代账号实测。Issue #78 已有一次人脸
+`data.status=Y` 的日志片段及用户报告的结束成功，但缺少完整版本、改动、回包
+和最终成绩记录，尚不能证明稳定可复现，也无法据此确定后续封禁的原因。
+
+修正了结束检查对 `url/list` 的误拦截。客户端 `CheckRunStateDialog` 将 `url`
+作为状态图片、`list` 作为条件明细展示；字段非空不代表需要补拍或复核。
+本分支继续遵守“状态检查 → 必要尾批确认 → finish”，不会无条件强制提交：
+
+| 状态检查结果 | 自动处理 |
+|---|---|
+| HTTP、解码或业务 code 失败；data 缺失或类型错误 | 停止，不发尾批/finish |
+| isCheat=Y（即使 isStandard=Y） | 显示服务端标记并停止 |
+| isStandard=Y，且没有明确 isCheat=Y | 发送尾批，确认成功后发送 finish |
+| isStandard 非 Y、缺失或未知 | 停止自动结束，保留现场 |
+| url/list 非空 | 记录展示字段，不因此阻断 |
+
+非 Y 时停止是脚本的保守自动化策略，不代表客户端所有人工结束分支。
+`isCheat` 缺失不是“确认无作弊”；人脸 status=Y、结束前达标、finish 受理、
+最终成绩有效是不同结果，不能相互替代。日志新增脱敏后的状态展示字段。
+
+反馈请附每次运行的提交版本、修改差异、命令参数、脱敏请求时间线、业务回包
+及最终成绩/限制提示；不要上传密码、token、人脸 Base64 或完整账号配置。
+不要通过反复登录或强制提交来猜测限制阈值。登录会改变会话及本地配置，
+实测应由账号持有人明确授权；本次修复验证不执行登录或线上跑步请求。
+
+输入仍为照片/选定视频帧加人工标注，自动检测器、完整恢复及部分客户端
+时序尚未实现；详细范围见 [docs/USAGE.md](docs/USAGE.md)。
 
 ## 1. 相对 master 的功能性改动（服务器可见 / 行为可见）
 
@@ -15,7 +42,7 @@
 | 请求身份 | uuid 固定读配置；utc/sign 整会话算一次复用 | 每请求随机大写 UUID + 新鲜 utc + 重算 sign（3.6.6 真机行为）；`legacy_uuid=1` 可回退旧协议 |
 | 业务 code | 只看 HTTP 200，响应仅打印 | `code≠200 → BusinessException` 传播即停，后续 split/finish 一律不发，报告 recordId 与最后确认位置；HTTP 层错误（结果未知）与业务拒绝严格区分，不自动重放 |
 | splitPoint 载荷 | StepNumber=里程差÷步幅（自造）；null 字段丢失 | Gson serializeNulls 字段序、null 保留；StepNumber=表格真实 runStep 差值（loader 不再丢 runStep/ts）；体级 gzip 仅该端点白名单 |
-| 结束链 | 直接 finish | `/run/isStandard`（同一 P1 体）状态检查先行 → 必要尾批（改为暂存至此补发）→ finish；检查失败/未知/返回 url,list → 后两者不发 |
+| 结束链 | 直接 finish | `/run/isStandard`（同一 P1 体）状态检查先行 → 必要尾批（改为暂存至此补发）→ finish；检查失败、未达标或 isCheat=Y → 后两者不发；url/list 仅展示 |
 | 自动人脸 | 无（当年正倒在 3.6.4/3.6.6 人脸验证上，见 [issue#78](https://github.com/Zirconium233/yunForNewVersion/issues/78)） | 新增整套：窗口调度、比对上传、重试/等待状态机、faceTime+4s 预算、成功守卫（未确认窗口拒绝 finish） |
 | getRlStatus/采集 | 无 | `live_probe.py` 准入探测 getRlStatus（不创建跑步记录）；采集端点 `runFaceInfo` **有意不自动调用**（真人审核流，脚本代发=伪造身份材料） |
 | 响应解码 | 单一 SM4 | 明文 JSON / SM4 / SM4+gzip 三形态统一，异常即 DecodeException |
@@ -36,23 +63,15 @@ FaceImageCompressor：EXIF 摆正→宽>720 才缩→质量阶梯 80..20 压至 
 比对基准在**服务端注册照**（`runFaceInfo` 采集 + 审核状态机：
 `getRlStatus.runFaceStudentStatus` Y=可跑 / N、N0=需（重新）采集 / N1=审核中禁跑）。
 
-**我们发送什么**：与上面逐字节同构（两键、同 b64 形态、同压缩链，含
+**我们发送什么**：与上面的请求字段结构对应（图片编码及 Luban 处理存在已记录的近似差异）（两键、同 b64 形态、同压缩链，含
 "限宽不限长边、150KB 硬目标"等 WIRE_AUDIT 修正）；图片来源为
 `--face-photo` / `--face-video` + 人工标注 JSON（内容哈希绑定 + 取景门复算 +
 start 前全量预检）。**限制如实声明**：检测模型（RetinaFace）未移植，标注必须
 人工提供；等待期复用同一张图、语音引导 4s、重试形态对齐 APK，但比对阈值在
 服务端，离线不可测。
 
-**第一次实机通过概率（分层估计，非单一数字）**：
-
-| 层 | 依据 | 首验估计 |
-|---|---|---|
-| 传输/信封/加密 | 与已可用端点同通道 + 155 测试/10 项字段护栏 | ~90% |
-| 业务受理（recordId 时机、学校人脸开关、两键体） | 键面逐字对照 APK | ~75% |
-| 比对本体 status=Y | 取决于账号人脸注册状态 | 状态 Y + 本人真照：~50-70%；未注册：≈0（先真机 APP 采集，N1 期间连 APP 都禁跑） |
-
-综合：L1 探测为 Y 且提供本人合格照片时，端到端首验约 **4-6 成**；未注册账号
-人脸任务现在不可能过——这与脚本代码质量无关，先用 `live_probe.py` 探状态。
+**实测成功率尚无可靠统计**：此前的百分比估计缺少样本依据，已撤回。
+需要按版本收集完整成功/失败记录，才能评估可复现性。
 
 ## 3. 代码结构与文件职能
 
@@ -71,7 +90,7 @@ start 前全量预检）。**限制如实声明**：检测模型（RetinaFace）
 ├── tools/getUrl_Id.py 学校地址/ID 发现（当前网络环境不可达时可预填绕过）
 ├── tools/drift.py / pace_changer.py / proxy.py   漂移 / 配速 / 抓包配置工具
 ├── tools/EasyAutoRunServer/run.sh                多 config 批量并行（crontab 可用）
-├── tests/             155 项：yun_http(信封/字段序/序列化)、yun_face(窗口/压缩/
+├── tests/             165 项：yun_http(信封/字段序/序列化)、yun_face(窗口/压缩/
 │                      verifier/绑定)、main_phase_a(会话流程/dry-run)、
 │                      wire_alignment(10 项服务器视角护栏)、
 │                      rework_final(R1-R6+S1-S3)、live_probe(探测只读性与退出码)、phase_a_fixes
@@ -88,7 +107,7 @@ start 前全量预检）。**限制如实声明**：检测模型（RetinaFace）
 python -m venv .venv
 .venv\Scripts\activate            # Windows；Linux/macOS 用 source .venv/bin/activate
 pip install -r requirements.txt    # 测试再加 -r requirements-dev.txt
-pytest tests -q                    # 155 项，全程可禁网跑（conftest 断网守卫）
+pytest tests -q                    # 165 项，全程可禁网跑（conftest 断网守卫）
 python main.py --dry-run           # 全离线演练（不登录、不发任何真实请求）
 python live_probe.py <跑步区域名>  # 实机第一步：查人脸准入（不建跑步记录；登录会更新会话/本地配置，可能使手机APP会话失效）
 python main.py                     # 正式跑（先小步验证，见 docs/USAGE.md §6）

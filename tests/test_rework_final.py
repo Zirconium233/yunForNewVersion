@@ -108,6 +108,8 @@ class StubClient:
         if router.endswith("runFaceInfoComparison"):
             return {"code": 200, "msg": "ok",
                     "data": {"status": "Y", "msg": "stub"}}
+        if router.endswith("/run/isStandard"):
+            return {"code": 200, "data": {"isStandard": "Y", "isCheat": "N"}}
         return {"code": 200, "msg": "ok", "data": None}
 
     def routers(self):
@@ -481,18 +483,47 @@ class TestS1FinishChainOrder:
         assert not any(r.endswith("/run/finish") for r in rs)
         assert sum(1 for r in rs if r.endswith("splitPointCheating")) == 1
 
-    def test_isstandard_unsupported_branch_stops(self, capsys):
+    def test_isstandard_cheat_stops(self, capsys):
         client, yun = self._flow({"/run/isStandard": lambda c, r, kw: {
             "code": 200, "msg": "ok",
             "data": {"isStandard": "N", "isCheat": "Y",
                      "msg": "需复核", "url": "http://x/recheck",
                      "list": [{"a": 1}]}}})
-        with pytest.raises(M.FaceRunStopError, match="暂不支持"):
+        with pytest.raises(M.FaceRunStopError, match="isCheat=Y"):
             yun.finish_by_points_map()
         rs = client.routers()
         assert not any(r.endswith("/run/finish") for r in rs)
         assert sum(1 for r in rs if r.endswith("splitPointCheating")) == 1
         assert "[isStandard 预检]" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("cheat", [None, "N"])
+    def test_standard_display_fields_allow_tail_and_finish(self, cheat):
+        data = {"isStandard": "Y", "isCheat": cheat,
+                "msg": "本次跑步已满足要求", "url": "https://example.invalid/status.png",
+                "list": [{"msg": "至少跑1.5公里", "isStandard": "Y",
+                          "url": "https://example.invalid/item.png"}]}
+        client, yun = self._flow({"/run/isStandard": lambda c, r, kw:
+                                 {"code": 200, "data": data}})
+        yun.finish_by_points_map()
+        assert [r.rsplit("/", 1)[-1] for r in client.routers()][-3:] == [
+            "isStandard", "splitPointCheating", "finish"]
+
+    @pytest.mark.parametrize("data,error", [
+        (None, yh.DecodeException), ([], yh.DecodeException),
+        ("Y", yh.DecodeException), ({}, M.FaceRunStopError),
+        ({"isStandard": "N"}, M.FaceRunStopError),
+        ({"isStandard": "unknown"}, M.FaceRunStopError),
+        ({"isStandard": True}, M.FaceRunStopError),
+        ({"isStandard": "Y", "isCheat": "Y"}, M.FaceRunStopError),
+    ])
+    def test_unconfirmed_or_cheat_state_never_sends_tail_or_finish(self, data, error):
+        client, yun = self._flow({"/run/isStandard": lambda c, r, kw:
+                                 {"code": 200, "data": data}})
+        tail = list(yun._pending_tail_points)
+        with pytest.raises(error):
+            yun.finish_by_points_map()
+        assert client.routers()[-1].endswith("/run/isStandard")
+        assert yun._pending_tail_points == tail
 
     def test_tail_rejected_means_no_finish(self):
         cnt = {"n": 0}
