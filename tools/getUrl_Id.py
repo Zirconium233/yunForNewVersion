@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
-"""学校目录查询（旧路线 http://sports.aiyyd.com:9001/api/app/schoolList）。
+"""学校目录查询：默认只查询公共目录，不读账号配置、不登录、不写配置。
 
-A 阶段修订（评审 2.1.5 / 2.2 表 BASE_URL 行）：
-- 模块导入时不再读取 config.ini（去除导入副作用）；缺省配置按项目根解析，可用 conf_path 覆盖。
-- 头部构造、签名、信封与响应解码统一走 yun_http；不再各处复制实现。
-- uuid 不再硬编码抓包值：配置 [User] uuid 非空则沿用，为空则每请求随机大写（与 3.6.6 证据一致）。
-- 该端点属于“公共目录”，与学校业务服务、登录路由分开；A 阶段不改默认端点值。
+2026-09-13 核实 Android 3.6.6 使用 HTTPS 9011 /api/app/lisshtcool。
+该接口返回普通 JSON，与学校业务服务的加密请求不同；实测空 POST 加
+version/platform/isApp 即可查询。显式 --write 才更新学校配置。
 """
+import argparse
+import requests
+from urllib.parse import urlsplit
 import configparser
 import hashlib
 import json
@@ -24,7 +25,8 @@ from yun_http import YunClient, join_url
 from yun_http import encrypt_sm4, decrypt_sm4  # 兼容旧导出名
 
 DEFAULT_CONF = os.path.join(_REPO_ROOT, "config.ini")
-SCHOOL_LIST_BASE = "http://sports.aiyyd.com:9001/api"
+SCHOOL_LIST_BASE = "https://sports.aiyyd.com:9011/api"
+SCHOOL_LIST_URL = SCHOOL_LIST_BASE + "/app/lisshtcool"
 
 
 def md5_encryption(data):
@@ -42,22 +44,47 @@ def load_conf(conf_path=None):
     return conf
 
 
+def fetch_school_directory(transport=None):
+    """一次公共目录请求；无 token/cookie/账号配置，HTTPS 校验保持开启。"""
+    send = transport or requests.post
+    response = send(url=SCHOOL_LIST_URL, data="", headers={
+        "version": "3.6.6", "platform": "android", "isApp": "app",
+        "Content-Type": "application/json",
+    }, timeout=(8, 15))
+    if response.status_code != 200:
+        raise yun_http.HttpStatusException(response.status_code, SCHOOL_LIST_URL,
+                                            response.text[:200])
+    try:
+        obj = json.loads(response.text)
+    except (TypeError, ValueError) as exc:
+        raise yun_http.DecodeException("学校目录不是有效 JSON") from exc
+    if not isinstance(obj, dict):
+        raise yun_http.DecodeException("学校目录响应不是对象")
+    if obj.get("code") != 200:
+        raise yun_http.BusinessException(obj.get("code"), str(obj.get("msg", "")), obj)
+    rows = obj.get("data")
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        raise yun_http.DecodeException("学校目录 data 不是学校列表")
+    return rows
+
+
 def getschool_Url_Id(schoolName, conf_path=None, transport=None, rng=None):
-    """按学校名查 (schoolUrl, schoolId)。transport 可注入假传输（测试/dry-run）。"""
-    conf = load_conf(conf_path)
-    profile = yun_http.profile_from_conf(conf)
-    client = YunClient(profile, base_url=SCHOOL_LIST_BASE, transport=transport, rng=rng)
-    infojson = client.post_json("/app/schoolList", "", fixed_envelope=True)
-    if infojson.get('code') != 200:
-        print("请求失败，请检查输入或网络。", infojson.get('msg', ''))
+    """按全称精确匹配；兼容旧调用参数，但查询不读取 conf_path。"""
+    matches = [row for row in fetch_school_directory(transport)
+               if row.get("schoolName") == schoolName.strip()]
+    if not matches:
+        print("未找到匹配的学校全称；请 --list 查询，勿套用其他学校地址")
         return None, None
-    for school in infojson.get('data', []):
-        if school.get('schoolName') == schoolName:
-            schoolUrl = school.get('schoolUrl').rstrip('/')
-            schoolId = school.get('schoolId')
-            return schoolUrl, schoolId
-    print("未找到匹配的学校名称")
-    return None, None
+    if len(matches) != 1:
+        raise yun_http.DecodeException("学校名称重复，需官方客户端确认，不自动选择")
+    row = matches[0]
+    url, sid = row.get("schoolUrl"), row.get("schoolId")
+    if not isinstance(url, str) or not url.strip() or sid is None or not str(sid).strip():
+        raise yun_http.DecodeException("所选学校缺少有效 schoolUrl/schoolId")
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise yun_http.DecodeException("所选学校 schoolUrl 不是 HTTP(S) 地址")
+    return url.rstrip('/'), sid
 
 
 def writeUrlToConfig(schoolUrl, schoolId, conf_path=None):
@@ -76,8 +103,31 @@ def writeUrlToConfig(schoolUrl, schoolId, conf_path=None):
         print("当前学校URL和ID与配置文件中的一致，无需更新。")
 
 
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--list", action="store_true", help="输出完整学校目录 JSON")
+    mode.add_argument("--school", help="学校全称，精确匹配")
+    parser.add_argument("--write", action="store_true", help="显式更新配置中的学校地址和 ID")
+    parser.add_argument("--config", default=DEFAULT_CONF)
+    args = parser.parse_args(argv)
+    if args.list:
+        if args.write:
+            parser.error("--write 必须选择一所学校，不能与 --list 同用")
+        print(json.dumps(fetch_school_directory(), ensure_ascii=False, indent=2))
+        return 0
+    name = args.school or input("请输入学校全称（默认只查询）：")
+    url, sid = getschool_Url_Id(name)
+    if url is None:
+        return 1
+    print(json.dumps({"schoolName": name, "schoolId": sid, "schoolUrl": url},
+                     ensure_ascii=False, indent=2))
+    if args.write:
+        writeUrlToConfig(url, sid, conf_path=args.config)
+    else:
+        print("仅查询：未读取或修改账号配置；确认学校无误后用 --write 更新学校字段。")
+    return 0
+
+
 if __name__ == '__main__':
-    schoolName = input("请输入学校名称：")
-    url, schoolId = getschool_Url_Id(schoolName)
-    if url is not None:
-        writeUrlToConfig(url, schoolId)
+    raise SystemExit(main())

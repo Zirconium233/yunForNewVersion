@@ -4,6 +4,49 @@
 协议构造、人脸子系统与偏差清单见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 本 README 顶部为 develop 现状汇报与最新配置教学；底部保留仍有价值的历史档案。
 
+## 连接失败先核对学校地址（2026-09-13）
+
+已实时查询官方目录（HTTP 200 / code=200 / 99 条）：
+[全部学校 → schoolId → schoolUrl 对照表](docs/SCHOOL_DIRECTORY_20260913.md)。
+请按自己的**学校全称**查找，不要复制合工大地址到外校，也不要根据目录域名拼接 8080。
+
+- 合肥工业大学：`schoolId=100`，`http://210.45.246.53:8080/`。
+- 多数学校：`https://sports.aiyyd.com:8000/`，但 schoolId 仍各不相同。
+- 本次目录没有 `http://sports.aiyyd.com:8080/`；此前反馈更应先核对目标地址，
+  不能凭“ping 通但 TCP 失败”认定学校封了宿舍 8080。
+- 有的学校 URL 带 `/m-api/` 或使用私网 IP，必须保留完整 URL；私网入口需要
+  对应校园网络或官方提供的入口，热点/普通公网代理不保证可达。
+- 目录快照不代表所有学校业务服务都可用。若学校目录记录异常，以官方客户端
+  实际选校后的地址或学校确认结果为准；不要猜端口、降级 HTTPS 或套用其他学校。
+
+新版目录接口是 **POST `https://sports.aiyyd.com:9011/api/app/lisshtcool`**，
+Android 3.6.6 也使用该路径。它只负责返回学校地址，9011 不等于跑步服务端口。
+旧查询工具的 `9001/api/app/schoolList` 已替换；新版查询不需要账号配置、token 或加密信封。
+
+```powershell
+# 只查询，不登录、不读写账号配置
+python tools/getUrl_Id.py --list
+python tools/getUrl_Id.py --school "合肥工业大学"
+# 核对全称后显式更新 school_host / school_id（保留其他配置值）
+python tools/getUrl_Id.py --school "你的学校全称" --write --config config.ini
+```
+
+也可独立通过 PowerShell 查询（不需要本项目或账号）：
+
+```powershell
+$schoolDirectory = Invoke-RestMethod -Method Post `
+  -Uri 'https://sports.aiyyd.com:9011/api/app/lisshtcool' `
+  -Headers @{version='3.6.6'; platform='android'; isApp='app'} `
+  -ContentType 'application/json' -Body ''
+if ($schoolDirectory.code -ne 200) { throw $schoolDirectory.msg }
+$schoolDirectory.data | Select-Object schoolName, schoolId, schoolUrl | Format-Table -AutoSize
+```
+
+缺少 version 请求头时本次返回“版本过低”，不能把该业务错误当成 TCP 不通。
+取到 schoolUrl 后，将其完整填入 `[Yun] school_host`，并使用同一条记录的 schoolId；
+查询工具不推测或更改 `school_login_url`。TCP 不通时 token 尚未参与 HTTP 业务判断。
+本次仅查询公共目录，没有登录或调用任何学校的跑步、人脸接口。
+
 ## develop 实测反馈与结束流程修正（2026-09-12）
 
 当前分支保留用于受控验证，**等待更多可复现成功反馈后再考虑合并 master**。
@@ -90,7 +133,7 @@ start 前全量预检）。**限制如实声明**：检测模型（RetinaFace）
 ├── tools/getUrl_Id.py 学校地址/ID 发现（当前网络环境不可达时可预填绕过）
 ├── tools/drift.py / pace_changer.py / proxy.py   漂移 / 配速 / 抓包配置工具
 ├── tools/EasyAutoRunServer/run.sh                多 config 批量并行（crontab 可用）
-├── tests/             165 项：yun_http(信封/字段序/序列化)、yun_face(窗口/压缩/
+├── tests/             173 项：yun_http(信封/字段序/序列化)、yun_face(窗口/压缩/
 │                      verifier/绑定)、main_phase_a(会话流程/dry-run)、
 │                      wire_alignment(10 项服务器视角护栏)、
 │                      rework_final(R1-R6+S1-S3)、live_probe(探测只读性与退出码)、phase_a_fixes
@@ -107,7 +150,7 @@ start 前全量预检）。**限制如实声明**：检测模型（RetinaFace）
 python -m venv .venv
 .venv\Scripts\activate            # Windows；Linux/macOS 用 source .venv/bin/activate
 pip install -r requirements.txt    # 测试再加 -r requirements-dev.txt
-pytest tests -q                    # 165 项，全程可禁网跑（conftest 断网守卫）
+pytest tests -q                    # 173 项，全程可禁网跑（conftest 断网守卫）
 python main.py --dry-run           # 全离线演练（不登录、不发任何真实请求）
 python live_probe.py <跑步区域名>  # 实机第一步：查人脸准入（不建跑步记录；登录会更新会话/本地配置，可能使手机APP会话失效）
 python main.py                     # 正式跑（先小步验证，见 docs/USAGE.md §6）
@@ -127,10 +170,11 @@ python main.py                     # 正式跑（先小步验证，见 docs/USAG
 - 登录失败可能触发服务端锁定/验证码：首次失败即停，勿盲目重试。
 
 ### [Yun]（多数保持默认；实机核对三项）
-- `school_host` / `school_id` / `school_login_url`：学校服务端三要素。地址
-  发现接口（`yun_host:8085`）在部分网络环境不可达——探测失败时脚本保留既有
-  配置，直接手填即可（合工大：`http://210.45.246.53:8080` / `100` /
-  `appLoginHGD`；其他学校抓包 `210.x.x.x:8080` 类 URL 照抄）。
+- `school_host` / `school_id` / `school_login_url`：学校服务端三要素。地址与 ID
+  通过本文顶部的新版目录查询；登录路由仍需对应学校确认。合工大为
+  `http://210.45.246.53:8080` / `100` / `appLoginHGD`，外校不能照搬。
+  目录查询失败不会证明既有配置正确，先单独查询或对照官方客户端；当前登录
+  流程遇到目录请求异常会停止，勿将其理解为保证自动回退。
 - `app_edition`：3.6.6 行为基准（脚本按此生成 3.6.6 形态请求）。
 - `legacy_uuid=1`（可选，[User] 段）：回退"固定 uuid + 会话级 sign"旧协议，
   仅当服务端按新版本拒绝请求时排查用。

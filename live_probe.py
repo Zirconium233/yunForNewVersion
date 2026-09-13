@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """实机验收 L1 准入探测：登录 + run/getRlStatus，不创建跑步记录。
 
-只发两类请求：
+除登录内部的公共学校目录查询外，只发以下两类请求：
   1) /login/<school_login_url>（tools.Login 既有实现，凭据取自 config.ini
      [Login]，登录失败可能触发服务端锁定/验证码——首次失败即停，勿重试）；
   2) /run/getRlStatus  {"raRunArea": <命令行参数>}（APK 证据：
@@ -10,8 +10,7 @@
 手机端会话失效，因此此脚本并非零状态变更。
 
 用法：在 config.ini 填好 [Login] username/password 与 Yun 段
-（school_host/school_id/school_login_url 需预填；本机到 yun_host:8085
-不可达，地址发现不可用，Login 探测失败时会保留既有配置）。
+（先用 tools/getUrl_Id.py 查询学校地址与 ID；school_login_url 需对应学校确认）。
 
   python live_probe.py <raRunArea>
 """
@@ -38,7 +37,7 @@ def run(ra_run_area, conf_path=None):
     cfg = M.resolve_cli_path(conf_path) if conf_path else M.project_resource("config.ini")
     M.set_args(cfg)
     if not M.my_host:
-        print("[L1] school_host 未配置：本机到地址发现服务不可达，请先在 config.ini 预填")
+        print("[L1] school_host 未配置：请先用 tools/getUrl_Id.py 查询并确认学校地址")
         return 2
     result = Login.main(cfg)
     if result is None:
