@@ -1,0 +1,25 @@
+{
+  "base_geojson": "base_v3.geojson",
+  "coordinate_system": "GCJ-02",
+  "distance_m": 2100,
+  "pace_min_km": 6,
+  "cadence_spm": 160,
+  "sample_seconds": 1,
+  "seed": 20260919,
+  "start_trim": 0,
+  "end_trim": 0,
+  "lane_change_indices": [
+    90,
+    175,
+    290
+  ],
+  "lane_change_choices_m": [
+    -1.3,
+    -0.9,
+    0.9,
+    1.2
+  ],
+  "max_offset_m": 5,
+  "detour_enabled": false,
+  "lane_transition_points": 12
+}

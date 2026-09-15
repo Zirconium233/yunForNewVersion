@@ -26,6 +26,7 @@ import time
 import requests
 import json
 import configparser
+import copy
 import hashlib
 from typing import List, Dict
 from gmssl.sm4 import CryptSM4, SM4_ENCRYPT, SM4_DECRYPT
@@ -43,6 +44,7 @@ from tools.Login import Login
 
 import yun_http
 import yun_face
+import yun_route
 from yun_face import FaceRunStopError  # noqa: F401  (main 的 except 分支使用)
 from yun_http import (
     BusinessException,
@@ -223,6 +225,8 @@ def parse_args():
                         help='任务文件路径（相对路径按调用者工作目录解析；缺省为项目根 tasks_fch）')
     parser.add_argument('-a', '--auto_run', action='store_true', help='自动跑步，默认打表')
     parser.add_argument('-d', '--drift', action='store_true', help='是否添加漂移')
+    parser.add_argument('--route-config', default=None,
+                        help='V4 几何模板生成配置（JSON）；替代打表，不能与 -t/-d 混用')
     parser.add_argument('--dry-run', '--dry_run', dest='dry_run', action='store_true',
                         help='离线演练：本地 fixture + 假传输，不登录/不探测学校/不调高德/不 sleep/不写配置')
     parser.add_argument('--dry-home', dest='dry_home', type=str, default=None,
@@ -949,6 +953,66 @@ class Yun_For_New:
                 self.client.sleep(sleep_time)
             print('第' + str(task_index + 1) + '个点处理完毕！')
 
+    def validate_generated_route(self, task):
+        """在 start 前校验任务约束；几何生成不能替代学校的踩点要求。"""
+        data = task['data']
+        if task['metadata']['coordinate_system'] != 'GCJ-02':
+            raise ValueError("当前客户端上传要求 GCJ-02；生成器不会自动转换 WGS84")
+        if int(self.raDislikes) > 0:
+            raise ValueError("生成模式暂不支持要求踩点的任务（raDislikes > 0）")
+        km = float(data['recordMileage'])
+        if not float(self.raSingleMileageMin) <= km <= float(self.raSingleMileageMax):
+            raise ValueError(f"生成里程 {km:.4f} km 不在任务范围 "
+                             f"{self.raSingleMileageMin}～{self.raSingleMileageMax} km")
+        if not float(self.raCadenceMin) <= data['recodeCadence'] <= float(self.raCadenceMax):
+            raise ValueError("生成步频不在任务允许范围")
+        if split_count < 2:
+            raise ValueError("生成模式 split_count 至少为 2，避免单点批次无法计算差值")
+
+    def do_generated_route(self, task):
+        """按逐点时间调度；复用既有上传、人脸停止门与结束链。"""
+        self.task_map = copy.deepcopy(task)
+        self._pending_tail_points = []
+        points = []
+        epoch = self.client.now()
+        started = self.client.mono()
+        previous = 0
+        last_time, last_mileage = 0, 0.0
+        actual_points = []
+        print(f"[路径生成] {len(task['data']['pointsList'])} 点，"
+              f"{task['data']['recordMileage']:.4f} km，{task['data']['duration']} 秒")
+        for source in task['data']['pointsList']:
+            self._face_guard("生成路径推进")
+            # 请求和人脸处理所用时间不会被负 sleep 或追赶式突发上传抵消。
+            self.client.sleep(source['runTime'] - previous)
+            previous = source['runTime']
+            point = dict(source)
+            elapsed = max(source['runTime'], int(round(self.client.mono()-started)))
+            if actual_points:
+                elapsed = max(elapsed, last_time+source['runTime']-actual_points[-1]['_planned_time'])
+            point['runTime'] = elapsed
+            point['runStep'] = math.floor(elapsed*task['metadata']['cadence_spm']/60)
+            point['speed'] = yun_route.client_speed(point['runMileage']-last_mileage, elapsed-last_time)
+            point['ts'] = str(int(epoch)+elapsed)
+            actual_points.append(dict(point, _planned_time=source['runTime']))
+            last_time, last_mileage = elapsed, point['runMileage']
+            points.append(point)
+            if len(points) == split_count:
+                self.split_by_points_map(points)
+                self._last_confirmed_mileage_m = int(point['runMileage'])
+                points = []
+            self._face_on_mileage(point['runMileage'])
+        self._pending_tail_points = points
+        for point in actual_points:
+            point.pop('_planned_time')
+        data = self.task_map['data']
+        data['pointsList'] = actual_points
+        data['duration'] = last_time
+        data['recodePace'] = last_time/60/data['recordMileage']
+        data['recodeCadence'] = actual_points[-1]['runStep']*60/last_time
+        if points:
+            print(f"[尾批] 暂存尾部 {len(points)} 点；由状态检查 → 尾批 → finish 链处理")
+
     def do_by_points_map(self, path='./tasks', random_choose=False, isDrift=False):
         files = os.listdir(path)
         files.sort()
@@ -1323,8 +1387,14 @@ def run_dry(cfg_path: str, task_path: str, args):
     try:
         yun = Yun_For_New(auto_generate_task=False, client=client, home_info=None,
                           face_runner=face_runner)
+        generated_task = getattr(args, 'generated_task', None)
+        if generated_task is not None:
+            yun.validate_generated_route(generated_task)
         yun.start()
-        yun.do_by_points_map(path=task_path, random_choose=True, isDrift=args.drift)
+        if generated_task is not None:
+            yun.do_generated_route(generated_task)
+        else:
+            yun.do_by_points_map(path=task_path, random_choose=True, isDrift=args.drift)
         yun.finish_by_points_map()
     except FaceRequiredError as e:
         print("[dry-run 停止门] " + str(e))
@@ -1343,6 +1413,11 @@ def run_dry(cfg_path: str, task_path: str, args):
 
 def main(run=True):
     args = parse_args()
+    route_path = getattr(args, 'route_config', None)
+    if route_path and (args.task_path or args.drift):
+        raise ValueError("--route-config 不能与 -t/--task_path 或 -d/--drift 混用")
+    # 几何预检在账号配置、登录、getHomeRunInfo 和 start 之前完成。
+    args.generated_task = yun_route.generate(resolve_cli_path(route_path)) if route_path else None
     cfg_path = resolve_cli_path(args.config_path) if args.config_path else project_resource("config.ini")
     task_path = resolve_cli_path(args.task_path) if args.task_path else project_resource("tasks_fch")
 
@@ -1383,6 +1458,14 @@ def main(run=True):
     Yun = None   # 返修 R3：异常分支需要报告 recordId/最后确认位置（未构造时保持 None）
     try:
         if sure == 'y':
+            if args.generated_task is not None:
+                Yun = Yun_For_New(auto_generate_task=False,
+                                  face_runner=build_face_runner(args))
+                Yun.validate_generated_route(args.generated_task)
+                Yun.start()
+                Yun.do_generated_route(args.generated_task)
+                Yun.finish_by_points_map()
+                return
             if args.auto_run:
                 print_table = 'y'
             else:
@@ -1460,6 +1543,9 @@ def main(run=True):
         print(f"[失败] 请求结果可能未定（状态未知），不要盲目重发；recordId={rid!r}，"
               f"{pos_s}；请先查询服务端记录再决定。")
     except Exception as e:
+        if args.generated_task is not None:
+            # 自动生成任务失败必须以非零退出，不等待不可见的 input()。
+            raise
         print("跑步失败了，错误信息：")
         print(e)
         input()

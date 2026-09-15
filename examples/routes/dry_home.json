@@ -1,0 +1,21 @@
+{
+  "code": 200,
+  "msg": "offline fixture only",
+  "data": {
+    "cralist": [
+      {
+        "id": 900001,
+        "schoolId": "100",
+        "raType": "T1",
+        "raRunArea": "A",
+        "raDislikes": 0,
+        "raSingleMileageMin": 2.0,
+        "raSingleMileageMax": 3.0,
+        "raCadenceMin": 120,
+        "raCadenceMax": 190,
+        "runFaceStatus": "N",
+        "points": ""
+      }
+    ]
+  }
+}

@@ -150,15 +150,31 @@ start 前全量预检）。**限制如实声明**：检测模型（RetinaFace）
 python -m venv .venv
 .venv\Scripts\activate            # Windows；Linux/macOS 用 source .venv/bin/activate
 pip install -r requirements.txt    # 测试再加 -r requirements-dev.txt
-pytest tests -q                    # 173 项，全程可禁网跑（conftest 断网守卫）
+pytest tests -q                    # 195 项，可在禁网环境运行
 python main.py --dry-run           # 全离线演练（不登录、不发任何真实请求）
 python live_probe.py <跑步区域名>  # 实机第一步：查人脸准入（不建跑步记录；登录会更新会话/本地配置，可能使手机APP会话失效）
 python main.py                     # 正式跑（先小步验证，见 docs/USAGE.md §6）
 ```
 
-常用参数：`-f/-t` 指定 config/task 目录；`-a` 自动模式（map.json 路线，旧行为
-保留）；`-d` 轨迹漂移；`--face-photo/--face-video/--face-detection/--face-mirror`
+常用参数：`-f/-t` 指定 config/task 目录；`-a` 自动模式（缺省打表；指定 `--route-config` 时生成路线）；`-d` 轨迹漂移；`--face-photo/--face-video/--face-detection/--face-mirror`
 人脸源（见 §人脸输入）。
+
+## V4 几何模板生成（develop）
+
+新增 `--route-config`，使用本地几何底图和参数生成点列，重新计算时间、距离、步数和配速，替代读取旧打表数据。仍需要底图定义跑道形状；默认不裁剪、不绕出跑道，随机种子固定以便复现。
+
+```powershell
+# 只生成文件，不读取账号、不联网；输出已存在时请换文件名
+python tools/generate_route.py --config examples/routes/v4.json --output work_dir/route_preview.geojson
+# 完整离线假传输演练
+python main.py --dry-run -f tests/fixtures/test_config.ini --dry-home examples/routes/dry_home.json --route-config examples/routes/v4.json
+# 使用账号运行时的入口
+python main.py -f config.ini --route-config examples/routes/v4.json
+```
+
+参数、路径规则与限制见 [路径生成配置说明](docs/ROUTE_GENERATION.md)，配置模板为 [v4.json](examples/routes/v4.json)。示例底图仅适用于其对应场地，其他学校需更换；不能与 `-t/-d` 混用。暂不支持需要踩点的任务，发现不匹配会在建记录前停止。
+
+此前记录被追溯取消的原因尚不明确。几何合理和离线测试通过均不代表成绩有效，当前保持 develop 测试状态。
 
 ## 5. 配置教学（2026 develop 版）
 
