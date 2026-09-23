@@ -22,7 +22,8 @@ def main():
     output.write_text(json.dumps(yun_route.geojson(task), ensure_ascii=False, indent=2), encoding='utf-8')
     task_output.write_text(json.dumps(task, ensure_ascii=False, indent=2), encoding='utf-8')
     data = task['data']
-    print(f"{len(data['pointsList'])} 点 / {data['recordMileage']:.4f} km / {data['duration']} 秒")
+    print(f"{len(data['pointsList'])} 点 / {data['recordMileage']:.4f} km / {data['duration']} 秒"
+          f" / seed={task['metadata']['seed']}")
     print(f"几何：{output}\n明细：{task_output}\n仅完成离线生成，未验证围栏、成绩或服务端接受情况。")
 
 

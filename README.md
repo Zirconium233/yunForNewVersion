@@ -133,7 +133,7 @@ start 前全量预检）。**限制如实声明**：检测模型（RetinaFace）
 ├── tools/getUrl_Id.py 学校地址/ID 发现（当前网络环境不可达时可预填绕过）
 ├── tools/drift.py / pace_changer.py / proxy.py   漂移 / 配速 / 抓包配置工具
 ├── tools/EasyAutoRunServer/run.sh                多 config 批量并行（crontab 可用）
-├── tests/             173 项：yun_http(信封/字段序/序列化)、yun_face(窗口/压缩/
+├── tests/             离线测试：yun_http(信封/字段序/序列化)、yun_face(窗口/压缩/
 │                      verifier/绑定)、main_phase_a(会话流程/dry-run)、
 │                      wire_alignment(10 项服务器视角护栏)、
 │                      rework_final(R1-R6+S1-S3)、live_probe(探测只读性与退出码)、phase_a_fixes
@@ -150,7 +150,7 @@ start 前全量预检）。**限制如实声明**：检测模型（RetinaFace）
 python -m venv .venv
 .venv\Scripts\activate            # Windows；Linux/macOS 用 source .venv/bin/activate
 pip install -r requirements.txt    # 测试再加 -r requirements-dev.txt
-pytest tests -q                    # 195 项，可在禁网环境运行
+pytest tests -q                    # 可在禁网环境运行
 python main.py --dry-run           # 全离线演练（不登录、不发任何真实请求）
 python live_probe.py <跑步区域名>  # 实机第一步：查人脸准入（不建跑步记录；登录会更新会话/本地配置，可能使手机APP会话失效）
 python main.py                     # 正式跑（先小步验证，见 docs/USAGE.md §6）
@@ -162,6 +162,12 @@ python main.py                     # 正式跑（先小步验证，见 docs/USAG
 ## V4 几何模板生成（develop）
 
 新增 `--route-config`，使用本地几何底图和参数生成点列，重新计算时间、距离、步数和配速，替代读取旧打表数据。仍需要底图定义跑道形状；默认不裁剪、不绕出跑道，随机种子固定以便复现。
+
+现在也可在配置中用 `base_task` 读取已有轨迹、用 `telemetry_task` 保留分段速度与步频变化，或将 `seed` 设为 `"auto"` 每次选择新种子。偏移超过 5 米须给出可跑区域 Polygon。任务下发的里程上限和 `passPointNum` 上传阈值会在运行时生效；打表入口的时间戳按逐点 `runTime` 推进。详见下方配置说明。
+
+打表及 `--route-config` 模式中的“2 km 强制提交”按学校任务的 `raSingleMileageMax` 处理，没有全局写死 2 km；达到上限后进入既有的状态检查 → 尾批 → finish 链。上传批量按客户端正常分支的 `passPointNum` 阈值确定，不额外随机化。运动样本模式仍可能保留轨迹与节奏的相似性，当前实现不代表已解决次日复核不合格的问题。
+
+2026-09-23 离线验收：在阻断 socket 连接的环境下，211 项测试通过，覆盖样本轨迹完整执行、里程上限、上传批量、时间戳、旧表步数兼容及区域越界。当前仅发布至 develop，后续仍需实机与延迟复核反馈。
 
 ```powershell
 # 只生成文件，不读取账号、不联网；输出已存在时请换文件名

@@ -615,6 +615,23 @@ class Yun_For_New:
         self.raMinDislikes = data['raDislikes']
         self.raSingleMileageMin = data['raSingleMileageMin'] + single_mileage_min_offset
         self.raSingleMileageMax = data['raSingleMileageMax'] + single_mileage_max_offset
+        self.server_min_mileage_km = float(data['raSingleMileageMin'])
+        self.distance_cap_m = float(data['raSingleMileageMax']) * 1000
+        if not math.isfinite(self.distance_cap_m) or self.distance_cap_m <= 0:
+            raise DecodeException('任务下发的 raSingleMileageMax 必须为有限正数，无法执行里程上限结束')
+        # APK SportRunMapActivity:4345,4351,4189：passPointNum<10 回退 60，
+        # 缓存点数严格大于阈值时发送。旧 fixture 未提供此字段，沿用配置以兼容。
+        point_limit = data.get('passPointNum')
+        if point_limit is None:
+            self.upload_batch_size = split_count
+        else:
+            try:
+                point_limit = int(point_limit)
+            except (TypeError, ValueError) as exc:
+                raise DecodeException('passPointNum 非法，无法确定客户端上传阈值') from exc
+            self.upload_batch_size = (60 if point_limit < 10 else point_limit) + 1
+        if self.upload_batch_size < 2:
+            raise ValueError('上传批次至少需要两个点')
         self.raCadenceMin = data['raCadenceMin'] + cadence_min_offset
         self.raCadenceMax = data['raCadenceMax'] + cadence_max_offset
         points = data['points'].split('|')
@@ -961,13 +978,47 @@ class Yun_For_New:
         if int(self.raDislikes) > 0:
             raise ValueError("生成模式暂不支持要求踩点的任务（raDislikes > 0）")
         km = float(data['recordMileage'])
-        if not float(self.raSingleMileageMin) <= km <= float(self.raSingleMileageMax):
+        effective_km = min(km, self.distance_cap_m/1000)
+        if effective_km < max(float(self.raSingleMileageMin), self.server_min_mileage_km):
             raise ValueError(f"生成里程 {km:.4f} km 不在任务范围 "
-                             f"{self.raSingleMileageMin}～{self.raSingleMileageMax} km")
+                             f"{self.server_min_mileage_km}～{self.distance_cap_m/1000} km")
         if not float(self.raCadenceMin) <= data['recodeCadence'] <= float(self.raCadenceMax):
             raise ValueError("生成步频不在任务允许范围")
-        if split_count < 2:
-            raise ValueError("生成模式 split_count 至少为 2，避免单点批次无法计算差值")
+        if self.upload_batch_size < 2:
+            raise ValueError("生成模式上传批次至少为 2 点")
+
+    def _cap_point(self, point, previous):
+        """达到学校上限时在当前线段截点，避免 finish 里程和末点不符。"""
+        cap = self.distance_cap_m
+        if cap <= 0 or float(point['runMileage']) < cap:
+            return False
+        if previous is None and float(point['runMileage']) > cap:
+            raise ValueError('首个轨迹点已超过任务里程上限，无法截取有效终点')
+        if previous is not None and float(previous['runMileage']) < cap < float(point['runMileage']):
+            frac = ((cap-float(previous['runMileage'])) /
+                    (float(point['runMileage'])-float(previous['runMileage'])))
+            a = list(map(float, previous['point'].split(',')))
+            b = list(map(float, point['point'].split(',')))
+            point['point'] = ','.join(f'{x+(y-x)*frac:.8f}' for x, y in zip(a, b))
+        point['runMileage'] = cap
+        if previous is not None:
+            point['speed'] = yun_route.client_speed(
+                cap-float(previous['runMileage']),
+                int(point['runTime'])-int(previous['runTime']))
+        return True
+
+    def _update_task_summary(self, points, planned_duration):
+        """以实际上报点和经过时间更新 finish 汇总。"""
+        if not points:
+            raise ValueError('路径没有可上传点')
+        data = self.task_map['data']
+        data['pointsList'] = points
+        data['duration'] = max(int(points[-1]['runTime']), int(planned_duration))
+        data['recordMileage'] = float(points[-1]['runMileage']) / 1000
+        if data['recordMileage'] > 0:
+            data['recodePace'] = data['duration'] / 60 / data['recordMileage']
+        if points[-1]['runStep'] and data['duration'] > 0:
+            data['recodeCadence'] = int(points[-1]['runStep']) * 60 / data['duration']
 
     def do_generated_route(self, task):
         """按逐点时间调度；复用既有上传、人脸停止门与结束链。"""
@@ -991,25 +1042,28 @@ class Yun_For_New:
             if actual_points:
                 elapsed = max(elapsed, last_time+source['runTime']-actual_points[-1]['_planned_time'])
             point['runTime'] = elapsed
-            point['runStep'] = math.floor(elapsed*task['metadata']['cadence_spm']/60)
+            if 'cadence_spm' in task['metadata']:
+                point['runStep'] = math.floor(elapsed*task['metadata']['cadence_spm']/60)
+            # telemetry_task 分支已根据来源步数生成逐点 runStep；网络延迟不会
+            # 虚构额外步数，否则会抹掉原始步频的变化形状。
             point['speed'] = yun_route.client_speed(point['runMileage']-last_mileage, elapsed-last_time)
             point['ts'] = str(int(epoch)+elapsed)
+            reached_cap = self._cap_point(point, actual_points[-1] if actual_points else None)
             actual_points.append(dict(point, _planned_time=source['runTime']))
             last_time, last_mileage = elapsed, point['runMileage']
             points.append(point)
-            if len(points) == split_count:
+            if len(points) == self.upload_batch_size:
                 self.split_by_points_map(points)
                 self._last_confirmed_mileage_m = int(point['runMileage'])
                 points = []
             self._face_on_mileage(point['runMileage'])
+            if reached_cap:
+                print(f'[里程上限] 已达任务上限 {self.distance_cap_m/1000:.3f} km；进入结束链')
+                break
         self._pending_tail_points = points
         for point in actual_points:
             point.pop('_planned_time')
-        data = self.task_map['data']
-        data['pointsList'] = actual_points
-        data['duration'] = last_time
-        data['recodePace'] = last_time/60/data['recordMileage']
-        data['recodeCadence'] = actual_points[-1]['runStep']*60/last_time
+        self._update_task_summary(actual_points, last_time)
         if points:
             print(f"[尾批] 暂存尾部 {len(points)} 点；由状态检查 → 尾批 → finish 链处理")
 
@@ -1032,48 +1086,97 @@ class Yun_For_New:
             self.task_map = json.loads(f.read())
         if isDrift:
             self.task_map = add_drift(self.task_map)
+        source_points = self.task_map['data']['pointsList']
+        # 旧 task 可以无 runStep；上传前统一派生绝对累计步数，避免批内派生
+        # 与 finish 汇总使用不同来源。混合“有步数/缺步数”则拒绝猜测。
+        raw_steps = [p.get('runStep', 0) for p in source_points]
+        try:
+            has_steps = any(int(s) != 0 for s in raw_steps)
+        except (TypeError, ValueError) as exc:
+            raise ValueError('打表点的 runStep 非法') from exc
+        if has_steps and any('runStep' not in p for p in source_points):
+            raise ValueError('打表点的 runStep 部分缺失，无法安全派生')
+        if not has_steps:
+            if self.strides <= 0:
+                raise ValueError('打表点无累计步数且 strides 非正，无法派生 runStep')
+            for p in source_points:
+                p['runStep'] = math.floor(float(p['runMileage']) / self.strides + 0.5)
+        if len(source_points) < 2:
+            raise ValueError('打表任务至少需要两个轨迹点')
+        previous_mileage = -1.0
+        previous_time = -1
+        previous_steps = -1
+        for p in source_points:
+            try:
+                mileage = float(p['runMileage'])
+                planned_time = int(p['runTime'])
+                steps = int(p['runStep'])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError('打表点缺少合法的里程、时间或步数') from exc
+            if (not math.isfinite(mileage) or mileage < previous_mileage or
+                    planned_time < previous_time or steps < previous_steps or
+                    mileage < 0 or planned_time < 0 or steps < 0):
+                raise ValueError('打表点的里程、时间或累计步数回退或非法')
+            previous_mileage, previous_time, previous_steps = mileage, planned_time, steps
+        if float(source_points[0]['runMileage']) > self.distance_cap_m:
+            raise ValueError('打表首点已超过任务里程上限')
         points = []
-        count = 0
-        for point in tqdm(self.task_map['data']['pointsList'], leave=True):
-            # 评审 2.2：loader 不得静默丢弃真机字段（runStep/ts 等），
-            # 在保留原字段的基础上覆盖脚本可控项。
+        emitted = []
+        epoch = int(self.client.now())
+        started = self.client.mono()
+        previous_planned = 0
+        reached_cap = False
+        for point in tqdm(source_points, leave=True):
+            self._face_guard('轨迹点推进')
+            planned = int(point['runTime'])
+            if planned < previous_planned:
+                raise ValueError('打表点的 runTime 回退，拒绝上传')
+            self.client.sleep(planned - previous_planned)
+            previous_planned = planned
+            elapsed = max(planned, int(round(self.client.mono()-started)))
+            if emitted:
+                elapsed = max(elapsed, int(emitted[-1]['runTime']) +
+                              max(1, planned-int(emitted[-1]['_planned_time'])))
             point_changed = dict(point)
             point_changed.update({
                 'runStatus': '1',
                 'speed': point['speed'],
-                # 打表，为了防止格式意外，来一个格式化
                 'isFence': 'Y',
                 'isMock': False,
-                "runMileage": point['runMileage'],
-                "runTime": point['runTime'],
-                "ts": str(int(time.time()))
+                'runMileage': float(point['runMileage']),
+                'runTime': elapsed,
+                'ts': str(epoch + elapsed),
             })
+            if emitted:
+                step = int(point_changed['runStep']) - int(emitted[-1]['runStep'])
+                if step < 0:
+                    raise ValueError('打表点的 runStep 回退，拒绝上传')
+                point_changed['speed'] = yun_route.client_speed(
+                    point_changed['runMileage']-float(emitted[-1]['runMileage']),
+                    elapsed-int(emitted[-1]['runTime']))
+            reached_cap = self._cap_point(point_changed, emitted[-1] if emitted else None)
+            emitted.append(dict(point_changed, _planned_time=planned))
             points.append(point_changed)
-            count += 1
-            if count == split_count:
-                self._face_guard("splitPoint 批次上传")   # R2：人脸阻断后不再发任何请求
+            if len(points) == self.upload_batch_size:
                 self.split_by_points_map(points)
                 self._last_confirmed_mileage_m = int(float(points[-1]['runMileage']))
-                # 返修 R1：距离事件在批内逐轨迹点评估——时序仍与批次
-                # 耦合（非按轨迹时间独立推进，见文档残留偏差）；
-                # 首批/尾批跨窗不再依赖批末单点。
-                for p in points:
-                    self._face_on_mileage(float(p['runMileage']))
-                sleep_time = self.task_map['data']['duration'] / len(self.task_map['data']['pointsList']) * split_count
-                print(f" 等待{sleep_time:.2f}秒.")
-                self.client.sleep(sleep_time)
-                count = 0
                 points = []
-        if count != 0:
-            # 二返修 S1：尾批不再于批末无条件发送。APK 结束链：checkRunState
-            # （API.java:343-344 映射 /run/isStandard）先发起
-            # （SportRunMapActivity.java:2798 T1），b0 回调（:481-514）仅在
-            # code=200 时决定 sendLastPoints 或 S1，S1（:2775）才 runToFinish。
-            # 尾批在此缓存，由 finish 链在 isStandard 状态检查通过后补发。
-            # 窗口距离事件照常逐点推进（时序仍与批次耦合，见文档偏差记录）。
-            self._pending_tail_points = points
-            for p in points:
-                self._face_on_mileage(float(p['runMileage']))
+            self._face_on_mileage(float(point_changed['runMileage']))
+            if reached_cap:
+                print(f'[里程上限] 已达任务上限 {self.distance_cap_m/1000:.3f} km；进入结束链')
+                break
+        if not reached_cap:
+            planned_duration = int(self.task_map['data']['duration'])
+            if planned_duration > previous_planned:
+                self.client.sleep(planned_duration - previous_planned)
+        for p in emitted:
+            p.pop('_planned_time')
+        self._update_task_summary(emitted, max(
+            int(emitted[-1]['runTime']),
+            int(round(self.client.mono()-started)) if not reached_cap else 0,
+            int(self.task_map['data']['duration']) if not reached_cap else 0))
+        self._pending_tail_points = points
+        if points:
             print(f"[尾批] 暂存尾部 {len(points)} 点，未在批末发送；"
                   "将由 finish 链按『状态检查 → 尾批 → finish』顺序处理")
 

@@ -347,7 +347,7 @@ class TestR2Flow:
             yun.do_by_points_map(path=str(tmp_path / "tasks"), random_choose=True)
             yun.finish_by_points_map()
         routers = client.routers()
-        assert routers.count("/run/splitPointCheating") == 1     # 超时后未再发下一批
+        assert routers.count("/run/splitPointCheating") == 0     # 逐点触发人脸，超时在首批前停止
         cmp_seen = [r for r in routers if r.endswith("runFaceInfoComparison")]
         assert len(cmp_seen) == 1                                # 只一次，不轰炸
         assert sum(1 for r in routers if r.endswith("/run/finish")) == 0

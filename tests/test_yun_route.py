@@ -63,14 +63,15 @@ def test_v4_geometry_matches_supplied_result(tmp_path):
     assert sum(R.distance(a, b) for a, b in zip(points, points[1:])) == pytest.approx(1878.045, abs=0.1)
 
 
-def client_and_run(responder=_responder):
+def client_and_run(responder=_responder, home=None):
     M.set_args(CFG)
     clock = [0.0]
     fake = H.FakeTransport(responder, sm2box=H.SM2Box(M.PUBLIC_KEY, M.PRIVATE_KEY))
     client = H.YunClient(M.build_profile(M._CONF), base_url=M.my_host, transport=fake,
                          sleep=lambda s: clock.__setitem__(0, clock[0]+s),
                          now=lambda: 1700000000+clock[0], mono=lambda: clock[0])
-    run = M.Yun_For_New(client=client, home_info=_home(raDislikes=0))
+    run = M.Yun_For_New(client=client, home_info=home or _home(
+        raDislikes=0, raSingleMileageMin=0.0, raSingleMileageMax=10.0))
     run.raSingleMileageMin, run.raSingleMileageMax = 0, 10
     run.raCadenceMin, run.raCadenceMax = 1, 350
     return clock, fake, run
@@ -176,3 +177,182 @@ def test_exact_batch_has_no_extra_tail(tmp_path, monkeypatch):
     run.finish_by_points_map()
     assert [c['router'] for c in fake.calls] == [
         '/run/start', '/run/splitPointCheating', '/run/isStandard', '/run/finish']
+
+
+def test_school_point_threshold_is_strict_and_under_ten_uses_sixty(tmp_path):
+    task = R.generate(config(tmp_path, distance_m=200))
+    _, fake, run = client_and_run(home=_home(raDislikes=0, passPointNum=9))
+    assert run.upload_batch_size == 61
+    sent = []
+    original = run.split_by_points_map
+    def collect(points):
+        sent.append(len(points))
+        return original(points)
+    run.split_by_points_map = collect
+    run.start()
+    run.do_generated_route(task)
+    assert sent == [61]
+    run.finish_by_points_map()
+    assert sent == [61, len(task['data']['pointsList'])-61]
+    assert [c['router'] for c in fake.calls][-3:] == [
+        '/run/isStandard', '/run/splitPointCheating', '/run/finish']
+
+
+def test_school_mileage_cap_stops_before_extra_points(tmp_path):
+    task = R.generate(config(tmp_path, distance_m=2100))
+    _, fake, run = client_and_run(home=_home(
+        raDislikes=0, raSingleMileageMin=1.5, raSingleMileageMax=2.0, passPointNum=10))
+    run.raSingleMileageMin, run.raSingleMileageMax = 1.5, 2.0
+    assert run.distance_cap_m == 2000
+    assert run.upload_batch_size == 11
+    run.validate_generated_route(task)
+    run.start()
+    run.do_generated_route(task)
+    assert run.task_map['data']['recordMileage'] == 2.0
+    assert run.task_map['data']['pointsList'][-1]['runMileage'] == 2000
+    assert len(run.task_map['data']['pointsList']) < len(task['data']['pointsList'])
+    run.finish_by_points_map()
+    assert fake.calls[-1]['router'] == '/run/finish'
+    assert sum(1 for c in fake.calls if c['router'] == '/run/isStandard') == 1
+
+
+def test_map_point_timestamps_follow_run_time(tmp_path):
+    task = R.generate(config(tmp_path, distance_m=100))
+    # 打表入口只用所给字段，要求 ts 与逐点 runTime 同步。
+    d = tmp_path/'tasks'
+    d.mkdir()
+    (d/'one.json').write_text(json.dumps(task), encoding='utf-8')
+    clock, fake, run = client_and_run()
+    recorded = []
+    original = run.split_by_points_map
+    def collect(points):
+        recorded.extend(copy.deepcopy(points))
+        return original(points)
+    run.split_by_points_map = collect
+    run.start()
+    run.do_by_points_map(path=str(d), random_choose=True)
+    run.finish_by_points_map()
+    assert len(recorded) == len(task['data']['pointsList'])
+    assert all(int(b['ts'])-int(a['ts']) == b['runTime']-a['runTime']
+               for a, b in zip(recorded, recorded[1:]))
+    assert run.task_map['data']['duration'] >= recorded[-1]['runTime']
+
+
+def test_telemetry_source_preserves_shape_and_recalculates_speed(tmp_path):
+    source = {'data': {'pointsList': [
+        {'runMileage': i*4.2, 'runTime': i + i//3,
+         'runStep': i*3 + i//8} for i in range(501)]}}
+    (tmp_path/'source.json').write_text(json.dumps(source), encoding='utf-8')
+    path = config(tmp_path, telemetry_task='source.json', telemetry_variation=0.08)
+    a = R.generate(path)
+    b = R.generate(path)
+    assert a == b
+    points = a['data']['pointsList']
+    assert len(points) == 501
+    assert a['data']['duration'] >= 600
+    assert points[-1]['runStep'] == source['data']['pointsList'][-1]['runStep']
+    assert any((points[i+1]['runTime']-points[i]['runTime']) !=
+               (source['data']['pointsList'][i+1]['runTime']-source['data']['pointsList'][i]['runTime'])
+               for i in range(500))
+    assert all(b['runMileage'] > a['runMileage'] and b['runTime'] > a['runTime']
+               for a, b in zip(points, points[1:]))
+    assert points[-1]['runMileage'] == pytest.approx(2100, rel=0.01)
+
+
+def test_large_offset_requires_polygon_and_checks_segments(tmp_path):
+    with pytest.raises(ValueError, match='allowed_polygon'):
+        R.generate(config(tmp_path, max_offset_m=10))
+    small = {'type': 'Polygon', 'coordinates': [[[117.205,31.773],
+              [117.2051,31.773], [117.2051,31.7731], [117.205,31.7731],
+              [117.205,31.773]]]}
+    (tmp_path/'small.geojson').write_text(json.dumps(small), encoding='utf-8')
+    with pytest.raises(ValueError, match='超出'):
+        R.generate(config(tmp_path, max_offset_m=10,
+                          allowed_polygon_geojson='small.geojson'))
+    broad = {'type': 'Polygon', 'coordinates': [[[117.2055,31.773],
+              [117.207,31.773], [117.207,31.775], [117.2055,31.775],
+              [117.2055,31.773]]]}
+    (tmp_path/'broad.geojson').write_text(json.dumps(broad), encoding='utf-8')
+    task = R.generate(config(tmp_path, max_offset_m=10,
+                             allowed_polygon_geojson='broad.geojson'))
+    assert task['data']['recordMileage'] > 2
+
+
+def test_auto_seed_recorded_and_changes_geometry(tmp_path):
+    path = config(tmp_path, seed='auto')
+    a, b = R.generate(path), R.generate(path)
+    assert a['metadata']['seed'] != b['metadata']['seed']
+    assert a['data']['pointsList'] != b['data']['pointsList']
+
+
+def test_existing_task_can_supply_geometry_and_telemetry(tmp_path):
+    source = R.generate(config(tmp_path))
+    (tmp_path/'source.task.json').write_text(json.dumps(source), encoding='utf-8')
+    path = config(tmp_path, base_geojson=None, base_task='source.task.json',
+                  distance_m=2000, seed=42.0)
+    produced = R.generate(path)
+    assert type(produced['metadata']['seed']) is int
+    assert produced['metadata']['seed'] == 42
+    assert produced['metadata']['mode'] == 'geometry_v4_telemetry'
+    assert produced['metadata']['telemetry_source'] == 'source.task.json'
+    assert produced['data']['recordMileage'] == pytest.approx(2, rel=0.01)
+    assert len(produced['data']['pointsList']) == len(source['data']['pointsList'])
+    _, fake, run = client_and_run()
+    run.start()
+    run.do_generated_route(produced)
+    assert run.task_map['data']['pointsList'][-1]['runStep'] == \
+        produced['data']['pointsList'][-1]['runStep']
+    run.finish_by_points_map()
+    assert fake.calls[-1]['router'] == '/run/finish'
+
+
+@pytest.mark.parametrize('cap', [float('nan'), float('inf'), 0, -1])
+def test_invalid_school_cap_rejected_before_start(cap):
+    with pytest.raises(H.DecodeException, match='有限正数'):
+        client_and_run(home=_home(raDislikes=0, raSingleMileageMax=cap))
+
+
+def test_legacy_map_without_run_step_keeps_batch_and_finish_consistent(tmp_path):
+    task = R.generate(config(tmp_path, distance_m=100))
+    for point in task['data']['pointsList']:
+        point.pop('runStep')
+    directory = tmp_path/'tasks'
+    directory.mkdir()
+    (directory/'one.json').write_text(json.dumps(task), encoding='utf-8')
+    _, fake, run = client_and_run()
+    run.start()
+    run.do_by_points_map(path=str(directory), random_choose=True)
+    assert run.task_map['data']['pointsList'][-1]['runStep'] > 0
+    assert run.task_map['data']['recodeCadence'] == pytest.approx(
+        run.task_map['data']['pointsList'][-1]['runStep']*60/
+        run.task_map['data']['duration'])
+    run.finish_by_points_map()
+    assert fake.calls[-1]['router'] == '/run/finish'
+
+
+@pytest.mark.parametrize('field,value', [
+    ('runMileage', -1), ('runTime', -1), ('runStep', -1),
+])
+def test_invalid_map_is_rejected_before_first_batch(tmp_path, field, value):
+    task = R.generate(config(tmp_path, distance_m=100))
+    task['data']['pointsList'][20][field] = value
+    directory = tmp_path/'tasks'
+    directory.mkdir()
+    (directory/'one.json').write_text(json.dumps(task), encoding='utf-8')
+    _, fake, run = client_and_run()
+    run.start()
+    with pytest.raises(ValueError, match='回退或非法'):
+        run.do_by_points_map(path=str(directory), random_choose=True)
+    assert [c['router'] for c in fake.calls] == ['/run/start']
+
+
+def test_polygon_detects_narrow_concavity_between_samples():
+    ring = [(117.000000, 30.999990), (117.000050, 30.999990),
+            (117.000050, 31.000010), (117.000019, 31.000010),
+            (117.000019, 30.999999), (117.000017, 30.999999),
+            (117.000017, 31.000010), (117.000000, 31.000010)]
+    with pytest.raises(ValueError, match='超出'):
+        R.validate_polygon_route([(117.000010, 31.0),
+                                  (117.000040, 31.0)], ring)
+    R.validate_polygon_route([(117.000025, 31.0),
+                              (117.000040, 31.0)], ring)
