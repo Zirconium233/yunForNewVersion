@@ -1,0 +1,925 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>云运动 · 跑步路径可视化（临时工具）</title>
+<style>
+  :root {
+    --bg: #12161c;
+    --panel: #1b212a;
+    --panel-2: #232b36;
+    --line: #313b49;
+    --text: #e6ecf3;
+    --muted: #8b98a9;
+    --accent: #4da3ff;
+    --ok: #47c98a;
+    --warn: #ffb454;
+    --bad: #ff6b6b;
+    --fence: #b07cff;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex; font: 13px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--text); overflow: hidden;
+  }
+  #map { flex: 1 1 auto; height: 100%; background: #0d1117; }
+  #side {
+    width: 372px; flex: 0 0 372px; height: 100%; overflow-y: auto;
+    background: var(--panel); border-left: 1px solid var(--line); padding: 14px;
+  }
+  #side::-webkit-scrollbar { width: 9px; }
+  #side::-webkit-scrollbar-thumb { background: #3a4553; border-radius: 5px; }
+  h1 { font-size: 15px; margin: 0 0 4px; letter-spacing: .3px; }
+  .sub { color: var(--muted); font-size: 11.5px; margin-bottom: 12px; }
+  .card {
+    background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 9px; padding: 11px; margin-bottom: 11px;
+  }
+  .card > h2 {
+    font-size: 12px; margin: 0 0 9px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: .8px; font-weight: 600;
+  }
+  #drop {
+    border: 1.5px dashed #46536a; border-radius: 9px; padding: 20px 12px;
+    text-align: center; cursor: pointer; transition: .15s; background: #1a2029;
+  }
+  #drop:hover, #drop.on { border-color: var(--accent); background: #1d2634; }
+  #drop b { color: var(--accent); }
+  #drop small { color: var(--muted); display: block; margin-top: 5px; font-size: 11px; }
+  input[type=file] { display: none; }
+  label.row {
+    display: flex; align-items: center; gap: 7px; padding: 3px 0;
+    cursor: pointer; font-size: 12.5px;
+  }
+  label.row input { accent-color: var(--accent); }
+  .field { display: flex; align-items: center; gap: 8px; margin: 7px 0; font-size: 12.5px; }
+  .field span { flex: 1 1 auto; color: var(--muted); }
+  select, input[type=number] {
+    background: #141a22; color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 4px 7px; font: inherit; min-width: 0;
+  }
+  input[type=number] { width: 84px; }
+  button {
+    background: #2b3644; color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 11px; font: inherit; cursor: pointer;
+  }
+  button:hover { background: #35424f; border-color: #4a5a6b; }
+  button.primary { background: #1d4e80; border-color: #2a6ba8; }
+  button.primary:hover { background: #235c96; }
+  .btnrow { display: flex; gap: 7px; flex-wrap: wrap; margin-top: 9px; }
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+  .stat { background: #141a22; border-radius: 6px; padding: 7px 9px; }
+  .stat .k { color: var(--muted); font-size: 10.5px; }
+  .stat .v { font-size: 14px; font-variant-numeric: tabular-nums; margin-top: 1px; }
+  .warn { color: var(--warn); font-size: 11.5px; }
+  .err { color: var(--bad); font-size: 11.5px; }
+  .ok { color: var(--ok); font-size: 11.5px; }
+  .route {
+    border: 1px solid var(--line); border-radius: 8px; padding: 9px;
+    margin-bottom: 8px; background: #171d25;
+  }
+  .route .hd { display: flex; align-items: center; gap: 7px; }
+  .route .hd b { font-size: 12.5px; flex: 1 1 auto; overflow: hidden;
+                 text-overflow: ellipsis; white-space: nowrap; }
+  .swatch { width: 11px; height: 11px; border-radius: 3px; flex: 0 0 11px; }
+  .route .m { color: var(--muted); font-size: 11px; margin: 4px 0 0; }
+  .route .m b { color: var(--text); font-weight: 600; }
+  .legend { display: flex; align-items: center; gap: 7px; font-size: 11.5px; color: var(--muted); }
+  .bar { flex: 1 1 auto; height: 9px; border-radius: 5px;
+         background: linear-gradient(90deg, #2ecc71, #f1c40f, #e74c3c); }
+  .seg-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  .seg-table th, .seg-table td { text-align: right; padding: 3px 4px;
+                                 border-bottom: 1px solid #232b36; }
+  .seg-table th { color: var(--muted); font-weight: 500; }
+  .seg-table td:first-child, .seg-table th:first-child { text-align: left; }
+  .hint { color: var(--muted); font-size: 11.5px; }
+  .mono { font-variant-numeric: tabular-nums; }
+  code { background: #141a22; padding: 1px 4px; border-radius: 4px;
+         font-size: 11.5px; color: #9fd0ff; }
+  #banner {
+    position: absolute; left: 50%; top: 12px; transform: translateX(-50%);
+    background: #2a1d1d; color: #ffc9c9; border: 1px solid #6b3535;
+    padding: 8px 14px; border-radius: 8px; font-size: 12px; z-index: 50;
+    max-width: 70%; display: none;
+  }
+  #wrap { position: relative; flex: 1 1 auto; height: 100%; }
+</style>
+</head>
+<body>
+
+<div id="wrap">
+  <div id="map"></div>
+  <div id="banner"></div>
+</div>
+
+<div id="side">
+  <h1>云运动 · 路径可视化</h1>
+  <div class="sub">临时工具：导入 tasklist JSON，直接在高德底图上查看轨迹</div>
+
+  <div class="card">
+    <div id="drop">
+      <div>拖入或点击选择 <b>tasklist_*.json</b></div>
+      <small>支持多选；也可拖入 <code>work_dir/models/*.model.json</code> 查看中心线与走廊</small>
+      <input type="file" id="file" accept=".json,application/json" multiple>
+    </div>
+    <div class="btnrow">
+      <button class="primary" id="btn-fit">适应全部</button>
+      <button id="btn-clear">清空</button>
+    </div>
+    <div id="status" class="hint" style="margin-top:8px"></div>
+  </div>
+
+  <div class="card">
+    <h2>底图与坐标</h2>
+    <div class="field">
+      <span>坐标系</span>
+      <select id="coord">
+        <option value="gcj">GCJ-02（任务文件默认）</option>
+        <option value="wgs">WGS84 → GCJ-02 纠偏</option>
+      </select>
+    </div>
+    <div class="field">
+      <span>地图源</span>
+      <select id="tiles">
+        <option value="vector">高德矢量（默认）</option>
+        <option value="sat">高德卫星影像</option>
+        <option value="roadnet">卫星 + 路网标注</option>
+      </select>
+    </div>
+    <div class="field">
+      <span>API 版本</span>
+      <select id="apiver">
+        <option value="1.4.15">1.4.15（无需安全密钥）</option>
+        <option value="2.0">2.0（需要安全密钥）</option>
+      </select>
+    </div>
+    <div class="field">
+      <span>安全密钥</span>
+      <input type="text" id="jscode" placeholder="v2.0 时填 securityJsCode" style="width:150px">
+    </div>
+    <div class="hint">改 API 版本或密钥后点「重载地图」</div>
+    <div class="btnrow"><button id="btn-reload">重载地图</button></div>
+  </div>
+
+  <div class="card">
+    <h2>显示</h2>
+    <label class="row"><input type="checkbox" id="opt-fence" checked> 踩点 / 围栏点（manageList）</label>
+    <label class="row"><input type="checkbox" id="opt-labels" checked> 起点、终点、方向标注</label>
+    <label class="row"><input type="checkbox" id="opt-pace" checked> 按配速着色</label>
+    <label class="row"><input type="checkbox" id="opt-points"> 逐点标记（点多时卡顿）</label>
+    <label class="row"><input type="checkbox" id="opt-model"> 学习模型中心线</label>
+    <div class="field" style="margin-top:9px">
+      <span>线宽</span>
+      <input type="number" id="opt-width" value="5" min="1" max="14" step="1">
+      <label class="row" style="padding:0"><input type="checkbox" id="opt-glow" checked> 阴影</label>
+    </div>
+    <div class="legend" style="margin-top:9px">
+      <span>配速快</span><div class="bar"></div><span>慢</span>
+    </div>
+    <div id="pace-range" class="hint mono"></div>
+  </div>
+
+  <div class="card">
+    <h2>轨迹详情</h2>
+    <div class="field">
+      <span>悬停采样点</span>
+      <input type="number" id="probe" value="0" min="0" step="1">
+      <button id="btn-probe">定位</button>
+    </div>
+    <div id="probe-out" class="hint">导入文件后，把鼠标移到轨迹上即可读取最近采样点的明细；也可直接填序号后点「定位」。</div>
+  </div>
+
+  <div id="routes"></div>
+
+  <div class="card">
+    <h2>说明</h2>
+    <div class="hint">
+      <p style="margin:0 0 6px">· 逐点里程单位是米，<code>speed</code> 实际是配速 min/km。</p>
+      <p style="margin:0 0 6px">· 部分来源 <code>manageList</code> 同时含跑到与没跑到的点，
+        <span style="color:var(--fence)">紫色实心</span>=marked Y，
+        <span style="color:var(--fence);opacity:.5">紫色空心</span>=marked N。</p>
+      <p style="margin:0 0 6px">· 任务文件本身不含围栏边界，这里只画踩点，不代表服务端围栏。</p>
+      <p style="margin:0 0 6px">· 高德 Key：<code id="keyecho"></code></p>
+      <p style="margin:0 0 6px" id="proto-note"></p>
+      <p style="margin:0">· 地图没出来时：确认 Key 类型是「Web端(JS API)」，
+        且当前页面的域名已加入 Key 的白名单；用 2.0 还要填安全密钥。</p>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ------------------------------------------------------------------ *
+ * 配置
+ * ------------------------------------------------------------------ */
+const AMAP_KEY = '';
+document.getElementById('keyecho').textContent = AMAP_KEY;
+if (location.protocol === 'file:') {
+  document.getElementById('proto-note').innerHTML =
+    '<span class="warn">当前是 file:// 打开。高德 JS API 通常要求 http(s) 来源，' +
+    '若底图空白，请用本地服务器打开：<code>python -m http.server 8000</code> ' +
+    '然后访问 http://127.0.0.1:8000/route_viewer.html</span>';
+}
+
+const PALETTE = ['#4da3ff', '#ff8f43', '#47c98a', '#e15bff', '#ffd23f',
+                 '#ff5c8a', '#3fd0d4', '#a3e635', '#f97316', '#8b5cf6'];
+
+const state = {
+  map: null, layer: null, api: null, ready: false,
+  routes: [],       // 导入的轨迹
+  overlays: [],     // 当前地图上的覆盖物
+  bounds: null,
+  pace: { min: 0, max: 0 },
+  model: null,      // 若导入的是学习模型
+  seq: 0,
+};
+
+/* ------------------------------------------------------------------ *
+ * 工具：坐标纠偏（WGS84 -> GCJ-02）
+ * 任务文件由脚本生成，坐标系已是 GCJ-02；仅当你确认来源是 WGS84 时才需要纠偏。
+ * ------------------------------------------------------------------ */
+const X_PI = Math.PI * 3000 / 180, PI = Math.PI, A = 6378245.0, EE = 0.00669342162296594323;
+function outOfChina(lng, lat) {
+  return !(lng > 73.66 && lng < 135.05 && lat > 3.86 && lat < 53.55);
+}
+function tLat(x, y) {
+  let r = -100 + 2 * x + 3 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * Math.sqrt(Math.abs(x));
+  r += (20 * Math.sin(6 * x * PI) + 20 * Math.sin(2 * x * PI)) * 2 / 3;
+  r += (20 * Math.sin(y * PI) + 40 * Math.sin(y / 3 * PI)) * 2 / 3;
+  r += (160 * Math.sin(y / 12 * PI) + 320 * Math.sin(y * PI / 30)) * 2 / 3;
+  return r;
+}
+function tLng(x, y) {
+  let r = 300 + x + 2 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * Math.sqrt(Math.abs(x));
+  r += (20 * Math.sin(6 * x * PI) + 20 * Math.sin(2 * x * PI)) * 2 / 3;
+  r += (20 * Math.sin(x * PI) + 40 * Math.sin(x / 3 * PI)) * 2 / 3;
+  r += (150 * Math.sin(x / 12 * PI) + 300 * Math.sin(x / 30 * PI)) * 2 / 3;
+  return r;
+}
+function wgs84ToGcj02(lng, lat) {
+  if (outOfChina(lng, lat)) return [lng, lat];
+  let dLat = tLat(lng - 105, lat - 35), dLng = tLng(lng - 105, lat - 35);
+  const radLat = lat / 180 * PI;
+  let magic = Math.sin(radLat); magic = 1 - EE * magic * magic;
+  const sqrtMagic = Math.sqrt(magic);
+  dLat = (dLat * 180) / ((A * (1 - EE)) / (magic * sqrtMagic) * PI);
+  dLng = (dLng * 180) / (A / sqrtMagic * Math.cos(radLat) * PI);
+  return [lng + dLng, lat + dLat];
+}
+function toGcj(lng, lat) {
+  return document.getElementById('coord').value === 'wgs'
+    ? wgs84ToGcj02(lng, lat) : [lng, lat];
+}
+
+/* ------------------------------------------------------------------ *
+ * 工具：几何
+ * ------------------------------------------------------------------ */
+function haversine(a, b) {
+  const R = 6371008.8, r = Math.PI / 180;
+  const dLat = (b[1] - a[1]) * r, dLng = (b[0] - a[0]) * r;
+  const h = Math.sin(dLat / 2) ** 2 +
+            Math.cos(a[1] * r) * Math.cos(b[1] * r) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+function pathLength(pts) {
+  let s = 0;
+  for (let i = 1; i < pts.length; i++) s += haversine(pts[i - 1], pts[i]);
+  return s;
+}
+function fmtDist(m) {
+  return m >= 1000 ? (m / 1000).toFixed(3) + ' km' : m.toFixed(1) + ' m';
+}
+function fmtDur(s) {
+  s = Math.round(s);
+  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), q = s % 60;
+  return (h ? h + ':' + String(m).padStart(2, '0') : String(m)) + ':' + String(q).padStart(2, '0');
+}
+function fmtPace(minPerKm) {
+  if (!isFinite(minPerKm) || minPerKm <= 0) return '—';
+  const m = Math.floor(minPerKm), s = Math.round((minPerKm - m) * 60);
+  return m + "'" + String(s).padStart(2, '0') + '"';
+}
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+/* 配速 -> 颜色（绿=快，红=慢） */
+function paceColor(pace, lo, hi) {
+  if (!isFinite(pace) || pace <= 0) return '#7a8899';
+  let t = hi > lo ? (pace - lo) / (hi - lo) : 0.5;
+  t = Math.max(0, Math.min(1, t));
+  const stops = [[46, 204, 113], [241, 196, 15], [231, 76, 60]];
+  const x = t * (stops.length - 1), i = Math.min(stops.length - 2, Math.floor(x)), f = x - i;
+  const c = stops[i].map((v, k) => Math.round(v + (stops[i + 1][k] - v) * f));
+  return `rgb(${c[0]},${c[1]},${c[2]})`;
+}
+
+/* ------------------------------------------------------------------ *
+ * 解析：tasklist / 学习模型
+ * ------------------------------------------------------------------ */
+function parsePointText(v) {
+  if (Array.isArray(v)) return [Number(v[0]), Number(v[1])];
+  if (typeof v === 'string') {
+    const p = v.split(',');
+    if (p.length !== 2) return null;
+    const a = Number(p[0]), b = Number(p[1]);
+    return (isFinite(a) && isFinite(b)) ? [a, b] : null;
+  }
+  return null;
+}
+
+function parseTask(json, name) {
+  const d = json && json.data;
+  if (!d || !Array.isArray(d.pointsList)) throw new Error('缺少 data.pointsList');
+  const pts = [];
+  for (const p of d.pointsList) {
+    const c = parsePointText(p.point);
+    if (!c) throw new Error('存在非法 point 字段');
+    pts.push(c);
+  }
+  if (pts.length < 2) throw new Error('点数少于 2');
+
+  const times = d.pointsList.map(p => Number(p.runTime));
+  const miles = d.pointsList.map(p => Number(p.runMileage));
+  const steps = d.pointsList.map(p => Number(p.runStep));
+  const speeds = d.pointsList.map(p => Number(p.speed));
+
+  // 逐段配速：优先用里程/时间差，缺失时回退到 speed 字段
+  const segs = [];
+  for (let i = 1; i < pts.length; i++) {
+    const dm = miles[i] - miles[i - 1], dt = times[i] - times[i - 1];
+    let pace;
+    if (isFinite(dm) && isFinite(dt) && dm > 0.5 && dt > 0) pace = dt / 60 / (dm / 1000);
+    else if (isFinite(speeds[i]) && speeds[i] > 0) pace = speeds[i];
+    else pace = NaN;
+    segs.push({ pace, dm, dt, len: haversine(pts[i - 1], pts[i]) });
+  }
+
+  const fences = Array.isArray(d.manageList) ? d.manageList.map(m => {
+    const c = parsePointText(m.point);
+    return c ? { lnglat: c, marked: m.marked, index: m.index } : null;
+  }).filter(Boolean) : [];
+
+  const geoLen = pathLength(pts);
+  const paceVals = segs.map(s => s.pace).filter(v => isFinite(v) && v > 0).sort((a, b) => a - b);
+  const q = f => paceVals.length ? paceVals[Math.min(paceVals.length - 1, Math.floor(f * paceVals.length))] : NaN;
+
+  return {
+    kind: 'task', name, points: pts, times, miles, steps, speeds, segs, fences,
+    geoLen,
+    start: pts[0], end: pts[pts.length - 1],
+    naiveNet: haversine(pts[0], pts[pts.length - 1]),
+    duration: isFinite(Number(d.duration)) ? Number(d.duration) : times[times.length - 1],
+    recordMileage: Number(d.recordMileage),
+    recodePace: Number(d.recodePace),
+    recodeCadence: Number(d.recodeCadence),
+    recodeDislikes: d.recodeDislikes,
+    schoolId: d.schoolId,
+    paceP5: q(0.05), paceP50: q(0.5), paceP95: q(0.95),
+    paceMin: paceVals[0], paceMax: paceVals[paceVals.length - 1],
+    fenceY: fences.filter(f => f.marked === 'Y').length,
+    fenceN: fences.filter(f => f.marked === 'N').length,
+  };
+}
+
+function parseModel(json, name) {
+  if (!json || json.model_version === undefined || !json.loop) {
+    throw new Error('既不是任务文件，也不是本工具的学习模型');
+  }
+  const centerline = (json.loop.centerline || []).map(p => [Number(p[0]), Number(p[1])]);
+  if (centerline.length < 2) throw new Error('模型中心线为空');
+  const encl = json.points_of_interest || {};
+  const fences = [];
+  for (const r of (encl.reachable || []))
+    fences.push({ lnglat: r.point.map(Number), marked: 'Y', index: 'reachable' });
+  for (const r of (encl.unreachable || []))
+    fences.push({ lnglat: r.point.map(Number), marked: 'N', index: 'unreachable' });
+  return {
+    kind: 'model', name, centerline, fences,
+    perimeter: json.loop.perimeter_m,
+    corridor: (json.corridor || {}).envelope_p95_m,
+    source: (json.created_from || {}).file_count,
+  };
+}
+
+function parseAny(json, name) {
+  if (json && json.data && Array.isArray(json.data.pointsList)) return parseTask(json, name);
+  return parseModel(json, name);
+}
+
+/* ------------------------------------------------------------------ *
+ * 高德地图加载
+ * ------------------------------------------------------------------ */
+function loadScript(src) {
+  return new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = src; s.onload = res;
+    s.onerror = () => rej(new Error('脚本加载失败：' + src));
+    document.head.appendChild(s);
+  });
+}
+function banner(msg, ms) {
+  const b = document.getElementById('banner');
+  if (!msg) { b.style.display = 'none'; return; }
+  b.innerHTML = msg; b.style.display = 'block';
+  clearTimeout(banner._t);
+  if (ms) banner._t = setTimeout(() => b.style.display = 'none', ms);
+}
+
+async function initMap() {
+  const ver = document.getElementById('apiver').value;
+  const jscode = document.getElementById('jscode').value.trim();
+
+  // 只要填了安全密钥就先挂上：1.4 忽略它，2.0 强制要求它。
+  if (jscode) window._AMapSecurityConfig = { securityJsCode: jscode };
+
+  if (ver === '2.0') {
+    // v2.0 自 2021-12-02 起强制安全密钥，缺了必然白屏或 INVALID_USER_KEY。
+    if (!jscode) {
+      banner('JS API 2.0 需要安全密钥（securityJsCode）。已自动改用 1.4.15。', 6000);
+      document.getElementById('apiver').value = '1.4.15';
+      return initMap();
+    }
+    await loadScript(`https://webapi.amap.com/maps?v=2.0&key=${AMAP_KEY}`);
+    state.api = { ver: '2.0', ns: window.AMap };
+  } else {
+    await loadScript(`https://webapi.amap.com/maps?v=1.4.15&key=${AMAP_KEY}`);
+    state.api = { ver: '1.4.15', ns: window.AMap };
+  }
+
+  const AMap = window.AMap;
+  if (!AMap) throw new Error('AMap 未挂载到 window');
+
+  const map = new AMap.Map('map', {
+    zoom: 17, center: [117.2063, 31.7739],
+    viewMode: '2D', resizeEnable: true,
+    mapStyle: 'amap://styles/darkblue',
+  });
+  state.map = map;
+  if (AMap.plugin) {
+    AMap.plugin(['AMap.ToolBar', 'AMap.Scale'], () => {
+      map.addControl(new AMap.ToolBar({ position: { top: '12px', right: '12px' } }));
+      map.addControl(new AMap.Scale());
+    });
+  }
+  state.ready = true;
+  applyTile();
+  render();
+}
+
+function applyTile() {
+  const AMap = window.AMap, mode = document.getElementById('tiles').value;
+  if (!state.map) return;
+  // 通过切换图层实现；1.4 与 2.0 均支持 TileLayer
+  if (state.tileLayer) { state.map.remove(state.tileLayer); state.tileLayer = null; }
+  if (state.satLayer) { state.map.remove(state.satLayer); state.satLayer = null; }
+  if (state.roadLayer) { state.map.remove(state.roadLayer); state.roadLayer = null; }
+  if (!AMap.TileLayer) return;
+  if (mode === 'sat' || mode === 'roadnet') {
+    state.satLayer = new AMap.TileLayer.Satellite();
+    state.satLayer.setMap(state.map);
+    if (mode === 'roadnet') {
+      state.roadLayer = new AMap.TileLayer.RoadNet();
+      state.roadLayer.setMap(state.map);
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * 渲染
+ * ------------------------------------------------------------------ */
+function clearOverlays() {
+  if (state.map && state.overlays.length) state.map.remove(state.overlays);
+  for (const o of state.overlays) { try { o.setMap && o.setMap(null); } catch (e) {} }
+  state.overlays = [];
+  state.bounds = null;
+}
+
+function addOverlay(o) { state.overlays.push(o); return o; }
+
+function expand(b) {
+  if (!state.bounds) state.bounds = b;
+  else {
+    state.bounds[0][0] = Math.min(state.bounds[0][0], b[0][0]);
+    state.bounds[0][1] = Math.min(state.bounds[0][1], b[0][1]);
+    state.bounds[1][0] = Math.max(state.bounds[1][0], b[0][0]);
+    state.bounds[1][1] = Math.max(state.bounds[1][1], b[0][1]);
+  }
+}
+
+function render() {
+  const AMap = window.AMap;
+  if (!state.ready || !AMap) return;
+  clearOverlays();
+
+  const showFence = document.getElementById('opt-fence').checked;
+  const showLabels = document.getElementById('opt-labels').checked;
+  const showPace = document.getElementById('opt-pace').checked;
+  const showPoints = document.getElementById('opt-points').checked;
+  const showModel = document.getElementById('opt-model').checked;
+  const width = Number(document.getElementById('opt-width').value) || 5;
+  const glow = document.getElementById('opt-glow').checked;
+
+  for (const r of state.routes) {
+    if (!r.visible) continue;
+
+    if (r.kind === 'model') {
+      r.pts = r.centerline.map(p => toGcj(p[0], p[1]));
+      if (showModel) {
+        addOverlay(new AMap.Polyline({
+          path: r.pts, strokeColor: r.color, strokeWeight: width,
+          strokeOpacity: 0.9, strokeStyle: 'dashed', lineJoin: 'round', zIndex: 60,
+        })).setMap(state.map);
+      }
+    } else {
+      r.pts = r.points.map(p => toGcj(p[0], p[1]));
+      r.pts.forEach(p => expand([[p[0], p[1]], [p[0], p[1]]]));
+
+      if (showPace) {
+        // 单条 Polyline + 逐点颜色：2116 个点也只建一个覆盖物。
+        // 用全体的 5%~95% 配速分位裁剪色标，避免个别跳点吃掉对比度。
+        const lo = state.pace.min, hi = state.pace.max;
+        const colors = new Array(r.pts.length);
+        colors[0] = paceColor(r.segs.length ? r.segs[0].pace : NaN, lo, hi);
+        for (let i = 1; i < r.pts.length; i++) {
+          colors[i] = paceColor(r.segs[i - 1].pace, lo, hi);
+        }
+        addOverlay(new AMap.Polyline({
+          path: r.pts, strokeColor: colors, strokeWeight: width, strokeOpacity: 0.95,
+          lineJoin: 'round', lineCap: 'round', zIndex: 70, showDir: false,
+        })).setMap(state.map);
+      } else {
+        addOverlay(new AMap.Polyline({
+          path: r.pts, strokeColor: r.color, strokeWeight: width,
+          strokeOpacity: 0.95, lineJoin: 'round', lineCap: 'round', zIndex: 70,
+        })).setMap(state.map);
+      }
+
+      // 起点 / 终点
+      if (showLabels) {
+        const mk = (p, text, bg) => {
+          const el = document.createElement('div');
+          el.textContent = text;
+          el.style.cssText = `background:${bg};color:#fff;padding:2px 8px;border-radius:10px;` +
+            `font:600 11px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;` +
+            `box-shadow:0 1px 5px rgba(0,0,0,.45);white-space:nowrap;border:1px solid rgba(255,255,255,.35)`;
+          return new AMap.Marker({ position: p, content: el, offset: new AMap.Pixel(-16, -11), zIndex: 200 });
+        };
+        addOverlay(mk(r.pts[0], r.name + ' 起点', '#2b6cb0')).setMap(state.map);
+        addOverlay(mk(r.pts[r.pts.length - 1], '终点', '#b83232')).setMap(state.map);
+      }
+      if (showPoints && r.pts.length <= 3000) {
+        for (let i = 0; i < r.pts.length; i++) {
+          const dot = new AMap.CircleMarker({
+            center: r.pts[i], radius: 2.5, strokeWeight: 0,
+            fillColor: r.color, fillOpacity: 0.75, zIndex: 65, bubble: true,
+          });
+          addOverlay(dot).setMap(state.map);
+        }
+      }
+    }
+
+    // 踩点 / 围栏点
+    if (showFence && r.fences && r.fences.length) {
+      for (const f of r.fences) {
+        const c = toGcj(f.lnglat[0], f.lnglat[1]);
+        expand([[c[0], c[1]], [c[0], c[1]]]);
+        const isY = f.marked === 'Y';
+        const cm = new AMap.CircleMarker({
+          center: c, radius: isY ? 7 : 6,
+          strokeColor: '#c9a8ff', strokeWeight: 2,
+          fillColor: isY ? '#b07cff' : 'rgba(176,124,255,0.12)',
+          fillOpacity: isY ? 0.95 : 0.2, zIndex: 150, bubble: true,
+          cursor: 'pointer',
+        });
+        cm.on('click', () => banner(
+          `<b>${esc(r.name)}</b> · manageList 踩点<br>` +
+          `marked = <b>${esc(String(f.marked))}</b>　index = ${esc(String(f.index))}<br>` +
+          `${c[0].toFixed(6)}, ${c[1].toFixed(6)}`));
+        addOverlay(cm).setMap(state.map);
+      }
+    }
+    r.pts.forEach(p => expand([[p[0], p[1]], [p[0], p[1]]]));
+  }
+
+  if (state.bounds) fitAll();
+}
+
+function fitAll() {
+  if (!state.map || !state.bounds) return;
+  const AMap = window.AMap;
+  const sw = new AMap.LngLat(state.bounds[0][0], state.bounds[0][1]);
+  const ne = new AMap.LngLat(state.bounds[1][0], state.bounds[1][1]);
+  state.map.setBounds(new AMap.Bounds(sw, ne), false, [60, 60, 60, 60]);
+}
+
+/* ------------------------------------------------------------------ *
+ * 侧栏
+ * ------------------------------------------------------------------ */
+function routeCard(r, idx) {
+  const head = r.kind === 'task'
+    ? `<div class="hd">
+         <span class="swatch" style="background:${r.color}"></span>
+         <b title="${esc(r.name)}">${esc(r.name)}</b>
+         <button data-act="zoom" data-i="${idx}" style="padding:2px 7px">定位</button>
+         <button data-act="del" data-i="${idx}" style="padding:2px 7px">✕</button>
+       </div>
+       <div class="m mono">
+         ${r.points.length} 点 · 几何 <b>${fmtDist(r.geoLen)}</b> ·
+         上报 <b>${isFinite(r.recordMileage) ? r.recordMileage.toFixed(3) + ' km' : '—'}</b><br>
+         时长 <b>${fmtDur(r.duration)}</b> · 汇总配速 <b>${fmtPace(r.recodePace)}</b> ·
+         步频 <b>${isFinite(r.recodeCadence) ? r.recodeCadence.toFixed(0) : '—'}</b><br>
+         逐段配速 p5/p50/p95 = <b>${fmtPace(r.paceP5)}</b> / <b>${fmtPace(r.paceP50)}</b> /
+         <b>${fmtPace(r.paceP95)}</b><br>
+         采样 Δt ${[...new Set(r.segs.map(s => s.dt))].sort((a, b) => a - b).slice(0, 5).join('/')} s ·
+         踩点 <b>${r.fenceY}Y / ${r.fenceN}N</b> ·
+         首尾相距 <b>${r.naiveNet.toFixed(1)} m</b>
+       </div>`
+    : `<div class="hd">
+         <span class="swatch" style="background:${r.color}"></span>
+         <b title="${esc(r.name)}">${esc(r.name)}</b>
+         <button data-act="zoom" data-i="${idx}" style="padding:2px 7px">定位</button>
+         <button data-act="del" data-i="${idx}" style="padding:2px 7px">✕</button>
+       </div>
+       <div class="m mono">学习模型 · 中心线 ${r.centerline.length} 点 ·
+         单圈 <b>${isFinite(r.perimeter) ? r.perimeter.toFixed(1) + ' m' : '—'}</b> ·
+         走廊 <b>${isFinite(r.corridor) ? '±' + r.corridor.toFixed(2) + ' m' : '—'}</b> ·
+         来源 ${r.source || '—'} 个文件</div>`;
+
+  const issues = [];
+  if (r.kind === 'task') {
+    if (r.naiveNet < 60) issues.push(['ok', '首尾几乎重合：闭环轨迹']);
+    else issues.push(['warn', `首尾相距 ${r.naiveNet.toFixed(0)} m：不是闭环，或起点终点不同`]);
+    if (isFinite(r.recordMileage) && r.geoLen > 0) {
+      const ratio = r.recordMileage * 1000 / r.geoLen;
+      if (ratio < 0.85 || ratio > 1.15)
+        issues.push(['warn', `上报/几何里程 = ${ratio.toFixed(3)}，明显偏离 1`]);
+      else issues.push(['ok', `上报/几何里程 = ${ratio.toFixed(3)}，一致`]);
+    }
+    const step = r.geoLen / Math.max(1, r.points.length - 1);
+    if (step > 30) issues.push(['warn', `平均点距 ${step.toFixed(1)} m，采样偏稀`]);
+    let back = 0;
+    for (let i = 1; i < r.times.length; i++) if (r.times[i] < r.times[i - 1]) back++;
+    if (back) issues.push(['warn', `runTime 有 ${back} 处回退`]);
+    let mback = 0;
+    for (let i = 1; i < r.miles.length; i++) if (r.miles[i] < r.miles[i - 1]) mback++;
+    if (mback) issues.push(['warn', `runMileage 有 ${mback} 处回退`]);
+    const dmax = Math.max(...r.segs.map(s => s.len));
+    if (dmax > 100) issues.push(['warn', `存在 ${dmax.toFixed(0)} m 的相邻点跳跃（GPS 跳点）`]);
+  }
+  const issueHtml = issues.map(([k, t]) =>
+    `<div class="${k === 'ok' ? 'ok' : 'warn'}" style="margin-top:4px">· ${esc(t)}</div>`).join('');
+
+  const chart = r.kind === 'task' ? paceChart(r) : '';
+  return `<div class="card route">${head}${chart}${issueHtml}</div>`;
+}
+
+/* 配速曲线（纯 SVG，横轴=累计里程） */
+function paceChart(r) {
+  const W = 320, H = 56, PAD = 4;
+  const vals = r.segs.map(s => s.pace).filter(v => isFinite(v) && v > 0);
+  if (vals.length < 2) return '';
+  const total = r.miles[r.miles.length - 1] || r.geoLen;
+  let lo = r.paceP5, hi = r.paceP95;
+  if (!isFinite(lo) || !isFinite(hi) || hi <= lo) { lo = Math.min(...vals); hi = Math.max(...vals); }
+  if (hi <= lo) hi = lo + 0.5;
+  const x = m => PAD + (W - 2 * PAD) * (m / (total || 1));
+  const y = p => {
+    const t = Math.max(0, Math.min(1, (p - lo) / (hi - lo)));
+    return PAD + (H - 2 * PAD) * t;   // 配速越大（越慢）越靠下
+  };
+  let d = '';
+  for (let i = 0; i < r.segs.length; i++) {
+    const p = r.segs[i].pace;
+    if (!isFinite(p) || p <= 0) continue;
+    d += (d ? ' L' : 'M') + x(r.miles[i]).toFixed(1) + ' ' + y(p).toFixed(1);
+  }
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px;margin-top:7px;` +
+    `background:#141a22;border-radius:6px">
+    <line x1="0" y1="${H - PAD}" x2="${W}" y2="${H - PAD}" stroke="#2a3340"/>
+    <path d="${d}" fill="none" stroke="#4da3ff" stroke-width="1.6"/></svg>
+    <div class="hint mono" style="display:flex;justify-content:space-between">
+      <span>配速曲线 ${fmtPace(lo)}（上，快）</span><span>${fmtPace(hi)}（下，慢）</span></div>`;
+}
+
+function renderSide() {
+  const box = document.getElementById('routes');
+  if (!state.routes.length) {
+    box.innerHTML = `<div class="card"><h2>已导入</h2>
+      <div class="hint">还没有数据。把 <code>tasks_*/tasklist_*.json</code> 拖到上面的框里。</div></div>`;
+    return;
+  }
+  const all = state.routes.map((r, i) => routeCard(r, i)).join('');
+  const tasks = state.routes.filter(r => r.kind === 'task');
+  const summary = tasks.length ? `
+    <div class="card">
+      <h2>汇总（${tasks.length} 条轨迹）</h2>
+      <div class="stats">
+        <div class="stat"><div class="k">轨迹数</div><div class="v">${tasks.length}</div></div>
+        <div class="stat"><div class="k">总点数</div><div class="v">${tasks.reduce((a, r) => a + r.points.length, 0)}</div></div>
+        <div class="stat"><div class="k">几何里程合计</div><div class="v">${(tasks.reduce((a, r) => a + r.geoLen, 0) / 1000).toFixed(2)} km</div></div>
+        <div class="stat"><div class="k">上报里程合计</div><div class="v">${tasks.reduce((a, r) => a + (isFinite(r.recordMileage) ? r.recordMileage : 0), 0).toFixed(2)} km</div></div>
+      </div>
+    </div>` : '';
+  box.innerHTML = all + summary;
+}
+
+function recomputePaceRange() {
+  const vals = [];
+  for (const r of state.routes) {
+    if (r.kind !== 'task') continue;
+    for (const s of r.segs) if (isFinite(s.pace) && s.pace > 0) vals.push(s.pace);
+  }
+  if (!vals.length) { state.pace = { min: 0, max: 0 }; document.getElementById('pace-range').textContent = ''; return; }
+  vals.sort((a, b) => a - b);
+  const q = f => vals[Math.min(vals.length - 1, Math.floor(f * vals.length))];
+  state.pace = { min: q(0.05), max: q(0.95) };
+  document.getElementById('pace-range').textContent =
+    `逐段配速范围 ${fmtPace(q(0.05))}（快）～ ${fmtPace(q(0.95))}（慢），n=${vals.length}`;
+}
+
+/* ------------------------------------------------------------------ *
+ * 导入
+ * ------------------------------------------------------------------ */
+async function importFiles(files) {
+  const st = document.getElementById('status');
+  let ok = 0, fail = 0;
+  const errs = [];
+  for (const f of files) {
+    try {
+      const text = await f.text();
+      const json = JSON.parse(text);
+      const r = parseAny(json, f.name.replace(/\.json$/i, ''));
+      r.color = PALETTE[state.seq++ % PALETTE.length];
+      r.visible = true;
+      r.uid = 'r' + state.seq;
+      state.routes.push(r);
+      ok++;
+    } catch (e) {
+      fail++;
+      errs.push(`${f.name}: ${e.message}`);
+    }
+  }
+  recomputePaceRange();
+  renderSide();
+  render();
+  st.className = fail ? 'warn' : 'ok';
+  st.innerHTML = `导入成功 ${ok} 个${fail ? `，失败 ${fail} 个` : ''}` +
+    (errs.length ? `<br><span class="err">${errs.map(esc).join('<br>')}</span>` : '');
+}
+
+/* ------------------------------------------------------------------ *
+ * 事件
+ * ------------------------------------------------------------------ */
+const drop = document.getElementById('drop');
+const fileInput = document.getElementById('file');
+drop.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', e => { importFiles([...e.target.files]); e.target.value = ''; });
+['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => {
+  e.preventDefault(); e.stopPropagation(); drop.classList.add('on');
+}));
+['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => {
+  e.preventDefault(); e.stopPropagation(); drop.classList.remove('on');
+}));
+drop.addEventListener('drop', e => {
+  const fs = [...(e.dataTransfer ? e.dataTransfer.files : [])].filter(f => /\.json$/i.test(f.name));
+  if (fs.length) importFiles(fs);
+});
+// 页面级拖放也接受
+window.addEventListener('dragover', e => e.preventDefault());
+window.addEventListener('drop', e => {
+  e.preventDefault();
+  const fs = [...(e.dataTransfer ? e.dataTransfer.files : [])].filter(f => /\.json$/i.test(f.name));
+  if (fs.length) importFiles(fs);
+});
+
+document.getElementById('routes').addEventListener('click', e => {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn) return;
+  const i = Number(btn.dataset.i), r = state.routes[i];
+  if (!r) return;
+  if (btn.dataset.act === 'del') {
+    state.routes.splice(i, 1);
+    recomputePaceRange(); renderSide(); render();
+  } else if (btn.dataset.act === 'zoom') {
+    const pts = r.kind === 'model' ? r.centerline : r.points;
+    const AMap = window.AMap;
+    const gc = pts.map(p => toGcj(p[0], p[1]));
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const c of gc) {
+      if (c[0] < x0) x0 = c[0];
+      if (c[0] > x1) x1 = c[0];
+      if (c[1] < y0) y0 = c[1];
+      if (c[1] > y1) y1 = c[1];
+    }
+    const b = new AMap.Bounds(new AMap.LngLat(x0, y0), new AMap.LngLat(x1, y1));
+    try { state.map.setBounds(b, false, [70, 70, 70, 70]); } catch (err) {}
+  }
+});
+
+document.getElementById('btn-clear').addEventListener('click', () => {
+  state.routes = []; state.seq = 0;
+  document.getElementById('status').textContent = '';
+  recomputePaceRange(); renderSide(); render();
+});
+document.getElementById('btn-fit').addEventListener('click', fitAll);
+document.getElementById('btn-reload').addEventListener('click', () => location.reload());
+
+['opt-fence', 'opt-labels', 'opt-pace', 'opt-points', 'opt-model', 'opt-glow']
+  .forEach(id => document.getElementById(id).addEventListener('change', render));
+document.getElementById('opt-width').addEventListener('change', render);
+document.getElementById('coord').addEventListener('change', render);
+document.getElementById('tiles').addEventListener('change', applyTile);
+
+document.getElementById('btn-probe').addEventListener('click', () => {
+  const i = Number(document.getElementById('probe').value);
+  showProbe(i);
+});
+
+/* 悬停探针：在地图上移动时找最近的采样点 */
+let probeTimer = null;
+function bindProbe() {
+  if (!state.map) return;
+  state.map.on('mousemove', ev => {
+    if (probeTimer) return;
+    probeTimer = setTimeout(() => { probeTimer = null; }, 60);
+    const tasks = state.routes.filter(r => r.kind === 'task' && r.visible && r.pts);
+    if (!tasks.length) return;
+    const p = [ev.lnglat.getLng(), ev.lnglat.getLat()];
+    let best = null;
+    for (const r of tasks) {
+      // 稀疏抽样再局部细化，避免每次移动都遍历上万个点
+      const n = r.pts.length, stride = Math.max(1, Math.floor(n / 400));
+      let bi = 0, bd = Infinity;
+      for (let i = 0; i < n; i += stride) {
+        const d = (r.pts[i][0] - p[0]) ** 2 + (r.pts[i][1] - p[1]) ** 2;
+        if (d < bd) { bd = d; bi = i; }
+      }
+      const lo = Math.max(0, bi - stride), hi = Math.min(n - 1, bi + stride);
+      for (let i = lo; i <= hi; i++) {
+        const d = (r.pts[i][0] - p[0]) ** 2 + (r.pts[i][1] - p[1]) ** 2;
+        if (d < bd) { bd = d; bi = i; }
+      }
+      const dist = haversine(p, r.pts[bi]);
+      if (!best || dist < best.dist) best = { r, i: bi, dist };
+    }
+    if (best && best.dist < 60) showProbeFor(best.r, best.i, best.dist);
+  });
+}
+
+function showProbe(i) {
+  const r = state.routes.find(x => x.kind === 'task' && x.visible);
+  if (!r) { document.getElementById('probe-out').innerHTML = '<span class="warn">没有可查询的轨迹</span>'; return; }
+  if (!(i >= 0 && i < r.points.length)) {
+    document.getElementById('probe-out').innerHTML =
+      `<span class="warn">序号需在 0～${r.points.length - 1} 之间</span>`;
+    return;
+  }
+  showProbeFor(r, i, 0);
+}
+
+function showProbeFor(r, i, dist) {
+  const p = r.pts ? r.pts[i] : toGcj(r.points[i][0], r.points[i][1]);
+  const seg = i > 0 ? r.segs[i - 1] : null;
+  const speed = r.speeds[i];
+  document.getElementById('probe-out').innerHTML =
+    `<b>${esc(r.name)}</b> #${i}${dist ? `（距鼠标 ${dist.toFixed(1)} m）` : ''}<br>` +
+    `坐标 <span class="mono">${r.points[i][0].toFixed(7)}, ${r.points[i][1].toFixed(7)}</span><br>` +
+    `runTime <b class="mono">${r.times[i]}</b> s　runStep <b class="mono">${r.steps[i]}</b><br>` +
+    `runMileage <b class="mono">${isFinite(r.miles[i]) ? r.miles[i].toFixed(2) : '—'}</b> m　` +
+    `speed <b class="mono">${isFinite(speed) ? speed.toFixed(2) : '—'}</b><br>` +
+    `本段 Δt <b class="mono">${seg ? seg.dt : '—'}</b> s　Δ里程 <b class="mono">${seg ? seg.dm.toFixed(2) : '—'}</b> m　` +
+    `本段配速 <b class="mono">${seg ? fmtPace(seg.pace) : '—'}</b>`;
+  if (state.map) {
+    if (showProbeFor._m) { state.map.remove(showProbeFor._m); }
+    const AMap = window.AMap;
+    showProbeFor._m = new AMap.CircleMarker({
+      center: p, radius: 8, strokeColor: '#fff', strokeWeight: 2,
+      fillColor: '#4da3ff', fillOpacity: 0.9, zIndex: 300,
+    });
+    showProbeFor._m.setMap(state.map);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * 启动
+ * ------------------------------------------------------------------ */
+(async function boot() {
+  renderSide();
+  try {
+    await initMap();
+    bindProbe();
+    banner('', 0);
+  } catch (e) {
+    banner('地图加载失败：' + esc(e.message) +
+      '<br>请确认 Key 有效、类型是「Web端(JS API)」，且当前页面域名在 Key 的白名单内。' +
+      '<br>若用 JS API 2.0，还需要在「安全密钥」里填 securityJsCode。');
+    document.getElementById('status').className = 'err';
+    document.getElementById('status').textContent = '地图未就绪，但文件解析仍可使用。';
+  }
+})();
+</script>
+</body>
+</html>
