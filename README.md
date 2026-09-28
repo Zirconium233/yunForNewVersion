@@ -2,59 +2,30 @@
 
 **注意：develop实现只经过和客户端逻辑的严格比对，未经过充分测试**
 
-9月23日更新：
-已知存在跑步当天合格过几天被撤回改为不合格的问题，详见 [issue#82](https://github.com/Zirconium233/yunForNewVersion/issues/82) 
-develop已经更新：
-1. 改进路线生成与打表播放模式，支持基于已有轨迹保留节奏变化、自动种子和可跑区域校验（不能再假定说什么服务器信什么了）
-2. 按任务里程上限截断，并依据客户端规则确定上传批次（解决2km提交问题，弱化固定`splitCount`特征）
+9月28：
+
+1. 基本上确定人脸问题已解决（目前没有任何反馈关于这个），详见[issue78](https://github.com/Zirconium233/yunForNewVersion/issues/78) 
+
+2. 有很大把握认为云运动会人工审查，目前主要针对重复的轨迹，不排除审查轨迹合理性的可能。因此后面不要使用相同轨迹多次跑步。详见 [issue82](https://github.com/Zirconium233/yunForNewVersion/issues/82)
+
+3. 注意，打表模式的偏移方案是不可靠的！drift.py为24年PR提供，偏移质量很拉。现在只建议一天一张表，或者用现有的合成轨迹方案。
+      
 
 **如果你知道develop分支是什么、怎么用，欢迎参与讨论和后续开发；如果你不知道我下文那些内容在叽里咕噜说什么，请保持观望，避免造成损失**
-
-#### 1. 人脸识别触发时间：谁决定什么
-
-**服务端决定全部要素，客户端只做"距离到达→弹窗"的执行**，且服务端从不推送"现在弹"的指令。决策链分四层：
-
-| 层 | 包 | 决定 |
-|---|---|---|
-| 启用与否 | `run/getHomeRunInfo`（任务列表）响应 | 该跑步区域本次任务是否启用人脸（`runFaceStatus`） |
-| 跑点与预算 | `/run/start` 响应 | 本次会话每个人脸校验点的**距离位置**（`randomList`，服务端随机下发）和单窗倒计时（`faceTime`） |
-| 账号准入 | `run/getRlStatus` 响应 | 账号人脸注册状态（N1 时连正版 APP 都拒绝开跑） |
-| 结果判定 | `run/appFace/runFaceInfoComparison` 响应 | 单次比对通过与否（`data.status=="Y"`） |
-
-客户端侧的"触发时刻"= 累计里程跨过 `randomList` 某项（弹窗前有 4s 语音引导；弹窗后的总预算 = `faceTime+4` 秒）。服务端事后对整条记录做核验，其核验算法离线不可见，只能尽可能模仿客户端的行为。
-
-#### 2. 人脸识别相关配置参数（包 → 参数 → 功能）
-
-**决定人脸行为的全部字段**
-
-| 端点/方向 | 字段 | 语义 | APK 消费点 | 我方实现 |
-|---|---|---|---|---|
-| `run/getHomeRunInfo` 响应 `data.cralist[]` | `runFaceStatus` "Y"/"N" | **人脸验证唯一启用开关**（区域任务级） | NewRunningFragment:1079 启动前分支；SportRunMapActivity:4314 `B1="Y".equals(...)`、:3056 `N0.setNeedFace` | main.py:796-797 明示"faceTime 不是开关"；N=完全不执行 |
-| 同上 | `raRunArea`/`id`/`raDislikes`/`raSingleMileageMin/Max`/`raCadenceMin/Max`/`points` | 任务基准（区域、踩点数、里程/步频约束、围栏点）；randomList 取值范围落在里程区间内 | 任务卡片→start | 打表与守卫上下文用 |
-| `run/getRlStatus` 请求 `{raRunArea}` 响应 `data.runFaceStudentStatus` | Y=注册通过可跑；N=未注册（APP 强制先去 `runFaceInfo` 采集）；N0=认证失败重采；**N1=审核中，禁止跑步** | NewRunningFragment:929-932 构造、:640-698 四分支 | 仅 `live_probe.py` L1 只读探测（退出码 0/5 区分 Y/非Y）；正式跑流程不调用 |
-| `/run/start` 响应 `data.id` | crsRunRecordId（字符串）——比对包 `recordId` 唯一来源 | 结束链/比对共用 | `build_compare_body` 强转 str |
-| 同响应 `faceTime`（int，秒） | 单窗口倒计时；**APK 对 <10 的值夹到 10**（:787-788 `if(K1<10)K1=10`）；窗口总预算 `faceTime+4`（:1500、:2172 `(K1+4)*1000`、:3344） | start 回调 f0；断点续跑从本地 RunTaskModel.FaceTime 恢复（:3126） | `yun_face.FACE_TIME_FLOOR=10`（main.py:803-804 同下限）；**Y 任务 faceTime 缺失/非法 → 拒绝执行**（:812-815，不默认放行） |
-| 同响应 `randomList`（List\<Double\>，km） | 本次人脸校验点距离列表；每项生成一个窗口：`FaceRunWindowBean{idStr=recordId+序号, window=值, isShow="N", ...}`（a2() :2989-3012，落 GreenDao） | MAP:786、a2() | `windows_from_random_list`（main.py:818）；**Y 任务 randomList 缺失 → 停止**（:808-810）；int(km×1000) 米制跨越判定 |
-| `/run/appFace/runFaceInfoComparison` 响应 `data.status`/`msg` | Y=该窗口通过（唯一记成功值）；非 Y=终端失败不重试；code≠200/HTTP/解码=可重试的传输失败 | JTFaceCompareActivity:737/845、f:370、L():607-611、3004 | `compare_once`/`FaceVerifier` 逐态对齐 |
-| `/run/isStandard` 响应 `data.isStandard/isCheat/msg/url/list` | 结束前有效性预检；**`url/list` 非空 = 服务端要求补拍/复核**（人脸关联分支） | b0 回调 :481-514 | `_finish_state_check`：非200/解码失败/超时→尾批+finish 不发；url/list→明确停止 |
-
-**客户端本地字段（不上行，但是"完成度"的依据）**：`FaceRunWindowBean` 的 `voiceSecond/voiceTime`（弹窗时刻）、`uploadSuccess/compareSuccess/reason`——正版靠它+GreenDao 做断点续跑；我们可以用同构跟踪（`WindowTrigger` + 窗口记账）支撑守卫。config.ini `[Run]` 全部与人脸无关；`[User].legacy_uuid` 仅协议回退。
-
-#### 3. 当前的核心对策
-
-- **参数严格性**：开关只认 `runFaceStatus`；Y 任务缺 `faceTime`/`randomList` 直接拒绝；faceTime 下限 10 与 APK 一致；N 任务带窗口参数只提示不执行。
-- **W1 事件语义等价**：起点基线 0（首批跨窗不漏）、`int(window_m)` 边界算跨越、非单调忽略、每窗一次、在途互斥（在途漏跨与 APK 相同不补偿）；其上叠加自加护栏——finish 前完整性检查（范围内任何窗口未弹/未确认 → 拒绝 finish）+ expired 窗口拦截后续 split/finish。
-- **时钟与预算**：双轨（utc/sign 走 epoch，一切预算走 client.mono）；重试状态机对齐 a0（会话终止丢弃）、f:370（3 次即时间隔 1s + 等待期每 3s 复用同图、30s 耗尽报 3004）；`faceTime+4` 与 `pending_seconds` 两道截止，**恰好压线或越界的成功一律丢弃**（reviewer 小修后连请求的 connect/read 裁剪都按阶段剩余预算，<0.05s 直接停发）。
-- **图像链**：EXIF 摆正→镜像声明→限宽 720（不限长边）→质量阶梯 80..20 压至 ≤150KB，与 FaceImageCompressor 逐字节对齐；取景质量门（人脸占比/俯仰/偏航/滚转）复刻相机 UI 提交前门；内容哈希（sha256）绑定 + 全量预检（解码→标注匹配→质量门→最终压缩形态）在 **start 之前**完成并缓存（照片与视频预检帧均锁死为已验证内容，运行中换源文件不影响上传）。
-- **比对上传**：两键体 `{faceBaseData, recordId}` 逐字对齐；只有 `data.status=="Y"` 记成功；成功以外的终端失败不重试。
-- **结束链**：isStandard 前置门——失败/未知/`url/list`（补拍分支）时尾批与 finish 都不发，不猜测服务端后续流程。
-- **边界与诚实**：人脸采集链（`runFaceInfo`）有意不实现不自动调用（真人审核材料，代发=伪造）；准入状态用只读 `live_probe.py` 先行探测；服务端复核语义未线上验证（概率分层表见 README §2）；全部离线可证部分由 155 项测试覆盖（含禁网守卫复跑）。
 
 ### 简介：
 
 这是(3.4.8)云运动代跑脚本，可以进行云运动全自动代跑。
 
 ### 更新记录：
+
+- 2026/9/23：
+   1. 改进路线生成与打表播放模式，支持基于已有轨迹保留节奏变化、自动种子和可跑区域校验（不能再假定说什么服务器信什么了）
+      
+   2. 按任务里程上限截断，并依据客户端规则确定上传批次（解决2km提交问题，弱化固定`splitCount`特征）
+
+- 2026/9/14：
+   1. 更新合成路径方案
 
 - 2026/9/12：
    1. 对云运动的人脸问题安排了对策，但未经过实际测试。
