@@ -1,62 +1,226 @@
-# 云运动自动跑步脚本（develop：3.6.6 协议层重构，已通过两轮评审返修）
+# 云运动自动跑步脚本（develop 使用手册）
 
-**文档导航**：当前实际行为与操作方式见 [docs/USAGE.md](docs/USAGE.md)；
-协议构造、人脸子系统与偏差清单见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
-本 README 顶部为 develop 现状汇报与最新配置教学；底部保留仍有价值的历史档案。
+**文档导航**：本文是主使用文档；协议构造细节见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，
+逐条 CLI 与失败分支表见 [docs/USAGE.md](docs/USAGE.md)，合成配置完整键表见
+[docs/ROUTE_GENERATION.md](docs/ROUTE_GENERATION.md)。技术细节与历史档案在本文第 4 部分。
 
-## 连接失败先核对学校地址（2026-09-13）
+## 1. 速览
 
-已实时查询官方目录（HTTP 200 / code=200 / 99 条）：
-[全部学校 → schoolId → schoolUrl 对照表](docs/SCHOOL_DIRECTORY_20260913.md)。
-请按自己的**学校全称**查找，不要复制合工大地址到外校，也不要根据目录域名拼接 8080。
+develop：云运动（3.6.6）自动跑步脚本，解决 master 两个老大难问题：
 
-- 合肥工业大学：`schoolId=100`，`http://210.45.246.53:8080/`。
-- 多数学校：`https://sports.aiyyd.com:8000/`，但 schoolId 仍各不相同。
-- 本次目录没有 `http://sports.aiyyd.com:8080/`；此前反馈更应先核对目标地址，
-  不能凭“ping 通但 TCP 失败”认定学校封了宿舍 8080。
-- 有的学校 URL 带 `/m-api/` 或使用私网 IP，必须保留完整 URL；私网入口需要
-  对应校园网络或官方提供的入口，热点/普通公网代理不保证可达。
-- 目录快照不代表所有学校业务服务都可用。若学校目录记录异常，以官方客户端
-  实际选校后的地址或学校确认结果为准；不要猜端口、降级 HTTPS 或套用其他学校。
+1. **人脸验证**——master 停在 3.6.4/3.6.6 核验上无法开工；develop 重构请求链并实现人脸窗口状态机，已基本解决（少量实测失败待复核）。
+2. **轨迹重复**——master 的 `-d` 漂移只是整条轨迹约 0.1 毫米刚性平移（几何不变，易被近重复检测命中）；develop 用 `--route-config` 基于已有轨迹偏移出合成轨迹，算法仍有缺陷（换校区需换底图等），但已远好于老漂移。
 
-新版目录接口是 **POST `https://sports.aiyyd.com:9011/api/app/lisshtcool`**，
-Android 3.6.6 也使用该路径。它只负责返回学校地址，9011 不等于跑步服务端口。
-旧查询工具的 `9001/api/app/schoolList` 已替换；新版查询不需要账号配置、token 或加密信封。
+其余改动：每请求新鲜签名、splitPoint 载荷保真、结束前状态检查、dry-run 离线演练。
 
-```powershell
-# 只查询，不登录、不读写账号配置
-python tools/getUrl_Id.py --list
-python tools/getUrl_Id.py --school "合肥工业大学"
-# 核对全称后显式更新 school_host / school_id（保留其他配置值）
-python tools/getUrl_Id.py --school "你的学校全称" --write --config config.ini
+```
+├── main.py                 入口 + 会话编排 + 交互式菜单
+├── yun_http.py             协议层（SM2/SM4 信封、签名、解码）
+├── yun_face.py             人脸子系统（窗口调度、压缩、状态机）
+├── yun_route.py            轨迹合成引擎（--route-config 后端）
+├── live_probe.py           跑前准入探测（只读，不建记录）
+├── history.py              历史记录查看器
+├── tools/                  登录 / 学校地址查询 / 老漂移(弃用) / 抓包 / 路由生成 CLI
+├── examples/routes/        合成配置样例（v4.json + 底图 + dry-run 夹具）
+├── tasks_fch|txl|xc/       三个校区的打表任务表
+├── tests/                  离线测试（211 项，禁网可跑）
+├── docs/                   USAGE / ARCHITECTURE / ROUTE_GENERATION / 学校目录
+├── config.ini              唯一配置文件
+└── dry_run_home.json       dry-run 离线夹具
 ```
 
-也可独立通过 PowerShell 查询（不需要本项目或账号）：
+## 2. 更新日志
 
-```powershell
-$schoolDirectory = Invoke-RestMethod -Method Post `
-  -Uri 'https://sports.aiyyd.com:9011/api/app/lisshtcool' `
-  -Headers @{version='3.6.6'; platform='android'; isApp='app'} `
-  -ContentType 'application/json' -Body ''
-if ($schoolDirectory.code -ne 200) { throw $schoolDirectory.msg }
-$schoolDirectory.data | Select-Object schoolName, schoolId, schoolUrl | Format-Table -AutoSize
+- 2026-10-08：
+  1. develop 分支 README 优化为使用文档（速览 / 更新日志 / 使用文档 / 技术细节后置四部分）。
+  2. `main.py` 交互式模式升级：轨迹来源三选一菜单（打表回放 / 合成轨迹 / 老式漂移），
+     老式漂移标注弃用并警告近重复风险，提示勿重复上传同一轨迹，合成配置以菜单选择并可反馈补齐指引。命令行参数行为不变。
+
+- 2025/12/9：
+   1. 感谢 10punny 解决gmssl和hutool的验签问题，加密函数加上04头就可以被后端正确解密。现在我们可以使用随机密钥了(注意是随机加密，不是解密)详见[PR](https://github.com/Zirconium233/yunForNewVersion/pull/75)
+   2. headers的user-agent被顺手更新成了4.9.1，虽然服务器一直都是忽略这个的。
+
+- 2025/3/16: 封装抓历史记录功能。
+
+- 2025/2/25: 修复3.4.7版本公钥密钥变换问题，脚本基本功能已经恢复。
+
+- 2024/12/3:
+   1. 合并xiaocheng4097代码，提供登录功能支持，可以不抓包直接登录。
+   2. 增加自动版本检查，现在会自动检查`config.ini`里面的`app_edition`版本信息，如果小于3.4.5会自动更新最低可运行版本3.4.5，高版本不会更改(截至12/3日，最新版本为3.4.5)。过低的版本会导致服务返回错误信息，详见[issue#35](https://github.com/Zirconium233/yunForNewVersion/issues/35)。
+
+- 2024/10/28: 合并laizhangtu代码，现在代理工具可以批量抓取config了。
+
+- 2024/10/18:
+   1. 修改并合并xiaochen4097代码，提供随机偏移添加功能(路线改变效果并不明显，所以也不会鬼畜)。**（后记：此"偏移"实为整条轨迹 ≈0.1mm 刚性平移，2026-10 起标注弃用。）**
+   2. 有人测试发现ios版本也可以直接抓包token和deviceId，uuid使用当前代码，虽然很逆天但是真的过了。(还是不建议使用iOS登录信息跑本脚本)
+
+- 2024/10/12:
+   1. 合并ANormalDD代码，提供屯溪路校区地图和自动抓包(配置教程见proxy.md)支持。
+   2. 允许传递参数执行`main.py`，提供`./tools/EasyAutoRunServer/run.sh`批量并行运行多个config的任务，配合crontab即可定时批量运行跑步任务(挂一个云服务器上就可以全自动)。
+
+- 2024/9/21：其实我什么都没干，然后它自己又能过了，实锤了是学校服务器问题。
+
+  <img src="./image/pass.png" alt="image" style="zoom:50%;" />
+
+  注意事项：
+  1. 新版本**无需填写config里面的utc和sign参数**(留空就行，直接把那2行删了会报错)，脚本会自动生成utc，然后和uuid计算得到sign。详见 [issue#1](https://github.com/Zirconium233/yunForNewVerison/issues/1)
+  2. finish包500的问题自己好了，不知道是学校服务器是草台班子还是采用即时生成utc方法解决的。现在finish返回的是code 200。
+
+## 3. 使用文档
+
+### 3.1 安装
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate            # Windows；Linux/macOS 用 source .venv/bin/activate
+pip install -r requirements.txt   # 参与开发再加 -r requirements-dev.txt
+pytest tests -q                   # 211 项离线测试，可在禁网环境运行
+python main.py --dry-run          # 全离线演练：确认本地构造链路正常
+python live_probe.py <跑步区域名> # 实机第一步：查人脸准入（不创建跑步记录）
 ```
 
-缺少 version 请求头时本次返回“版本过低”，不能把该业务错误当成 TCP 不通。
-取到 schoolUrl 后，将其完整填入 `[Yun] school_host`，并使用同一条记录的 schoolId；
-查询工具不推测或更改 `school_login_url`。TCP 不通时 token 尚未参与 HTTP 业务判断。
-本次仅查询公共目录，没有登录或调用任何学校的跑步、人脸接口。
+### 3.2 config.ini 配置教学
 
-## develop 实测反馈与结束流程修正（2026-09-12）
+所有配置在 `config.ini`。**实机期间切勿把填了密码的 config.ini 提交进 git。**
+
+- **[Login]（实机必填）**：`username`/`password` 学号密码，留空则运行时询问；
+  登录响应中的 token 自动写回 `[User]`，**不再需要抓包填 token**。
+  登录失败可能触发服务端锁定/验证码：首次失败即停，勿盲目重试。
+- **[Yun]（多数保持默认）**：`school_host`/`school_id`/`school_login_url` 学校服务端
+  三要素（查询方法见 §3.6）；`app_edition` 保持 3.6.6；`md5key/publickey/privatekey/cipherkey*`
+  为仓库内公共协议密钥，勿改。
+- **[User]（全部留空）**：token/device_id/device_name/uuid/utc/sign 由登录与每请求逻辑
+  自动维护；历史"手填 4 件套"仍兼容，仅 `legacy_uuid=1` 回退旧协议时有意义。
+- **[Run]（打表参数，按需微调）**：`split_count` 每批点数；`min_distance`/
+  `allow_overflow_distance` 里程约束；`cadence_*_offset`、`strides` 步频步幅扰动
+  （只影响配速类字段，**不改坐标**）；`exclude_points` 围栏排除点。默认值可用。
+
+### 3.3 运行方式
+
+命令行（行为固定，适合自动化）：
+
+| 命令 | 模式 |
+|---|---|
+| `python main.py -a -t tasks_fch` | 打表自动回放（默认翡翠湖；`-d` 加老式漂移，**已不推荐**，见下） |
+| `python main.py -a --route-config examples/routes/v4.json` | 合成轨迹自动执行 |
+| `python main.py --dry-run [-f …] [--dry-home …] [--route-config …]` | 离线假传输演练，不登录不发请求 |
+| `python main.py --face-photo … --face-detection …` | 带人脸窗口任务的输入（见 §3.5） |
+
+交互模式（首次使用推荐，`python main.py` 直接回车）：
+
+1. 登录 → 确认账号信息（脱敏展示）；
+2. **轨迹来源三选一**：
+   - `[1] 打表原轨迹回放`（默认）：选校区后回放 tasklist 固定轨迹。
+     **请勿反复上传同一份任务表**——服务端有近似重复检测，轮换不同 tasklist
+     文件或换用合成轨迹；
+   - `[2] 合成轨迹`（基于已有轨迹偏移，**仍在测试**）：从 `examples/routes/`
+     菜单选择一份配置文件离线生成新轨迹后提交；配置不全时会打印缺失项与补齐
+     指引，修改后重新选择即可，全程不发起网络请求；
+   - `[3] 打表 + 老式漂移`（**弃用**）：即原 `-d`，仅 ≈0.1mm 刚性平移，
+     几何与原轨迹完全重合，近重复检测下基本无效，仅作历史兼容保留。
+3. 确认后自动执行：start → 逐批上传 → 状态检查 → 尾批 → finish。
+
+### 3.4 合成轨迹配置（--route-config）
+
+样例：[examples/routes/v4.json](examples/routes/v4.json)。**配置内所有相对路径按该
+配置文件所在目录解析**（所以 `v4.json` 里的 `base_v3.geojson` 就是同目录文件）。
+
+核心键：
+
+| 键 | 含义 |
+|---|---|
+| `base_geojson` 或 `base_task` | 底图二选一：GeoJSON（单条 LineString FeatureCollection）或已有打表任务 JSON |
+| `coordinate_system` | 声明底图坐标系（本项目用 `"GCJ-02"`；底图坐标系与声明不符会在生成时报错） |
+| `distance_m` | 目标里程，不得超过本校任务里程上限（`raSingleMileageMax`） |
+| `pace_min_km` / `cadence_spm` / `sample_seconds` | 配速 / 步频 / 采样间隔 |
+| `seed` | 随机种子（固定可复现；`"auto"` 每次新种子） |
+| `max_offset_m` / `detour_enabled` / `lane_change_*` | 偏移幅度 / 绕行开关 / 变道点 |
+| `allowed_polygon_geojson` | 可跑区域 Polygon。**`max_offset_m>5` 或开启绕行时必填**，所有点（含底图）都必须在框内 |
+| `telemetry_task` / `telemetry_variation` | 用真实任务的分段速度/步频做遥测回放（可选） |
+
+先离线预览再生成：
+
+```bash
+python tools/generate_route.py --config examples/routes/v4.json --output route_preview.geojson
+python main.py --dry-run -f tests/fixtures/test_config.ini --dry-home examples/routes/dry_home.json --route-config examples/routes/v4.json
+python main.py -f config.ini --route-config examples/routes/v4.json
+```
+
+**跨校区通用性**：配置结构与字段跨校区通用，但**底图与围栏必须换成目标校区**：
+把 `base_geojson` 指向目标校区的轨迹/手绘线、`allowed_polygon_geojson` 换成目标
+校区的可跑范围、`distance_m` 对齐该校任务上限；`pace/cadence/seed/偏移` 等参数
+可原样沿用。用真实轨迹当底图最省事——从任一 tasklist 导出 GeoJSON：
+
+```python
+import json, sys
+j = json.load(open(sys.argv[1], encoding='utf-8-sig')); d = j.get('data') or j
+pts = [[float(x) for x in r['point'].split(',')] for r in d['pointsList']]
+json.dump({"type":"FeatureCollection","features":[{"type":"Feature","properties":{},
+  "geometry":{"type":"LineString","coordinates":pts}}]},
+  open(sys.argv[2],'w',encoding='utf-8'), ensure_ascii=False)
+# 用法: python export_base.py tasks_fch/tasklist_0.json my_base.geojson
+```
+
+注意：底图若是"将来要提交"的轨迹本身，请只把它当几何模板——合成结果会围绕它
+偏移；同一底图反复合成仍可能相似，建议换种子或换底图。完整键表、误差与限制声明
+见 [docs/ROUTE_GENERATION.md](docs/ROUTE_GENERATION.md)。
+
+### 3.5 人脸输入（跑带人脸窗口任务时）
+
+标注 JSON 与照片/视频放一起，`--face-detection` 指向它：
+
+```json
+{
+  "box": [100, 120, 260, 360],
+  "points": [[130,180],[230,180],[180,240],[150,260],[210,260]],
+  "score": 0.9, "space": "image",
+  "source_sha256": "<照片或视频文件的SHA-256>",
+  "bind_apply": {"after_exif": true, "mirrored": false}
+}
+```
+
+- 照片：整帧正面自拍，人脸需过取景门（哈希用 `certutil -hashfile <文件> SHA256`）。
+- 视频：改用 `"frames": {"<帧号>": {…}}` 逐帧标注，`source_sha256` 绑定视频文件。
+- 任何绑定不符/预检不过 = start 之前报错停止，不会创建服务端记录。
+- 失败分支表见 docs/USAGE.md §4。
+
+### 3.6 常见问题
+
+- **连接失败先核对学校地址，不要猜端口**。官方目录实时接口为 POST
+  `https://sports.aiyyd.com:9011/api/app/lisshtcool`（需 `version: 3.6.6` 请求头，
+  缺头返回"版本过低"是业务错误不是网络不通）：
+
+  ```bash
+  python tools/getUrl_Id.py --list
+  python tools/getUrl_Id.py --school "你的学校全称" --write --config config.ini
+  ```
+
+  已抓好的 99 条对照表见 [docs/SCHOOL_DIRECTORY_20260913.md](docs/SCHOOL_DIRECTORY_20260913.md)。
+  合肥工业大学为 `schoolId=100`、`http://210.45.246.53:8080/`；外校不能照搬。
+  多数学校 `https://sports.aiyyd.com:8000/` 但 schoolId 各不相同；带 `/m-api/`
+  或私网 IP 的必须保留完整 URL。
+- **被"人脸完整性守卫"拦截 finish**：有窗口未弹或比对未确认，脚本有意不静默收尾；
+  服务端会留一条未完成记录，可在云运动 APP 内删除。
+- **BusinessException** = 服务端明确拒绝（修数据/修时机），后续 split/finish 一律不发；
+  传输结果未知 ≠ 失败，先 `python history.py` 查记录，勿自动重发。
+- 登录不可用时抓包兜底：手机装 PCAPdroid → VPN 放行 → 抓 `token`/`deviceId`
+  抄进 config.ini（图示见下方历史档案与 [proxy.md](proxy.md)）。
+- 更多问答见 [questions.md](questions.md)。
+
+---
+
+## 4. 技术细节（为合并评审保留）
+
+### 4.1 develop 实测反馈与结束流程修正（2026-09-12）
 
 当前分支保留用于受控验证，**等待更多可复现成功反馈后再考虑合并 master**。
 维护者的自动测试均为离线测试，不能替代账号实测。Issue #78 已有一次人脸
 `data.status=Y` 的日志片段及用户报告的结束成功，但缺少完整版本、改动、回包
-和最终成绩记录，尚不能证明稳定可复现，也无法据此确定后续封禁的原因。
+和最终成绩记录，尚不能证明稳定可复现。
 
 修正了结束检查对 `url/list` 的误拦截。客户端 `CheckRunStateDialog` 将 `url`
 作为状态图片、`list` 作为条件明细展示；字段非空不代表需要补拍或复核。
-本分支继续遵守“状态检查 → 必要尾批确认 → finish”，不会无条件强制提交：
+本分支继续遵守"状态检查 → 必要尾批确认 → finish"，不会无条件强制提交：
 
 | 状态检查结果 | 自动处理 |
 |---|---|
@@ -66,216 +230,87 @@ $schoolDirectory.data | Select-Object schoolName, schoolId, schoolUrl | Format-T
 | isStandard 非 Y、缺失或未知 | 停止自动结束，保留现场 |
 | url/list 非空 | 记录展示字段，不因此阻断 |
 
-非 Y 时停止是脚本的保守自动化策略，不代表客户端所有人工结束分支。
-`isCheat` 缺失不是“确认无作弊”；人脸 status=Y、结束前达标、finish 受理、
-最终成绩有效是不同结果，不能相互替代。日志新增脱敏后的状态展示字段。
+反馈请附提交版本、修改差异、命令参数、脱敏请求时间线、业务回包及最终成绩/限制
+提示；不要上传密码、token、人脸 Base64 或完整账号配置。不要通过反复登录或强制
+提交来猜测限制阈值。
 
-反馈请附每次运行的提交版本、修改差异、命令参数、脱敏请求时间线、业务回包
-及最终成绩/限制提示；不要上传密码、token、人脸 Base64 或完整账号配置。
-不要通过反复登录或强制提交来猜测限制阈值。登录会改变会话及本地配置，
-实测应由账号持有人明确授权；本次修复验证不执行登录或线上跑步请求。
-
-输入仍为照片/选定视频帧加人工标注，自动检测器、完整恢复及部分客户端
-时序尚未实现；详细范围见 [docs/USAGE.md](docs/USAGE.md)。
-
-## 1. 相对 master 的功能性改动（服务器可见 / 行为可见）
+### 4.2 相对 master 的功能性改动（服务器可见 / 行为可见）
 
 | 功能点 | master | develop |
 |---|---|---|
 | 请求身份 | uuid 固定读配置；utc/sign 整会话算一次复用 | 每请求随机大写 UUID + 新鲜 utc + 重算 sign（3.6.6 真机行为）；`legacy_uuid=1` 可回退旧协议 |
-| 业务 code | 只看 HTTP 200，响应仅打印 | `code≠200 → BusinessException` 传播即停，后续 split/finish 一律不发，报告 recordId 与最后确认位置；HTTP 层错误（结果未知）与业务拒绝严格区分，不自动重放 |
-| splitPoint 载荷 | StepNumber=里程差÷步幅（自造）；null 字段丢失 | Gson serializeNulls 字段序、null 保留；StepNumber=表格真实 runStep 差值（loader 不再丢 runStep/ts）；体级 gzip 仅该端点白名单 |
-| 结束链 | 直接 finish | `/run/isStandard`（同一 P1 体）状态检查先行 → 必要尾批（改为暂存至此补发）→ finish；检查失败、未达标或 isCheat=Y → 后两者不发；url/list 仅展示 |
-| 自动人脸 | 无（当年正倒在 3.6.4/3.6.6 人脸验证上，见 [issue#78](https://github.com/Zirconium233/yunForNewVersion/issues/78)） | 新增整套：窗口调度、比对上传、重试/等待状态机、faceTime+4s 预算、成功守卫（未确认窗口拒绝 finish） |
-| getRlStatus/采集 | 无 | `live_probe.py` 准入探测 getRlStatus（不创建跑步记录）；采集端点 `runFaceInfo` **有意不自动调用**（真人审核流，脚本代发=伪造身份材料） |
-| 响应解码 | 单一 SM4 | 明文 JSON / SM4 / SM4+gzip 三形态统一，异常即 DecodeException |
-| 登录后置 | 首个请求仍带旧 base_url/空 token | 登录后同步内存客户端（含学校地址探测结果）；输出脱敏 |
-| 其它 | — | `--dry-run` 全离线演练、config/task 路径 CLI 贯穿、history.py 记录查看器 |
+| 业务 code | 只看 HTTP 200，响应仅打印 | `code≠200 → BusinessException` 传播即停，后续 split/finish 一律不发，报告 recordId 与最后确认位置；HTTP 层错误与业务拒绝严格区分，不自动重放 |
+| splitPoint 载荷 | StepNumber=里程差÷步幅（自造）；null 字段丢失 | Gson serializeNulls 字段序、null 保留；StepNumber=表格真实 runStep 差值；体级 gzip 仅该端点白名单 |
+| 结束链 | 直接 finish | `/run/isStandard` 状态检查先行 → 必要尾批 → finish；检查失败、未达标或 isCheat=Y → 后两者不发 |
+| 自动人脸 | 无（[issue#78](https://github.com/Zirconium233/yunForNewVersion/issues/78)） | 窗口调度、比对上传、重试/等待状态机、faceTime+4s 预算、成功守卫 |
+| getRlStatus/采集 | 无 | `live_probe.py` 准入探测；采集端点 `runFaceInfo` **有意不自动调用**（脚本代发=伪造身份材料） |
+| 响应解码 | 单一 SM4 | 明文 / SM4 / SM4+gzip 三形态统一 |
+| 其它 | — | 登录后同步内存客户端、输出脱敏、`--dry-run`、history.py |
 
-## 2. 自动人脸现状
+### 4.3 自动人脸现状
 
-**真机 APK 发送什么**（JTFaceCompareActivity.java:724-740）：
+真机 APK 发送 `POST /run/appFace/runFaceInfoComparison`：
+`{ "faceBaseData": "Base64_NO_WRAP(压缩后JPEG整帧)", "recordId": "<record>" }`；
+图像是取景质量门通过后的整帧（不裁剪），EXIF 摆正→宽>720 才缩→质量阶梯 80..20
+压至 ≤150KB。比对基准在服务端注册照（`runFaceInfo` 采集 + 审核状态机：
+`runFaceStudentStatus` Y=可跑 / N、N0=需重新采集 / N1=审核中禁跑）。
 
-```json
-POST /run/appFace/runFaceInfoComparison
-{ "faceBaseData": "Base64_NO_WRAP(压缩后JPEG整帧)", "recordId": "<start响应的record>" }
+我们发送与上面请求字段结构对应（图片编码及 Luban 处理存在已记录的近似差异）；
+**限制如实声明**：检测模型（RetinaFace）未移植，标注必须人工提供；比对阈值在
+服务端，离线不可测。实测成功率尚无可靠统计（此前的百分比估计缺少样本依据，已撤回）。
+
+### 4.4 V4 几何生成实现要点
+
+`yun_route.generate(cfg)` 纯离线（读文件+计算，无网络）。`geometry_v4`：车道级
+OU 游走 + 变道事件 + 采样，`max_offset_m≤5` 时自由偏移，超出或开 `detour_enabled`
+则要求 `allowed_polygon_geojson` 且**每个点（含底图）必须在多边形内**。
+`geometry_v4_telemetry`：以真实任务为 `base_task`/`telemetry_task` 保留分段速度与
+步频形状，要求里程/时间字段单调累计，时间采样弦切损失 >1% 时报错（缩短
+`sample_seconds`）。任务下发的里程上限和 `passPointNum` 上传阈值在运行时生效；
+"2 km 强制提交"按学校任务 `raSingleMileageMax` 处理，无全局写死。
+2026-09-23 离线验收：阻断 socket 环境下 211 项测试通过（样本轨迹完整执行、里程
+上限、上传批量、时间戳、旧表步数兼容、区域越界）。运动样本模式仍可能保留轨迹与
+节奏的相似性，当前实现不代表已解决次日复核不合格的问题。
+
+### 4.5 代码结构与文件职能
+
+```
+├── main.py            CLI 入口 + Yun_For_New 会话编排 + 交互式轨迹来源菜单 + dry-run
+├── yun_http.py        协议边界：DeviceProfile、SM2/SM4 信封、每请求 sign/uuid、gzip 白名单、
+│                      三形态解码、异常体系、YunClient
+├── yun_face.py        人脸子系统：照片/视频源、sha256 内容绑定、取景门、APK 压缩链、
+│                      窗口触发(W1)、FaceRunner、FaceVerifier(预算状态机)
+├── yun_route.py       轨迹合成：geometry_v4 / geometry_v4_telemetry，GCJ-02 声明校验
+├── live_probe.py      实机 L1 准入探测（退出码 0=Y/2=缺配置/3=登录未完成/4=业务失败/5=非Y）
+├── history.py         历史记录查看器
+├── tools/             Login.py / getUrl_Id.py / drift.py(弃用) / pace_changer.py /
+│                      proxy.py / generate_route.py / EasyAutoRunServer(批量并行)
+├── examples/routes/   v4.json 样例、base_v3.geojson 合成底图、dry_home.json 夹具
+├── tests/             离线测试：yun_http / yun_face / yun_route / main_phase_a /
+│                      wire_alignment / rework_final / live_probe / phase_a_fixes …
+├── docs/USAGE.md      逐条 CLI 与失败分支表
+├── docs/ARCHITECTURE.md 分层 + 线上载荷投影 + 偏差清单 §7(10 条)
+├── docs/ROUTE_GENERATION.md 合成配置完整键表与限制声明
+└── config.ini         唯一配置（实机期间禁提交含密码的副本！）
 ```
 
-图像是取景质量门（人脸尺寸/俯仰/偏航/滚转）通过后的**整帧**（不裁剪），经
-FaceImageCompressor：EXIF 摆正→宽>720 才缩→质量阶梯 80..20 压至 ≤150KB。
-比对基准在**服务端注册照**（`runFaceInfo` 采集 + 审核状态机：
-`getRlStatus.runFaceStudentStatus` Y=可跑 / N、N0=需（重新）采集 / N1=审核中禁跑）。
+### 4.6 历史档案
 
-**我们发送什么**：与上面的请求字段结构对应（图片编码及 Luban 处理存在已记录的近似差异）（两键、同 b64 形态、同压缩链，含
-"限宽不限长边、150KB 硬目标"等 WIRE_AUDIT 修正）；图片来源为
-`--face-photo` / `--face-video` + 人工标注 JSON（内容哈希绑定 + 取景门复算 +
-start 前全量预检）。**限制如实声明**：检测模型（RetinaFace）未移植，标注必须
-人工提供；等待期复用同一张图、语音引导 4s、重试形态对齐 APK，但比对阈值在
-服务端，离线不可测。
-
-**实测成功率尚无可靠统计**：此前的百分比估计缺少样本依据，已撤回。
-需要按版本收集完整成功/失败记录，才能评估可复现性。
-
-## 3. 代码结构与文件职能
-
-```
-├── main.py            CLI 入口 + Yun_For_New 会话编排：start/split/尾批暂存/
-│                      结束链(isStandard→尾批→finish)、人脸窗口接线与守卫、
-│                      build_face_runner 全量预检、dry-run
-├── yun_http.py        协议边界：DeviceProfile、SM2/SM4 信封、每请求 sign/uuid、
-│                      gzip 白名单、三形态解码、异常体系、YunClient
-├── yun_face.py        人脸子系统：照片/视频源、sha256 内容绑定、标注 Bundle、
-│                      取景质量门、APK 压缩链、窗口触发(W1)、FaceRunner、
-│                      FaceVerifier(预算状态机+双段超时裁剪)、compare_once
-├── live_probe.py      实机 L1 准入探测：login + getRlStatus，不创建跑步记录（登录非零状态变更；退出码 0=Y/2=缺配置/3=登录未完成/4=业务失败/5=非Y）
-├── history.py         历史记录查看器（抓轨迹做打表数据 / 事后核验）
-├── tools/Login.py     登录（凭据来自 ini；token 脱敏；地址探测失败保留配置）
-├── tools/getUrl_Id.py 学校地址/ID 发现（当前网络环境不可达时可预填绕过）
-├── tools/drift.py / pace_changer.py / proxy.py   漂移 / 配速 / 抓包配置工具
-├── tools/EasyAutoRunServer/run.sh                多 config 批量并行（crontab 可用）
-├── tests/             离线测试：yun_http(信封/字段序/序列化)、yun_face(窗口/压缩/
-│                      verifier/绑定)、main_phase_a(会话流程/dry-run)、
-│                      wire_alignment(10 项服务器视角护栏)、
-│                      rework_final(R1-R6+S1-S3)、live_probe(探测只读性与退出码)、phase_a_fixes
-├── docs/USAGE.md      用户文档（配置/CLI/人脸输入/失败分支表）
-├── docs/ARCHITECTURE.md 分层 + 线上载荷投影 + 偏差清单 §7(10 条) + 测试地图
-├── config.ini         唯一配置（见下方教学；实机期间禁提交含密码的副本！）
-├── dry_run_home.json  dry-run 离线夹具（数据已脱敏）
-└── tasks_fch|txl|xc/  打表任务表（runStep 保真）
-```
-
-## 4. 快速开始
-
-```bash
-python -m venv .venv
-.venv\Scripts\activate            # Windows；Linux/macOS 用 source .venv/bin/activate
-pip install -r requirements.txt    # 测试再加 -r requirements-dev.txt
-pytest tests -q                    # 可在禁网环境运行
-python main.py --dry-run           # 全离线演练（不登录、不发任何真实请求）
-python live_probe.py <跑步区域名>  # 实机第一步：查人脸准入（不建跑步记录；登录会更新会话/本地配置，可能使手机APP会话失效）
-python main.py                     # 正式跑（先小步验证，见 docs/USAGE.md §6）
-```
-
-常用参数：`-f/-t` 指定 config/task 目录；`-a` 自动模式（缺省打表；指定 `--route-config` 时生成路线）；`-d` 轨迹漂移；`--face-photo/--face-video/--face-detection/--face-mirror`
-人脸源（见 §人脸输入）。
-
-## V4 几何模板生成（develop）
-
-新增 `--route-config`，使用本地几何底图和参数生成点列，重新计算时间、距离、步数和配速，替代读取旧打表数据。仍需要底图定义跑道形状；默认不裁剪、不绕出跑道，随机种子固定以便复现。
-
-现在也可在配置中用 `base_task` 读取已有轨迹、用 `telemetry_task` 保留分段速度与步频变化，或将 `seed` 设为 `"auto"` 每次选择新种子。偏移超过 5 米须给出可跑区域 Polygon。任务下发的里程上限和 `passPointNum` 上传阈值会在运行时生效；打表入口的时间戳按逐点 `runTime` 推进。详见下方配置说明。
-
-打表及 `--route-config` 模式中的“2 km 强制提交”按学校任务的 `raSingleMileageMax` 处理，没有全局写死 2 km；达到上限后进入既有的状态检查 → 尾批 → finish 链。上传批量按客户端正常分支的 `passPointNum` 阈值确定，不额外随机化。运动样本模式仍可能保留轨迹与节奏的相似性，当前实现不代表已解决次日复核不合格的问题。
-
-2026-09-23 离线验收：在阻断 socket 连接的环境下，211 项测试通过，覆盖样本轨迹完整执行、里程上限、上传批量、时间戳、旧表步数兼容及区域越界。当前仅发布至 develop，后续仍需实机与延迟复核反馈。
-
-```powershell
-# 只生成文件，不读取账号、不联网；输出已存在时请换文件名
-python tools/generate_route.py --config examples/routes/v4.json --output work_dir/route_preview.geojson
-# 完整离线假传输演练
-python main.py --dry-run -f tests/fixtures/test_config.ini --dry-home examples/routes/dry_home.json --route-config examples/routes/v4.json
-# 使用账号运行时的入口
-python main.py -f config.ini --route-config examples/routes/v4.json
-```
-
-参数、路径规则与限制见 [路径生成配置说明](docs/ROUTE_GENERATION.md)，配置模板为 [v4.json](examples/routes/v4.json)。示例底图仅适用于其对应场地，其他学校需更换；不能与 `-t/-d` 混用。暂不支持需要踩点的任务，发现不匹配会在建记录前停止。
-
-此前记录被追溯取消的原因尚不明确。几何合理和离线测试通过均不代表成绩有效，当前保持 develop 测试状态。
-
-## 5. 配置教学（2026 develop 版）
-
-所有配置在 `config.ini`。**开发/实机期间切勿把填了密码的 config.ini 提交进 git。**
-
-### [Login]（实机必填）
-- `username` / `password`：学号与密码。留空则运行时交互询问。登录响应里的
-  token 自动写回 `[User]`，**不再需要抓包填 token**。
-- 登录失败可能触发服务端锁定/验证码：首次失败即停，勿盲目重试。
-
-### [Yun]（多数保持默认；实机核对三项）
-- `school_host` / `school_id` / `school_login_url`：学校服务端三要素。地址与 ID
-  通过本文顶部的新版目录查询；登录路由仍需对应学校确认。合工大为
-  `http://210.45.246.53:8080` / `100` / `appLoginHGD`，外校不能照搬。
-  目录查询失败不会证明既有配置正确，先单独查询或对照官方客户端；当前登录
-  流程遇到目录请求异常会停止，勿将其理解为保证自动回退。
-- `app_edition`：3.6.6 行为基准（脚本按此生成 3.6.6 形态请求）。
-- `legacy_uuid=1`（可选，[User] 段）：回退"固定 uuid + 会话级 sign"旧协议，
-  仅当服务端按新版本拒绝请求时排查用。
-- `md5key/publickey/privatekey/cipherkey*`：协议密钥，仓库内公共值，勿改。
-
-### [User]（全部留空）
-- token/device_id/device_name/uuid/utc/sign 由登录与每请求逻辑自动维护。
-  历史教程里"手填 4 件套"的方式仍兼容，但 3.6.6 起 uuid 每请求随机，
-  固定值只在 legacy 模式有意义。
-
-### [Run]（打表参数，按需微调）
-- `split_count` 每批点数（默认 10）；`min_distance`/`allow_overflow_distance`
-  里程约束；`cadence_min_offset`/`max_offset`、`strides` 步频步幅扰动；
-  `exclude_points` 围栏排除点。默认值可用，异常时先别动。
-
-### 人脸输入（跑带人脸窗口任务时）
-标注 JSON 与照片/视频放一起，`--face-detection` 指向它：
-
-```json
-{
-  "box": [100, 120, 260, 360],                    // 人脸框（原图像素坐标）
-  "points": [[130,180],[230,180],[180,240],[150,260],[210,260]],  // 五官点
-  "score": 0.9, "space": "image",
-  "source_sha256": "<照片或视频文件的SHA-256>",    // 内容绑定，必需
-  "bind_apply": {"after_exif": true, "mirrored": false}            // 坐标声明
-}
-```
-
-- 照片：整帧正面自拍，人脸占比/角度过取景门即可（可用图像查看器量坐标；
-  哈希用 `certutil -hashfile <文件> SHA256` 或 `python -c "import
-  hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" <文件>`）。
-- 视频：改用 `"frames": {"<帧号>": {box/points/score/space...}}` 逐帧标注，
-  `source_sha256` 绑定的是**视频文件**内容。
-- 任何绑定不符/预检不过 = start 之前就报错停止，不会创建服务端记录。
-- 完整语义（含失败分支表）见 docs/USAGE.md §4。
-
-### 抓包兜底（登录不可用时）
-新版无需 root：手机装 PCAPdroid（Google Play 搜索）→ 配 VPN 放行 → 云运动
-随便翻页 → 抓 `210.x.x.x:8080` 的请求 → headers 里 token/deviceId 抄进
-config.ini 对应项。图示版教程保留在下方历史档案与 [proxy.md](proxy.md)。
-
-## 6. 常见问题
-
-- 常见问题清单见 [questions.md](questions.md)；失败分支的机器可读含义见
-  docs/USAGE.md §7 表格（BusinessException=服务端明确拒绝：修数据/修时机；
-  传输结果未知：勿自动重发，先 history.py 查记录）。
-- finish 被"人脸完整性守卫"拦截：说明有窗口未弹或比对未确认——脚本有意
-  为之（不静默收尾）；服务端会留一条未完成记录，可在云运动 APP 内删除
-  （协议存在 `run/deleteCrsRunRecordById`，脚本未实现该操作）。
-
----
-
-## 历史档案（仍有参考价值的内容）
-
-### 加密史一句话
-3.4.7 起云运动改用 SM2 包 SM4 信封（客户端只加密不签名回验，`04` 头 hex →
-Base64 才能被 hutool 验签，见 [PR#75](https://github.com/Zirconium233/yunForNewVersion/pull/75)）；
-现在该逻辑全部收敛在 `yun_http.py`，密钥每请求随机。客户端对 cipherKey 只有
-加密能力没有解密能力（服务端公钥设计如此）——所以"解密别人流量"走不通，
-读自己的记录用 `history.py`（api 细节见 [history.md](history.md)）。
-
-### 踩点/围栏一句话
-服务器对关键点 ManageList 的"踩点数"要求改过（2→3），任务表按
-`isFence=Y` 覆盖踩点即可——服务端对轨迹细节的信任度比想象中高，围栏点
-列表在 config `[Run] exclude_points` 可调。
-
-### 主要历史节点（完整记录 `git log --all`）
-- 2025-12 随机 SM4 key 通讯（10punny）；2024-12 登录功能合并（可不抓包）；
-  2024-10 屯溪路地图 + proxy.py 批量抓配置、EasyAutoRunServer 批量并行；
-  2024-09 起打表模式 / 时间戳 / 多图随机。
-- 项目曾于 3.6.4 人脸验证上线后停摆（[issue#78](https://github.com/Zirconium233/yunForNewVersion/issues/78)）；
-  develop 分支即该问题的完整解决方案（人脸链路重构 + 3.6.6 对齐）。
-
-### 抓包图示（原版保留）
-<img src="./image/googleplay.jpg" alt="image" style="zoom:50%;" />
-<img src="./image/VPN.jpg" alt="image" style="zoom:50%;" />
-<img src="./image/package.png" alt="image" style="zoom:50%;" />
-<img src="./image/header.jpg" alt="image" style="zoom:50%;" />
-
-效果展示（历史截图，3.4.x 时代）：肉眼难辨的轨迹与进度条
-<img src="./image/goodMap.jpg" alt="image" style="zoom:50%;" />
-<img src="./image/processBar.png" alt="image" style="zoom:50%;" />
+- 加密史：3.4.7 起 SM2 包 SM4 信封（`04` 头 hex → Base64 才能被 hutool 验签，
+  [PR#75](https://github.com/Zirconium233/yunForNewVersion/pull/75)），现收敛在
+  `yun_http.py`，密钥每请求随机；cipherKey 只加密不解密，"解密别人流量"走不通，
+  读自己的记录用 `history.py`（api 细节见 [history.md](history.md)）。
+- 踩点/围栏：服务端对关键点"踩点数"要求改过（2→3），任务表按 `isFence=Y` 覆盖
+  踩点即可；围栏点在 config `[Run] exclude_points` 可调。
+- 主要历史节点：2025-12 随机 SM4 key；2024-12 登录合并；2024-10 屯溪路地图 +
+  proxy.py 批量抓配置 + EasyAutoRunServer；2024-09 起打表模式。项目曾于 3.6.4
+  人脸验证上线后停摆（[issue#78](https://github.com/Zirconium233/yunForNewVersion/issues/78)），
+  develop 即该问题的完整解决方案。
+- 抓包图示（原版保留）：
+  <img src="./image/googleplay.jpg" alt="image" style="zoom:50%;" />
+  <img src="./image/VPN.jpg" alt="image" style="zoom:50%;" />
+  <img src="./image/package.png" alt="image" style="zoom:50%;" />
+  <img src="./image/header.jpg" alt="image" style="zoom:50%;" />
+- 效果展示（历史截图，3.4.x 时代）：
+  <img src="./image/goodMap.jpg" alt="image" style="zoom:50%;" />
+  <img src="./image/processBar.png" alt="image" style="zoom:50%;" />
