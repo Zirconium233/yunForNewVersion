@@ -9,7 +9,7 @@
 develop：云运动（3.6.6）自动跑步脚本，解决 master 两个老大难问题：
 
 1. **人脸验证**——master 停在 3.6.4/3.6.6 核验上无法开工；develop 重构请求链并实现人脸窗口状态机，已基本解决（少量实测失败待复核）。
-2. **轨迹重复**——master 的 `-d` 漂移只是整条轨迹约 0.1 毫米刚性平移（几何不变，易被近重复检测命中）；develop 用 `--route-config` 基于已有轨迹偏移出合成轨迹，算法仍有缺陷（换校区需换底图等），但已远好于老漂移。
+2. **轨迹重复**——master 的 `-d` 漂移只是整条轨迹约 0.1 毫米刚性平移（几何不变，易被近重复检测命中）；develop 用 `--route-config` 把已有轨迹形变成新轨迹（deform 引擎），几何形状与节奏都变，远好于老漂移。
 
 其余改动：每请求新鲜签名、splitPoint 载荷保真、结束前状态检查、dry-run 离线演练。
 
@@ -17,13 +17,14 @@ develop：云运动（3.6.6）自动跑步脚本，解决 master 两个老大难
 ├── main.py                 入口 + 会话编排 + 交互式菜单
 ├── yun_http.py             协议层（SM2/SM4 信封、签名、解码）
 ├── yun_face.py             人脸子系统（窗口调度、压缩、状态机）
-├── yun_route.py            轨迹合成引擎（--route-config 后端）
+├── yun_route.py            轨迹合成引擎（deform 形变 + 任务表构造）
+├── web.py                  本地网页面板（配置 / 预览 / 执行日志，纯标准库）
 ├── live_probe.py           跑前准入探测（只读，不建记录）
 ├── history.py              历史记录查看器
 ├── tools/                  登录 / 学校地址查询 / 老漂移(弃用) / 抓包 / 路由生成 CLI
-├── examples/routes/        合成配置样例（v4.json + 底图 + dry-run 夹具）
+├── examples/routes/        合成配置样例（deform_*.json + 围栏 + dry-run 夹具）
 ├── tasks_fch|txl|xc/       三个校区的打表任务表
-├── tests/                  离线测试（211 项，禁网可跑）
+├── tests/                  离线测试（219 项，禁网可跑）
 ├── docs/                   USAGE / ARCHITECTURE / ROUTE_GENERATION / 学校目录
 ├── config.ini              唯一配置文件
 └── dry_run_home.json       dry-run 离线夹具
@@ -35,6 +36,8 @@ develop：云运动（3.6.6）自动跑步脚本，解决 master 两个老大难
   1. develop 分支 README 优化为使用文档（速览 / 更新日志 / 使用文档 / 技术细节后置四部分）。
   2. `main.py` 交互式模式升级：轨迹来源三选一菜单（打表回放 / 合成轨迹 / 老式漂移），
      老式漂移标注弃用并警告近重复风险，提示勿重复上传同一轨迹，合成配置以菜单选择并可反馈补齐指引。命令行参数行为不变。
+  3. 合成引擎换代：V4 单值侧移整体移除，改为 deform 二维形变（`source_json` 任选任务表/GeoJSON/坐标列表），
+     新增本地网页面板 `web.py`（配置 / 路线预览 / 执行日志）。细节见文末 §4.7。
 
 - 2026/9/23：
    1. 改进路线生成与打表播放模式，支持基于已有轨迹保留节奏变化、自动种子和可跑区域校验（不能再假定说什么服务器信什么了）
@@ -113,7 +116,7 @@ python live_probe.py <跑步区域名> # 实机第一步：查人脸准入（不
 | 命令 | 模式 |
 |---|---|
 | `python main.py -a -t tasks_fch` | 打表自动回放（默认翡翠湖；`-d` 加老式漂移，**已不推荐**，见下） |
-| `python main.py -a --route-config examples/routes/v4.json` | 合成轨迹自动执行 |
+| `python main.py -a --route-config examples/routes/deform_xc.json` | 合成轨迹自动执行 |
 | `python main.py --dry-run [-f …] [--dry-home …] [--route-config …]` | 离线假传输演练，不登录不发请求 |
 | `python main.py --face-photo … --face-detection …` | 带人脸窗口任务的输入（见 §3.5） |
 
@@ -131,50 +134,58 @@ python live_probe.py <跑步区域名> # 实机第一步：查人脸准入（不
      几何与原轨迹完全重合，近重复检测下基本无效，仅作历史兼容保留。
 3. 确认后自动执行：start → 逐批上传 → 状态检查 → 尾批 → finish。
 
-### 3.4 合成轨迹配置（--route-config）
+### 3.4 轨迹合成配置（--route-config）
 
-样例：[examples/routes/v4.json](examples/routes/v4.json)。**配置内所有相对路径按该
-配置文件所在目录解析**（所以 `v4.json` 里的 `base_v3.geojson` 就是同目录文件）。
+样例：[examples/routes/deform_xc.json](examples/routes/deform_xc.json)（另有 fch / txl /
+带围栏 / 更野参数四份）。**配置内所有相对路径按该配置文件所在目录解析**（所以
+`deform_xc.json` 里的 `../../tasks_xc/tasklist_4.json` 就是仓库里的任务表）。
 
 核心键：
 
 | 键 | 含义 |
 |---|---|
-| `base_geojson` 或 `base_task` | 底图二选一：GeoJSON（单条 LineString FeatureCollection）或已有打表任务 JSON |
-| `coordinate_system` | 声明底图坐标系（本项目用 `"GCJ-02"`；底图坐标系与声明不符会在生成时报错） |
-| `distance_m` | 目标里程，不得超过本校任务里程上限（`raSingleMileageMax`） |
-| `pace_min_km` / `cadence_spm` / `sample_seconds` | 配速 / 步频 / 采样间隔 |
-| `seed` | 随机种子（固定可复现；`"auto"` 每次新种子） |
-| `max_offset_m` / `detour_enabled` / `lane_change_*` | 偏移幅度 / 绕行开关 / 变道点 |
-| `allowed_polygon_geojson` | 可跑区域 Polygon。**`max_offset_m>5` 或开启绕行时必填**，所有点（含底图）都必须在框内 |
-| `telemetry_task` / `telemetry_variation` | 用真实任务的分段速度/步频做遥测回放（可选） |
+| `source_json` | **形变来源（必填，任选）**：tasklist（`data.pointsList[*].point`）、GeoJSON LineString/FeatureCollection、裸坐标列表 `[[lon,lat],…]` |
+| `coordinate_system` | 声明坐标系（本项目用 `"GCJ-02"`；不执行转换，声明不符会在生成时报错） |
+| `distance_m` | 精确总里程（给定即钉住，不再抽签；不得超过来源可用长度与任务上限） |
+| `min_distance_m` / `max_distance_m` | 里程区间：**不给 `distance_m` 时**总里程按来源 ×(1±`length_offset_pct`) 抽签，必须落在此区间，否则换种子重抽，连续 **5 次**不中直接报错 |
+| `pace_offset_pct` / `cadence_offset_pct` / `length_offset_pct` | 三个参数各自的抽签幅度，默认 **0.10（±10%）**，设 0 即关闭抽签 |
+| `pace_min_km` / `cadence_spm` | 基准值：**写了以 cfg 为准**，没写则取来源轨迹的实测总体配速/步频（来源没有节奏字段或字段越界时退回 6.0/160） |
+| `sample_seconds` | 发送间隔（整数 1~5 秒），与里程、配速严格自洽：每点里程 = 间隔 ÷ 速度 |
+| `seed` | 随机种子（固定可复现；`"auto"` 每次新种子，实值写入 `metadata.seed`；重抽时按 seed+1000003×n 递进） |
+| `allowed_polygon_geojson` | 可选围栏 Polygon：给了就逐段校验全部生成点，不给则不校验 |
+| `deform_profile` | 可选，覆盖形变参数（`spacing_m`、`lane_sigma_m`、`jump_sigma_m`、`length_gain_pct` 等，范围与默认值见 [docs/ROUTE_GENERATION.md](docs/ROUTE_GENERATION.md)） |
+
+算法一句话：5.5m 等弧长重采样 → 法向 OU 游走（跨道摆动）→ 二维相关漂移 → 稀疏衰减跳变，
+再对**总里程 / 配速 / 步频**三个参数各自 ±10% 抽签。三个参数不是各点独立乱偏：
+采样采用「等时间间隔 + 等里程增量」，所以**每一点的配速都等于总体配速**、
+`runMileage`/`runTime` 严格等差、发送间隔与里程和配速三者互相算得出来
+（舍入误差 < 1 个采样间隔）；步频同理，末点步数×60/总时长 ≈ 名义步频。
+地图上量到的折线弦长会比总里程短 1~3%（折返尖峰），`metadata.geometry_chord_m` 如实给出。
+
+**注意 2026-10 起 V4 引擎已整体移除**：旧 cfg 里的 `base_geojson`/`base_task`/`max_offset_m`/
+`lane_change_*`/`detour_*`/`telemetry_task`/`start_trim` 等键会得到明确的迁移报错，
+不会静默按新语义执行（迁移细节见文末 §4.7）。
 
 先离线预览再生成：
 
 ```bash
-python tools/generate_route.py --config examples/routes/v4.json --output route_preview.geojson
-python main.py --dry-run -f tests/fixtures/test_config.ini --dry-home examples/routes/dry_home.json --route-config examples/routes/v4.json
-python main.py -f config.ini --route-config examples/routes/v4.json
+python tools/generate_route.py --config examples/routes/deform_xc.json --output route_preview.geojson
+python main.py --dry-run -f tests/fixtures/test_config.ini --dry-home examples/routes/dry_home.json --route-config examples/routes/deform_xc.json
+python main.py -f config.ini --route-config examples/routes/deform_xc.json
 ```
 
-**跨校区通用性**：配置结构与字段跨校区通用，但**底图与围栏必须换成目标校区**：
-把 `base_geojson` 指向目标校区的轨迹/手绘线、`allowed_polygon_geojson` 换成目标
-校区的可跑范围、`distance_m` 对齐该校任务上限；`pace/cadence/seed/偏移` 等参数
-可原样沿用。用真实轨迹当底图最省事——从任一 tasklist 导出 GeoJSON：
+不想开命令行时用网页面板看图形：`python web.py` → ②路线预览 → 方案2 轨迹合成 →
+任选底图 json、改 seed / 采样间隔 / 最短最长里程 → 刷新预览：页面上会给出
+**参考 vs 即将发送的「总里程 / 配速 / 步频」三行对比**，以及点数、每点里程、
+几何弦长与"第几次抽中"（与上面 `--route-config` 同一实现）。
 
-```python
-import json, sys
-j = json.load(open(sys.argv[1], encoding='utf-8-sig')); d = j.get('data') or j
-pts = [[float(x) for x in r['point'].split(',')] for r in d['pointsList']]
-json.dump({"type":"FeatureCollection","features":[{"type":"Feature","properties":{},
-  "geometry":{"type":"LineString","coordinates":pts}}]},
-  open(sys.argv[2],'w',encoding='utf-8'), ensure_ascii=False)
-# 用法: python export_base.py tasks_fch/tasklist_0.json my_base.geojson
-```
+**跨校区通用性**：配置结构与字段跨校区通用，只需换来源与（可选的）围栏：
+把 `source_json` 指到目标校区的打表任务表（如 `tasks_txl/tasklist_0.json`）、
+`distance_m` 对齐该校任务上限；`pace/cadence/seed/deform_profile` 可原样沿用。
+**不需要先导出 GeoJSON**——tasklist 可以直接当来源（这也是"任选底图 json"的含义）。
 
-注意：底图若是"将来要提交"的轨迹本身，请只把它当几何模板——合成结果会围绕它
-偏移；同一底图反复合成仍可能相似，建议换种子或换底图。完整键表、误差与限制声明
-见 [docs/ROUTE_GENERATION.md](docs/ROUTE_GENERATION.md)。
+注意：如果拿"将来要提交的那条轨迹"当来源，同种子 + 同来源会得到完全相同的结果；
+换种子或换来源才能改变形状。同一来源反复合成仍可能保留可识别的相似性，不代表规避复审。
 
 ### 3.5 人脸输入（跑带人脸窗口任务时）
 
@@ -270,33 +281,38 @@ json.dump({"type":"FeatureCollection","features":[{"type":"Feature","properties"
 **限制如实声明**：检测模型（RetinaFace）未移植，标注必须人工提供；比对阈值在
 服务端，离线不可测。实测成功率尚无可靠统计（此前的百分比估计缺少样本依据，已撤回）。
 
-### 4.4 V4 几何生成实现要点
+### 4.4 轨迹合成（deform）实现要点
 
-`yun_route.generate(cfg)` 纯离线（读文件+计算，无网络）。`geometry_v4`：车道级
-OU 游走 + 变道事件 + 采样，`max_offset_m≤5` 时自由偏移，超出或开 `detour_enabled`
-则要求 `allowed_polygon_geojson` 且**每个点（含底图）必须在多边形内**。
-`geometry_v4_telemetry`：以真实任务为 `base_task`/`telemetry_task` 保留分段速度与
-步频形状，要求里程/时间字段单调累计，时间采样弦切损失 >1% 时报错（缩短
-`sample_seconds`）。任务下发的里程上限和 `passPointNum` 上传阈值在运行时生效；
-"2 km 强制提交"按学校任务 `raSingleMileageMax` 处理，无全局写死。
-2026-09-23 离线验收：阻断 socket 环境下 211 项测试通过（样本轨迹完整执行、里程
-上限、上传批量、时间戳、旧表步数兼容、区域越界）。运动样本模式仍可能保留轨迹与
-节奏的相似性，当前实现不代表已解决次日复核不合格的问题。
+`yun_route.generate(cfg)` 纯离线（读文件+计算，无网络）：来源 → `deform_points` 形变
+（5.5m 等弧长重采样 → 法向 OU 游走 → 二维相关漂移 → 稀疏衰减跳变 → 长度校准）→
+按时间采样补齐 `runMileage/runTime/runStep/speed`。`deform_geometry(source, seed, profile)`
+是同一算法的纯几何入口（web 预览与外部脚本用）。参数默认值即历史演示包尺度，回归钉在
+`test_deform_matches_demo_scale`（686 点 / 3.877 km）。任务下发的里程上限和
+`passPointNum` 上传阈值在运行时生效；"2 km 强制提交"按学校任务 `raSingleMileageMax`
+处理，无全局写死。
+
+与已移除的 V4（单值侧移，`max_offset_m ≤ 20` 条带）相比：deform 直接对二维坐标做形变，
+可复现演示包那种跨越内场、彼此缠绕的密集观感；代价是长度损失门限放宽到 5%（折返尖峰
+使弦长天然短 1~3%，加密顶点无法改变）。2026-10-08 离线验收：219 项测试通过（含形变
+基准复现、三种来源等价、profile 越界拒绝、V4 旧键迁移报错、围栏校验、种子可复现、
+里程上限、上传批量、时间戳、旧表步数兼容）。同源同种子仍可能保留可识别相似性，当前
+实现不代表已解决次日复核不合格的问题。
 
 ### 4.5 代码结构与文件职能
 
 ```
 ├── main.py            CLI 入口 + Yun_For_New 会话编排 + 交互式轨迹来源菜单 + dry-run
+├── web.py             本地网页面板：配置表单 + 路线预览（打表/形变）+ 执行日志（纯标准库）
 ├── yun_http.py        协议边界：DeviceProfile、SM2/SM4 信封、每请求 sign/uuid、gzip 白名单、
 │                      三形态解码、异常体系、YunClient
 ├── yun_face.py        人脸子系统：照片/视频源、sha256 内容绑定、取景门、APK 压缩链、
 │                      窗口触发(W1)、FaceRunner、FaceVerifier(预算状态机)
-├── yun_route.py       轨迹合成：geometry_v4 / geometry_v4_telemetry，GCJ-02 声明校验
+├── yun_route.py       轨迹合成：deform 形变引擎 + 上传任务表构造 + 可选围栏校验
 ├── live_probe.py      实机 L1 准入探测（退出码 0=Y/2=缺配置/3=登录未完成/4=业务失败/5=非Y）
 ├── history.py         历史记录查看器
 ├── tools/             Login.py / getUrl_Id.py / drift.py(弃用) / pace_changer.py /
 │                      proxy.py / generate_route.py / EasyAutoRunServer(批量并行)
-├── examples/routes/   v4.json 样例、base_v3.geojson 合成底图、dry_home.json 夹具
+├── examples/routes/   deform_*.json 样例 + fence_xc_40.geojson 围栏 + dry_home.json 夹具
 ├── tests/             离线测试：yun_http / yun_face / yun_route / main_phase_a /
 │                      wire_alignment / rework_final / live_probe / phase_a_fixes …
 ├── docs/USAGE.md      逐条 CLI 与失败分支表
@@ -325,3 +341,59 @@ OU 游走 + 变道事件 + 采样，`max_offset_m≤5` 时自由偏移，超出�
 - 效果展示（历史截图，3.4.x 时代）：
   <img src="./image/goodMap.jpg" alt="image" style="zoom:50%;" />
   <img src="./image/processBar.png" alt="image" style="zoom:50%;" />
+
+### 4.7 本次更新细节：合成引擎换代（2026-10-08）
+
+**起因**：历史三校区演示页里那条"铺满操场、彼此缠绕"的轨迹，用 develop 原有的 V4
+引擎复现不出来。核查确认不是参数问题：V4 的 `geometry()` 是**沿底线法线的单值侧移**
+`offset(i)=lane+sin()`，输出永远锁在底线 ±`max_offset_m`（≤20m）的条带内，结构上不可能
+跨内场缠绕；演示包用的是另一套算法（外部复现包：5.5m 弧长重采样 + 法向 OU 游走 +
+二维相关漂移 + 稀疏衰减跳变 + 长度校准）。据此把合成部分换成 deform 引擎。
+
+**改动清单**（本轮，均未提交，待确认后提交至 `gui` 分支）：
+
+| 文件 | 变化 |
+|---|---|
+| `yun_route.py` | 整体重写为 deform-only：V4 的 `geometry()`/变道/绕行/遥测回放/`base_geojson` 严格解析全部移除；新增 `deform_points`/`deform_geometry`/`extract_points`/`load_points`/`resample`/`ou_distance` 与 `PROFILE_LIMITS`（默认值+取值范围）；`generate()` 只认 `source_json` 等 9 个键；旧 V4 键命中时给出 `V4 合成参数已移除：…` 迁移报错 |
+| `web.py`（新） | 本地网页面板：①信息配置（读写 config.ini、敏感字段掩码、重读按钮）②路线预览（打表回放 / 轨迹合成，任选底图 json + seed，地图按参考轨迹定位）③执行日志（子进程跑 main.py，stdout 实时抓取）；仅绑 127.0.0.1，`--port` 可配，启动自动开浏览器 |
+| `examples/routes/` | 删除 `v4.json`、`base_v3.geojson` 与 6 份 V4 对比配置；新增 `deform_fch/txl/xc/xc_fence/fch_bold.json`（后两份演示围栏与"更野"参数） |
+| `tests/test_yun_route.py` | 引擎用例换代为 deform（演示基准复现 686 点/3.877km、三种来源等价、profile 越界拒绝、V4 旧键迁移、围栏可选但校验、种子可复现）；main 流程用例保留。全量 211 → **219 项通过** |
+| `docs/ROUTE_GENERATION.md` | 按 deform 重写（参数表、profile 范围表、长度损失 5% 门限的成因、V4 迁移说明） |
+| 归档 | 外部复现包与其中的参考实现留在 `work_dir/route_offset_repro/`（不随仓库提交） |
+
+**复现基准**（`deform_geometry`，seed=31337，默认 profile）：fch 686 点 / 3.877 km、
+txl 848 / 4.798、xc 728 / 4.117，与演示包逐项零偏差；`distance_m` 与 `sample_seconds=2`
+对齐后生成的任务表点数为 685/847/721（演示包 711/845/749）。
+
+**已知取舍**：①形变不判断道路可通行性，围栏是可选一致性校验；②折返尖峰使按时间采样的
+弦长比弧长短 1~3%，长度损失门限因此放宽到 5%；③同源同种子结果完全相同，重复使用同一
+来源仍有可识别相似性；④V4 的"遥测回放"（保留真人分段配速）随 V4 一并移除，需要真实
+节奏时走打表回放入口。
+
+#### 4.7.1 追加：长度/配速/步频三参数抽签（同日第二轮）
+
+**起因**：核对发现"几何长度不随种子变化"。实测归因是**算法性质**而非漏算——
+`length_gain_pct=0.03` 的视觉校准把形变几何长度精确锁到来源的 ×1.03（三种子全是
+3.00%；把该参数设 0 时才自然浮动 +2.85%~+3.49%），再叠加 `distance_m` 截断把上传
+总里程钉死。据此把长度放开：
+
+- **三参数各自 ±10% 抽签**（`pace_offset_pct`/`cadence_offset_pct`/`length_offset_pct`，默认 0.10）：
+  基准取"来源轨迹的实测值"（cfg 显式写了 `pace_min_km`/`cadence_spm` 则以 cfg 为基准）。
+  长度偏移通过形变自身的长度校准实现（变长抬高 `length_gain_pct` 并留 1% 余量，变短则截尾），
+  所以**形状与长度一起变**，不再被校准参数钉住。
+- **严格一致性**（用户要求"各点算出来要等于总体值，不能逐点独立偏"）：采样改为
+  「等时间间隔 + 等里程增量」——n = round(target/(间隔×速度))、Δm = target/n、
+  Δt = 间隔、duration = n×间隔。于是每点配速 = 间隔/Δm ≡ 总体配速，`runMileage`/`runTime`
+  严格等差，间隔与里程/配速三向自洽；步频用 `runStep = round(t×步频/60)`，末点×60/总时长 ≈ 名义步频。
+  （旧实现按弦长累加里程，逐点配速会有 1~3% 抖动，已修。）
+- **里程区间 + 重抽**：`min_distance_m`/`max_distance_m` 给定时抽到的总里程必须落在区间内，
+  否则换种子重抽（seed+1000003×n，抽签流独立），连续 **5 次**不中直接报错，报错里附上
+  "来源里程 ±10% 的可达范围与区间交集占比"和 `distance_m` 精确模式提示，不静默放宽。
+- **来源数据实测发现**：fch 表的 `runStep` 折合 **489 spm**（约 3.3 倍失真，xc/txl 为
+  148/150 spm 正常），故加入 110~220 spm 合理性闸门，越界即不采信、退回名义步频，
+  并在 `metadata.source_cadence_spm = null` 如实标注。
+- **web 展示**：方案2 预览新增「总里程 / 配速 / 步频」参考↔发送三行对比表，
+  另附点数、采样间隔、每点里程、几何弦长、第几次抽中、所用区间。
+- 验证：`pytest` **226 项通过**（新增抽签幅度、三向自洽、区间重抽/失败、步频闸门等用例）；
+  实测四种子的抽签结果（相对来源）例如 里程 −9.88%/+0.26%/+5.73%/+7.53%、
+  配速 +8.16%/+4.88%/+0.70%/−3.42%、步频 −3.95%/−8.04%/+0.12%/+4.62%，全部落在 ±10% 内且每次一行一致。

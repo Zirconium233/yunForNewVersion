@@ -1044,8 +1044,8 @@ class Yun_For_New:
             point['runTime'] = elapsed
             if 'cadence_spm' in task['metadata']:
                 point['runStep'] = math.floor(elapsed*task['metadata']['cadence_spm']/60)
-            # telemetry_task 分支已根据来源步数生成逐点 runStep；网络延迟不会
-            # 虚构额外步数，否则会抹掉原始步频的变化形状。
+            # 步数按任务表元数据的名义步频计算（合成任务 metadata 带 cadence_spm）；
+            # 打表入口的任务自带逐点 runStep，网络延迟不会虚构额外步数。
             point['speed'] = yun_route.client_speed(point['runMileage']-last_mileage, elapsed-last_time)
             point['ts'] = str(int(epoch)+elapsed)
             reached_cap = self._cap_point(point, actual_points[-1] if actual_points else None)
@@ -1529,10 +1529,11 @@ def choose_synthesized_task(input_fn=input, print_fn=print):
     while True:
         if not cands:
             print_fn("[无法合成] examples/routes/ 下没有 --route-config 配置文件。")
-            print_fn("[配置补齐] 必需键：coordinate_system(\"GCJ-02\")、distance_m、pace_min_km，"
-                      "以及 base_geojson(底图 GeoJSON)/base_task(已有任务表) 二选一；"
-                      "max_offset_m>5 或 detour_enabled 时还必须提供 allowed_polygon_geojson。"
-                      "写法见 README 第 3 节与 docs/ROUTE_GENERATION.md。")
+            print_fn("[配置补齐] 必需键：source_json（tasklist / GeoJSON / 坐标列表任一来源）、"
+                      "coordinate_system(\"GCJ-02\")；里程与节奏三选：distance_m 精确指定，"
+                      "或 min_distance_m/max_distance_m 区间抽签（总里程、配速、步频各 ±10%，"
+                      "5 次抽不中就报错）；可选 pace_min_km/cadence_spm/sample_seconds/seed/"
+                      "deform_profile/allowed_polygon_geojson。写法见 README 第 3 节与 docs/ROUTE_GENERATION.md。")
             return None
         print_fn("可选择的合成配置（examples/routes/，配置内相对路径按该配置文件所在目录解析）：")
         for i, name in enumerate(cands, 1):
@@ -1548,9 +1549,10 @@ def choose_synthesized_task(input_fn=input, print_fn=print):
             task = yun_route.generate(os.path.join(routes_dir, picked))
         except Exception as exc:
             print_fn(f"[配置缺失或非法] {picked}: {exc}")
-            print_fn("[补齐方法] 编辑该 JSON：底图(base_geojson/base_task 二选一)、"
-                     "coordinate_system、distance_m(不超过本校任务里程上限)、pace_min_km、cadence_spm；"
-                     "跨校区复用需同时更换底图与 allowed_polygon_geojson 边界。"
+            print_fn("[补齐方法] 编辑该 JSON：source_json(任选任务表/GeoJSON/坐标列表)、"
+                     "coordinate_system、里程(distance_m 精确，或 min/max_distance_m 区间)、"
+                     "pace_min_km/cadence_spm(不写则取来源实测值，写则以 cfg 为基准，各自 ±10% 抽签)；"
+                     "跨校区复用需把 source_json 换成目标校区的轨迹，并按需更换 allowed_polygon_geojson 边界。"
                      "改完重新选择，或退出后用 python main.py --route-config <路径>。")
             continue
         rows = (task.get("data") or {}).get("pointsList") or []
