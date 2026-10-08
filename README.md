@@ -33,11 +33,27 @@ develop：云运动（3.6.6）自动跑步脚本，解决 master 两个老大难
 ## 2. 更新日志
 
 - 2026-10-08：
-  1. develop 分支 README 优化为使用文档（速览 / 更新日志 / 使用文档 / 技术细节后置四部分）。
-  2. `main.py` 交互式模式升级：轨迹来源三选一菜单（打表回放 / 合成轨迹 / 老式漂移），
-     老式漂移标注弃用并警告近重复风险，提示勿重复上传同一轨迹，合成配置以菜单选择并可反馈补齐指引。命令行参数行为不变。
-  3. 合成引擎换代：V4 单值侧移整体移除，改为 deform 二维形变（`source_json` 任选任务表/GeoJSON/坐标列表），
-     新增本地网页面板 `web.py`（配置 / 路线预览 / 执行日志）。细节见文末 §4.7。
+  1. develop 分支 README 优化。
+  2. `main.py` 交互式模式升级，一步步点击就可以直接使用合成配置
+  3. 新增`web.py`引入前端界面，可以在地图上预览本次即将发送的轨迹，并且提供发送这段轨迹的命令
+     - ③的命令由②当前预览自动生成（只读，旁边 `dry run` 勾选框默认勾上）：打表锁定所选那张表、
+       合成锁定预览用的 cfg；预览失败会同时清空地图与命令，不允许再发上一次的轨迹（§4.8）
+  4. 合成引擎简化，可以实现：
+     - 合成轨迹和原轨迹几何上有显著差异，不同随机种子合成的结果也显著不同
+     - 合成轨迹的总里程、步频和配速为原配置的±10%随机偏移
+     - 本次更新并未解决可能的穿墙、越界问题，更多是配合界面更新降低配置难度
+
+  界面演示（`python web.py`）：
+
+  <p align="center">
+    <img src="./image/preview.png" alt="web 面板「路线预览」：方案 2 轨迹合成，参考原轨迹 3.668 km / 5.36 min/km，即将发送 3.422 km / 5.04 min/km / 169.2 spm，地图上蓝色实线为合成轨迹" width="780"><br>
+    <em>②路线预览：灰虚线＝参考原轨迹，蓝实线＝即将发送的合成轨迹，旁边即③要执行的命令</em>
+  </p>
+
+  <p align="center">
+    <img src="./image/random.png" alt="同一来源、三个随机种子（31337 / 31338 / 31339）的形变结果对比，红色虚线为原始轨迹、蓝色实线为生成偏移" width="860"><br>
+    <em>同一来源换随机种子：形状明显不同（deform 几何层对比，原始 3.764 km ／ 合成 3.877 km、686 点）</em>
+  </p>
 
 - 2026/9/23：
    1. 改进路线生成与打表播放模式，支持基于已有轨迹保留节奏变化、自动种子和可跑区域校验（不能再假定说什么服务器信什么了）
@@ -178,6 +194,9 @@ python main.py -f config.ini --route-config examples/routes/deform_xc.json
 任选底图 json、改 seed / 采样间隔 / 最短最长里程 → 刷新预览：页面上会给出
 **参考 vs 即将发送的「总里程 / 配速 / 步频」三行对比**，以及点数、每点里程、
 几何弦长与"第几次抽中"（与上面 `--route-config` 同一实现）。
+
+③执行日志里的命令**由②当前预览自动生成、且不可编辑**，取消勾选 `dry run` 点执行就是
+"发地图上那条蓝线"（细节与一致性证据见 §4.8，界面截图见 §2 的 2026-10-08 条目）：
 
 **跨校区通用性**：配置结构与字段跨校区通用，只需换来源与（可选的）围栏：
 把 `source_json` 指到目标校区的打表任务表（如 `tasks_txl/tasklist_0.json`）、
@@ -350,12 +369,12 @@ python main.py -f config.ini --route-config examples/routes/deform_xc.json
 跨内场缠绕；演示包用的是另一套算法（外部复现包：5.5m 弧长重采样 + 法向 OU 游走 +
 二维相关漂移 + 稀疏衰减跳变 + 长度校准）。据此把合成部分换成 deform 引擎。
 
-**改动清单**（本轮，均未提交，待确认后提交至 `gui` 分支）：
+**改动清单**（合成引擎换代 + 三参数抽签，均已提交到本地 `gui` 分支 `ee2130a`，未 push）：
 
 | 文件 | 变化 |
 |---|---|
 | `yun_route.py` | 整体重写为 deform-only：V4 的 `geometry()`/变道/绕行/遥测回放/`base_geojson` 严格解析全部移除；新增 `deform_points`/`deform_geometry`/`extract_points`/`load_points`/`resample`/`ou_distance` 与 `PROFILE_LIMITS`（默认值+取值范围）；`generate()` 只认 `source_json` 等 9 个键；旧 V4 键命中时给出 `V4 合成参数已移除：…` 迁移报错 |
-| `web.py`（新） | 本地网页面板：①信息配置（读写 config.ini、敏感字段掩码、重读按钮）②路线预览（打表回放 / 轨迹合成，任选底图 json + seed，地图按参考轨迹定位）③执行日志（子进程跑 main.py，stdout 实时抓取）；仅绑 127.0.0.1，`--port` 可配，启动自动开浏览器 |
+| `web.py`（新） | 本地网页面板：①信息配置（读写 config.ini、敏感字段掩码、重读按钮）②路线预览（打表回放 / 轨迹合成，任选底图 json + seed，地图按参考轨迹定位）③执行日志（命令由②预览自动生成、只读，dry run 勾选；子进程跑 main.py，stdout 实时抓取）；仅绑 127.0.0.1，`--port` 可配，启动自动开浏览器 |
 | `examples/routes/` | 删除 `v4.json`、`base_v3.geojson` 与 6 份 V4 对比配置；新增 `deform_fch/txl/xc/xc_fence/fch_bold.json`（后两份演示围栏与"更野"参数） |
 | `tests/test_yun_route.py` | 引擎用例换代为 deform（演示基准复现 686 点/3.877km、三种来源等价、profile 越界拒绝、V4 旧键迁移、围栏可选但校验、种子可复现）；main 流程用例保留。全量 211 → **219 项通过** |
 | `docs/ROUTE_GENERATION.md` | 按 deform 重写（参数表、profile 范围表、长度损失 5% 门限的成因、V4 迁移说明） |
@@ -397,3 +416,47 @@ txl 848 / 4.798、xc 728 / 4.117，与演示包逐项零偏差；`distance_m` �
 - 验证：`pytest` **226 项通过**（新增抽签幅度、三向自洽、区间重抽/失败、步频闸门等用例）；
   实测四种子的抽签结果（相对来源）例如 里程 −9.88%/+0.26%/+5.73%/+7.53%、
   配速 +8.16%/+4.88%/+0.70%/−3.42%、步频 −3.95%/−8.04%/+0.12%/+4.62%，全部落在 ±10% 内且每次一行一致。
+
+### 4.8 面板③的命令跟随②的预览（同日第三轮，未提交）
+
+**起因**：核对"②里展示的轨迹，是不是 main.py 真正发送的那条"（含随机种子、底图、方案）。
+
+**结论：几何链路成立，逐点等同。** 合成任务由 `do_generated_route` → `_build_split_body`
+→ `_project_card_point` 上传，而 `_project_card_point` 把 `point` 字符串**原样透传**、
+只保留 APK bean 的 9 个字段（生成行的键与它完全一致，不会被裁剪）。
+实测：②预览 1155 点 / 3.6128 km → dry-run 日志 `[路径生成] 1155 点，3.6128 km，2308 秒`，
+点数与总里程一致，链路走到 `finish`（120 个假请求）。
+差异只在**运行时量**：`runTime` 取实测 elapsed、`runStep = floor(elapsed×步频/60)`、
+`speed` 由实测间隔重算（里程、坐标不变）；若某点里程触及任务上限 `distance_cap_m`，
+会在该线段插值截断末段。
+
+**两处"预览的 ≠ 发送的"隐患，本轮在面板侧解决**：
+
+1. **打表方案无法锁定表**：`-a -t <目录>` 内部是 `do_by_points_map(random_choose=True)`
+   → `random.choice(os.listdir(目录))`，把 `tasks_fch` 交给它就是随机发一张表。
+   面板改为把所选表复制进独占目录 `work_dir/web_send/task_pick/`（逐字节校验内容），
+   日志里的"随机选择：…"必然等于②里选的那张（实测：选 `tasks_txl/tasklist_3.json`
+   → 日志 `随机选择：…\task_pick\tasklist_3.json`）。
+2. **默认 `--dry-run` 演练的是随机表**：现在命令完全由②预览决定，
+   合成方案引用落盘的 `work_dir/web_send/route_cfg.json`（只含预览用到的键），
+   落盘后还会用 CLI 同一入口（`yun_route.generate`）**复算一遍逐点比对**，
+   不一致就拒绝给命令。预览失败（如区间抽不中）会清空地图并撤销命令。
+
+**顺带修掉两处**（都在 `web.py`，与本次需求相邻）：
+① `main()` 用 `__doc__.splitlines()[0]`，文件头 docstring 被整理掉后 `python web.py`
+直接 `AttributeError` 起不来 → 说明文字写死；
+② 子进程 stdout 是管道，Python 按本地代码页（GBK）写、面板按 utf-8 读，日志整片乱码
+→ 子进程加 `PYTHONIOENCODING=utf-8`（只改 stdio，不动 `open()` 默认值）。
+
+**dry run 勾选框**：勾上=给命令追加 `--dry-run`（合成方案还追加
+`--dry-home work_dir/web_send/dry_home_drill.json`——仓库自带的 `dry_run_home.json` 是打表
+夹具：`raDislikes=3`、6~7 km，拿它演练合成轨迹必被拒），取消勾选=真发。
+`-a` 是命令的一部分：面板无法代答控制台的"确认：[y/n]"。
+
+**仍存在的阻塞（未改，属 config/main.py 侧）**：`validate_generated_route` 的步频闸门用
+`config.ini` 的 `cadence_min_offset=30` / `cadence_max_offset=-150` 收缩学校区间，
+判据变成 `raCadenceMin+30 ≤ 合成步频 ≤ raCadenceMax-150`；典型任务区间 120~190 被收缩成
+[150, 40]（空区间），**任何合成轨迹都会被拒**——实测
+`--dry-home examples/routes/dry_home.json --route-config examples/routes/deform_xc.json`
+报 `生成步频不在任务允许范围`。dry-run 用面板夹具（放宽区间）不受影响；真跑前需调小
+`cadence_max_offset` 的收缩量。面板已在②的指标区与③的命令说明里给出该提示。
