@@ -1044,8 +1044,8 @@ class Yun_For_New:
             point['runTime'] = elapsed
             if 'cadence_spm' in task['metadata']:
                 point['runStep'] = math.floor(elapsed*task['metadata']['cadence_spm']/60)
-            # telemetry_task 分支已根据来源步数生成逐点 runStep；网络延迟不会
-            # 虚构额外步数，否则会抹掉原始步频的变化形状。
+            # 步数按任务表元数据的名义步频计算（合成任务 metadata 带 cadence_spm）；
+            # 打表入口的任务自带逐点 runStep，网络延迟不会虚构额外步数。
             point['speed'] = yun_route.client_speed(point['runMileage']-last_mileage, elapsed-last_time)
             point['ts'] = str(int(epoch)+elapsed)
             reached_cap = self._cap_point(point, actual_points[-1] if actual_points else None)
@@ -1514,6 +1514,52 @@ def run_dry(cfg_path: str, task_path: str, args):
     return client  # 供测试/审阅者检查 fake.calls
 
 
+def choose_synthesized_task(input_fn=input, print_fn=print):
+    """交互式合成轨迹菜单：从 examples/routes/ 选一份 --route-config 配置离线生成。
+
+    返回合成任务 dict（交给 do_generated_route）；无配置或用户回车回退时返回 None。
+    配置缺失/非法时打印补齐指引并留在菜单内，不抛异常、不发起任何网络请求。
+    """
+    routes_dir = project_resource("examples/routes")
+    try:
+        cands = sorted(f for f in os.listdir(routes_dir)
+                       if f.endswith(".json") and "dry" not in f.lower())
+    except OSError:
+        cands = []
+    while True:
+        if not cands:
+            print_fn("[无法合成] examples/routes/ 下没有 --route-config 配置文件。")
+            print_fn("[配置补齐] 必需键：source_json（tasklist / GeoJSON / 坐标列表任一来源）、"
+                      "coordinate_system(\"GCJ-02\")；里程与节奏三选：distance_m 精确指定，"
+                      "或 min_distance_m/max_distance_m 区间抽签（总里程、配速、步频各 ±10%，"
+                      "5 次抽不中就报错）；可选 pace_min_km/cadence_spm/sample_seconds/seed/"
+                      "deform_profile/allowed_polygon_geojson。写法见 README 第 3 节与 docs/ROUTE_GENERATION.md。")
+            return None
+        print_fn("可选择的合成配置（examples/routes/，配置内相对路径按该配置文件所在目录解析）：")
+        for i, name in enumerate(cands, 1):
+            print_fn(f"  [{i}] {name}")
+        sel = input_fn("选择配置编号（回车回退到打表模式）：").strip()
+        if not sel:
+            return None
+        if not sel.isdigit() or not 1 <= int(sel) <= len(cands):
+            print_fn("[输入无效] 请输入菜单编号范围内的数字。")
+            continue
+        picked = cands[int(sel) - 1]
+        try:
+            task = yun_route.generate(os.path.join(routes_dir, picked))
+        except Exception as exc:
+            print_fn(f"[配置缺失或非法] {picked}: {exc}")
+            print_fn("[补齐方法] 编辑该 JSON：source_json(任选任务表/GeoJSON/坐标列表)、"
+                     "coordinate_system、里程(distance_m 精确，或 min/max_distance_m 区间)、"
+                     "pace_min_km/cadence_spm(不写则取来源实测值，写则以 cfg 为基准，各自 ±10% 抽签)；"
+                     "跨校区复用需把 source_json 换成目标校区的轨迹，并按需更换 allowed_polygon_geojson 边界。"
+                     "改完重新选择，或退出后用 python main.py --route-config <路径>。")
+            continue
+        rows = (task.get("data") or {}).get("pointsList") or []
+        print_fn(f"[生成成功] {picked}：{len(rows)} 个点（离线生成，未建服务端记录）")
+        return task
+
+
 def main(run=True):
     args = parse_args()
     route_path = getattr(args, 'route_config', None)
@@ -1561,6 +1607,19 @@ def main(run=True):
     Yun = None   # 返修 R3：异常分支需要报告 recordId/最后确认位置（未构造时保持 None）
     try:
         if sure == 'y':
+            legacy_drift_choice = False
+            if args.generated_task is None and not args.auto_run:
+                # 交互式升级：轨迹来源显式三选一（命令行 -a/--route-config 行为不变）
+                print("[提示] 老式漂移（本问题的 y 或命令行 -d）只是对整条轨迹约 0.1 毫米的刚性平移，"
+                      "几何与原轨迹完全重合，易被服务端近重复检测识别，已不推荐。")
+                print("[提示] 不要反复上传同一份任务表/同一底图轨迹：请轮换不同任务文件，或使用合成轨迹。")
+                src = input("轨迹来源：[1]打表原轨迹回放（默认） "
+                            "[2]合成轨迹（基于已有轨迹偏移，仍在测试） "
+                            "[3]打表+老式漂移(弃用)（回车=1）：").strip()
+                if src == '2':
+                    args.generated_task = choose_synthesized_task()
+                elif src == '3':
+                    legacy_drift_choice = True
             if args.generated_task is not None:
                 Yun = Yun_For_New(auto_generate_task=False,
                                   face_runner=build_face_runner(args))
@@ -1585,11 +1644,13 @@ def main(run=True):
                         path = "./tasks_xc"
                     else:
                         path = "./tasks_else"
-                    isDrift = input("是否为数据添加漂移：[y/n]")
-                    if isDrift == 'y':
+                    if legacy_drift_choice:
+                        print("[弃用警告] 你选择了老式漂移：仅 ≈0.1mm 刚性平移，服务端近重复检测下基本无效；"
+                              "需要真实偏移请改用轨迹来源 [2] 合成轨迹。")
                         driftChoice = True
                     else:
-                        driftChoice = False
+                        isDrift = input("是否添加老式漂移（弃用：仅 0.1mm 刚性平移，推荐 n）：[y/n，默认 n]").strip()
+                        driftChoice = (isDrift == 'y')
                     Yun = Yun_For_New(auto_generate_task=False,
                                       face_runner=build_face_runner(args))
                     Yun.start()

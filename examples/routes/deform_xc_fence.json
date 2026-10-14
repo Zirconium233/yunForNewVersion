@@ -1,0 +1,10 @@
+{
+ "coordinate_system": "GCJ-02",
+ "pace_min_km": 6.0,
+ "cadence_spm": 160,
+ "sample_seconds": 2,
+ "seed": 31337,
+ "source_json": "../../tasks_xc/tasklist_4.json",
+ "distance_m": 4000,
+ "allowed_polygon_geojson": "../../examples/routes/fence_xc_40.geojson"
+}

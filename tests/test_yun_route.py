@@ -9,58 +9,182 @@ import yun_route as R
 import yun_http as H
 from test_main_phase_a import CFG, _home, _responder
 
-EXAMPLE = Path(__file__).resolve().parents[1]/'examples/routes/v4.json'
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE = ROOT/'tasks_fch/tasklist_0.json'        # 任意来源皆可：2.2km 任务表
+DEMO_SOURCE = ROOT/'tasks_fch/tasklist_1.json'   # 历史演示包基准来源
 
 
 def config(tmp_path, **updates):
-    cfg = json.loads(EXAMPLE.read_text())
-    cfg['base_geojson'] = str(EXAMPLE.parent/'base_v3.geojson')
+    # 默认关掉三个抽签（偏移 0 + 精确里程），让流程用例可复现；
+    # 抽签行为由 test_rhythm_offsets_* 专门覆盖。
+    cfg = {'source_json': str(SOURCE), 'coordinate_system': 'GCJ-02', 'distance_m': 1000,
+           'pace_min_km': 6.0, 'cadence_spm': 160, 'sample_seconds': 1, 'seed': 31337,
+           'pace_offset_pct': 0, 'cadence_offset_pct': 0, 'length_offset_pct': 0}
     cfg.update(updates)
     path = tmp_path/'route.json'
     path.write_text(json.dumps(cfg), encoding='utf-8')
     return path
 
 
-def test_geometry_and_telemetry_consistency(tmp_path):
+def source_dict():
+    return json.loads(SOURCE.read_text(encoding='utf-8-sig'))
+
+
+def test_deform_task_consistency(tmp_path):
     task = R.generate(config(tmp_path))
+    meta = task['metadata']
+    assert meta['engine'] == 'deform'
+    assert meta['coordinate_system'] == 'GCJ-02'
+    assert meta['seed'] == 31337
+    assert meta['source'] == SOURCE.name
     data = task['data']
     pts = data['pointsList']
-    assert data['duration'] == 756
-    assert len(pts) == 757
-    coords = [tuple(map(float, p['point'].split(','))) for p in pts]
-    measured = sum(R.distance(a, b) for a, b in zip(coords, coords[1:]))
-    assert measured == pytest.approx(data['recordMileage']*1000)
-    assert measured == pytest.approx(2100, rel=0.01)
-    assert pts[-1]['runMileage'] == pytest.approx(measured)
+    assert data['duration'] == 360
+    assert len(pts) == 361
+    assert data['recordMileage'] == pytest.approx(1.0)
+    # 等时间间隔 + 等里程增量：逐点配速恒等于总体配速，间隔与里程/配速自洽。
+    gaps_m = [b['runMileage']-a['runMileage'] for a, b in zip(pts, pts[1:])]
+    gaps_t = [b['runTime']-a['runTime'] for a, b in zip(pts, pts[1:])]
+    assert max(gaps_m)-min(gaps_m) < 1e-6
+    assert set(gaps_t) == {1}
+    assert ({p['speed'] for p in pts[1:]}) == {f"{data['recodePace']:.2f}"}
     assert data['recodePace'] == pytest.approx(data['duration']/60/data['recordMileage'])
+    assert gaps_m[0] == pytest.approx(meta['step_m'], rel=1e-5)
+    assert meta['step_m'] == pytest.approx(1e3/(data['recodePace']*60)*meta['interval_s'], rel=1e-4)
     for a, b in zip(pts, pts[1:]):
         assert b['runTime'] > a['runTime']
         assert b['runMileage'] > a['runMileage']
         assert b['runStep'] >= a['runStep']
-        assert float(b['speed']) == pytest.approx((b['runTime']-a['runTime'])/60/((b['runMileage']-a['runMileage'])/1000), abs=0.0051)
+    assert data['recodeCadence'] == pytest.approx(meta['cadence_spm'], rel=0.01)
     assert R.generate(config(tmp_path)) == task
     assert R.generate(config(tmp_path, seed=123))['data']['pointsList'] != pts
 
 
+def test_deform_matches_demo_scale():
+    """历史演示包复现基准（GPT 复现包 verify_demo 的 fch 行）：686 点 / 3.877km。
+
+    这条断言把"演示包视觉尺度"钉死在回归里：改动 DEMO_PROFILE 默认值或形变算法
+    都会让它失败，必须是有意为之。
+    """
+    out = R.deform_geometry(R.load_points(DEMO_SOURCE), seed=31337)
+    gaps = [R.distance(a, b) for a, b in zip(out, out[1:])]
+    assert len(out) == 686
+    assert sum(gaps)/1000 == pytest.approx(3.877, abs=0.01)
+    assert sum(gaps)/len(gaps) == pytest.approx(5.66, abs=0.3)   # 5.5m 等弧长重采样
+
+
 @pytest.mark.parametrize('updates', [
-    {'distance_m': 3000}, {'start_trim': 450}, {'end_trim': 460},
-    {'pace_min_km': float('nan')}, {'cadence_spm': True}, {'sample_seconds': 0},
-    {'coordinate_system': 'guess'}, {'lane_change_choices_m': []},
-    {'detour_enabled': 'false'}, {'lane_change_indices': [2, 2]},
-    {'unexpected_option': 1}, {'seed': 2.5},
+    {'distance_m': 50000}, {'pace_min_km': float('nan')}, {'cadence_spm': True},
+    {'sample_seconds': 0}, {'coordinate_system': 'guess'}, {'unexpected_option': 1},
+    {'seed': 2.5}, {'source_json': None}, {'allowed_polygon_geojson': 123},
+    {'deform_profile': 'x'}, {'deform_profile': {'spacing_m': 0}},
+    {'deform_profile': {'nope': 1}}, {'pace_offset_pct': 0.9}, {'length_offset_pct': -1},
+    {'min_distance_m': 3000, 'max_distance_m': 2000}, {'distance_m': 5000, 'max_distance_m': 4000},
 ])
 def test_invalid_config_fails(tmp_path, updates):
     with pytest.raises(ValueError):
         R.generate(config(tmp_path, **updates))
 
 
-def test_v4_geometry_matches_supplied_result(tmp_path):
-    # 原 V4 固定种子/裁剪/绕行应能复现；终点修复允许额外保留原末点。
-    cfg = json.loads(config(tmp_path, start_trim=27, end_trim=41, detour_enabled=True, lane_transition_points=1).read_text())
-    base = json.loads((EXAMPLE.parent/'base_v3.geojson').read_text())['features'][0]['geometry']['coordinates']
-    points = R.geometry(R.coordinates(base), cfg)
-    assert points[0] == pytest.approx([117.20617893, 31.77463768], abs=1e-8)
-    assert sum(R.distance(a, b) for a, b in zip(points, points[1:])) == pytest.approx(1878.045, abs=0.1)
+def test_rhythm_offsets_within_ten_percent_and_consistent(tmp_path):
+    """三个参数各自 ±10% 抽签，且每点配速/间隔与总体值自洽（不是逐点乱偏）。"""
+    _, metrics = R.load_source(SOURCE)
+    lengths = set()
+    for seed in (31337, 31338, 31339):
+        cfg = {'source_json': str(SOURCE), 'coordinate_system': 'GCJ-02', 'sample_seconds': 2, 'seed': seed}
+        task = R.generate_cfg(cfg, Path('.'))
+        meta, data = task['metadata'], task['data']
+        pts = data['pointsList']
+        lengths.add(round(data['recordMileage'], 3))
+        assert abs(data['recordMileage']*1000/metrics['length_m']-1) <= 0.10
+        assert abs(meta['pace_min_km']/metrics['pace_min_km']-1) <= 0.10
+        assert abs(meta['cadence_spm']/meta['source_cadence_spm']-1) <= 0.10 if meta['source_cadence_spm'] else True
+        gaps_m = [b['runMileage']-a['runMileage'] for a, b in zip(pts, pts[1:])]
+        gaps_t = {b['runTime']-a['runTime'] for a, b in zip(pts, pts[1:])}
+        assert max(gaps_m)-min(gaps_m) < 1e-6 and gaps_t == {2}
+        assert {p['speed'] for p in pts[1:]} == {f"{data['recodePace']:.2f}"}
+        assert gaps_m[0] == pytest.approx(meta['step_m'], rel=1e-5)   # 间隔 ↔ 里程 ↔ 配速 三向自洽
+        assert meta['interval_s']*1e3/(data['recodePace']*60) == pytest.approx(meta['step_m'], rel=1e-4)
+        assert 1 <= meta['attempt'] <= R.MAX_ATTEMPTS
+    assert len(lengths) > 1, '总里程应当随种子在 ±10% 内变化'
+
+
+def test_distance_window_retry_then_failure(tmp_path):
+    """里程区间：区间内抽中即用；抽不中换种子重抽，5 次失败后如实报错。"""
+    _, metrics = R.load_source(SOURCE)
+    base = metrics['length_m']
+    cfg = {'source_json': str(SOURCE), 'coordinate_system': 'GCJ-02', 'sample_seconds': 2,
+           'seed': 31337, 'min_distance_m': base*0.8, 'max_distance_m': base*1.2}
+    task = R.generate_cfg(cfg, Path('.'))
+    assert 1 <= task['metadata']['attempt'] <= R.MAX_ATTEMPTS
+    assert base*0.8 <= task['data']['recordMileage']*1000 <= base*1.2
+    with pytest.raises(ValueError, match='重抽'):
+        R.generate_cfg(dict(cfg, min_distance_m=base*3, max_distance_m=base*3.1), Path('.'))
+    with pytest.raises(ValueError, match='不在给定里程区间'):
+        R.generate_cfg(dict(cfg, distance_m=100, min_distance_m=base*0.9,
+                            max_distance_m=base*1.1), Path('.'))
+
+
+def test_source_cadence_gate_ignores_implausible_field():
+    """fch 表的 runStep 约 489 spm（来源字段异常）→ 不采信，退回名义步频。"""
+    _, fch = R.load_source(ROOT/'tasks_fch/tasklist_1.json')
+    _, xc = R.load_source(ROOT/'tasks_xc/tasklist_4.json')
+    assert fch['cadence_spm'] is None and fch['pace_min_km'] is not None
+    assert 110 <= xc['cadence_spm'] <= 220
+    task = R.generate_cfg({'source_json': str(ROOT/'tasks_fch/tasklist_1.json'),
+                           'coordinate_system': 'GCJ-02', 'cadence_spm': 160,
+                           'distance_m': 1500, 'seed': 5}, Path('.'))
+    meta = task['metadata']
+    assert meta['source_cadence_spm'] is None
+    assert abs(meta['cadence_spm']/160-1) <= 0.10
+
+
+@pytest.mark.parametrize('legacy', [
+    {'base_geojson': 'base.geojson'}, {'base_task': 'task.json'}, {'max_offset_m': 10},
+    {'lane_change_indices': [90]}, {'detour_enabled': True}, {'telemetry_task': 't.json'},
+    {'start_trim': 10}, {'mode': 'deform'},
+])
+def test_legacy_v4_keys_rejected(tmp_path, legacy):
+    """V4 已移除：旧 cfg 必须得到明确的迁移报错，而不是含糊的未知键。"""
+    with pytest.raises(ValueError, match='V4 合成参数已移除'):
+        R.generate(config(tmp_path, **legacy))
+
+
+def test_source_formats_all_accepted(tmp_path):
+    """tasklist / GeoJSON / 裸坐标列表三种来源等价（同一批点 -> 同一结果）。"""
+    rows = source_dict()['data']['pointsList']
+    coords = [[float(x) for x in r['point'].split(',')] for r in rows]
+    (tmp_path/'as_task.json').write_text(json.dumps(source_dict()), encoding='utf-8')
+    (tmp_path/'as_geo.json').write_text(json.dumps({
+        'type': 'FeatureCollection', 'features': [{'type': 'Feature', 'properties': {},
+         'geometry': {'type': 'LineString', 'coordinates': coords}}]}), encoding='utf-8')
+    (tmp_path/'as_list.json').write_text(json.dumps(coords), encoding='utf-8')
+    tasks = [R.generate(config(tmp_path, source_json=name))
+             for name in ('as_task.json', 'as_geo.json', 'as_list.json')]
+    assert all(t['data']['pointsList'] == tasks[0]['data']['pointsList'] for t in tasks)
+    assert tasks[0]['metadata']['source'] == 'as_task.json'
+    assert tasks[0]['data']['recordMileage'] == pytest.approx(1, rel=0.05)
+
+
+def test_polygon_is_optional_but_validated(tmp_path):
+    route = R.deform_geometry(R.load_points(SOURCE), seed=31337)
+    lons = [p[0] for p in route]
+    lats = [p[1] for p in route]
+    assert R.generate(config(tmp_path))['data']['recordMileage'] > 0      # 不给围栏：允许
+    tiny = {'type': 'Polygon', 'coordinates': [[
+        [lons[0]-0.00005, lats[0]-0.00005], [lons[0]+0.00005, lats[0]-0.00005],
+        [lons[0]+0.00005, lats[0]+0.00005], [lons[0]-0.00005, lats[0]+0.00005],
+        [lons[0]-0.00005, lats[0]-0.00005]]]}
+    (tmp_path/'tiny.geojson').write_text(json.dumps(tiny), encoding='utf-8')
+    with pytest.raises(ValueError, match='超出'):
+        R.generate(config(tmp_path, allowed_polygon_geojson='tiny.geojson'))
+    broad = {'type': 'Polygon', 'coordinates': [[
+        [min(lons)-0.001, min(lats)-0.001], [max(lons)+0.001, min(lats)-0.001],
+        [max(lons)+0.001, max(lats)+0.001], [min(lons)-0.001, max(lats)+0.001],
+        [min(lons)-0.001, min(lats)-0.001]]]}
+    (tmp_path/'broad.geojson').write_text(json.dumps(broad), encoding='utf-8')
+    task = R.generate(config(tmp_path, allowed_polygon_geojson='broad.geojson'))
+    assert task['data']['recordMileage'] > 0.9
 
 
 def client_and_run(responder=_responder, home=None):
@@ -238,46 +362,6 @@ def test_map_point_timestamps_follow_run_time(tmp_path):
     assert run.task_map['data']['duration'] >= recorded[-1]['runTime']
 
 
-def test_telemetry_source_preserves_shape_and_recalculates_speed(tmp_path):
-    source = {'data': {'pointsList': [
-        {'runMileage': i*4.2, 'runTime': i + i//3,
-         'runStep': i*3 + i//8} for i in range(501)]}}
-    (tmp_path/'source.json').write_text(json.dumps(source), encoding='utf-8')
-    path = config(tmp_path, telemetry_task='source.json', telemetry_variation=0.08)
-    a = R.generate(path)
-    b = R.generate(path)
-    assert a == b
-    points = a['data']['pointsList']
-    assert len(points) == 501
-    assert a['data']['duration'] >= 600
-    assert points[-1]['runStep'] == source['data']['pointsList'][-1]['runStep']
-    assert any((points[i+1]['runTime']-points[i]['runTime']) !=
-               (source['data']['pointsList'][i+1]['runTime']-source['data']['pointsList'][i]['runTime'])
-               for i in range(500))
-    assert all(b['runMileage'] > a['runMileage'] and b['runTime'] > a['runTime']
-               for a, b in zip(points, points[1:]))
-    assert points[-1]['runMileage'] == pytest.approx(2100, rel=0.01)
-
-
-def test_large_offset_requires_polygon_and_checks_segments(tmp_path):
-    with pytest.raises(ValueError, match='allowed_polygon'):
-        R.generate(config(tmp_path, max_offset_m=10))
-    small = {'type': 'Polygon', 'coordinates': [[[117.205,31.773],
-              [117.2051,31.773], [117.2051,31.7731], [117.205,31.7731],
-              [117.205,31.773]]]}
-    (tmp_path/'small.geojson').write_text(json.dumps(small), encoding='utf-8')
-    with pytest.raises(ValueError, match='超出'):
-        R.generate(config(tmp_path, max_offset_m=10,
-                          allowed_polygon_geojson='small.geojson'))
-    broad = {'type': 'Polygon', 'coordinates': [[[117.2055,31.773],
-              [117.207,31.773], [117.207,31.775], [117.2055,31.775],
-              [117.2055,31.773]]]}
-    (tmp_path/'broad.geojson').write_text(json.dumps(broad), encoding='utf-8')
-    task = R.generate(config(tmp_path, max_offset_m=10,
-                             allowed_polygon_geojson='broad.geojson'))
-    assert task['data']['recordMileage'] > 2
-
-
 def test_auto_seed_recorded_and_changes_geometry(tmp_path):
     path = config(tmp_path, seed='auto')
     a, b = R.generate(path), R.generate(path)
@@ -285,25 +369,13 @@ def test_auto_seed_recorded_and_changes_geometry(tmp_path):
     assert a['data']['pointsList'] != b['data']['pointsList']
 
 
-def test_existing_task_can_supply_geometry_and_telemetry(tmp_path):
-    source = R.generate(config(tmp_path))
-    (tmp_path/'source.task.json').write_text(json.dumps(source), encoding='utf-8')
-    path = config(tmp_path, base_geojson=None, base_task='source.task.json',
-                  distance_m=2000, seed=42.0)
-    produced = R.generate(path)
-    assert type(produced['metadata']['seed']) is int
-    assert produced['metadata']['seed'] == 42
-    assert produced['metadata']['mode'] == 'geometry_v4_telemetry'
-    assert produced['metadata']['telemetry_source'] == 'source.task.json'
-    assert produced['data']['recordMileage'] == pytest.approx(2, rel=0.01)
-    assert len(produced['data']['pointsList']) == len(source['data']['pointsList'])
-    _, fake, run = client_and_run()
-    run.start()
-    run.do_generated_route(produced)
-    assert run.task_map['data']['pointsList'][-1]['runStep'] == \
-        produced['data']['pointsList'][-1]['runStep']
-    run.finish_by_points_map()
-    assert fake.calls[-1]['router'] == '/run/finish'
+def test_deform_profile_override_changes_geometry_only_within_limits(tmp_path):
+    base = R.generate(config(tmp_path))['data']['pointsList']
+    bold = R.generate(config(tmp_path, deform_profile={'jump_sigma_m': 20.0,
+                      'length_gain_pct': 0.06}))['data']['pointsList']
+    assert bold != base
+    assert R.generate(config(tmp_path, deform_profile={'spacing_m': 8.0}))['metadata'][
+        'geometry_spacing_m'] == 8.0
 
 
 @pytest.mark.parametrize('cap', [float('nan'), float('inf'), 0, -1])
