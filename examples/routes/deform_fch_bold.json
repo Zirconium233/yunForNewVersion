@@ -1,0 +1,14 @@
+{
+ "coordinate_system": "GCJ-02",
+ "pace_min_km": 6.0,
+ "cadence_spm": 160,
+ "sample_seconds": 2,
+ "seed": 9001,
+ "source_json": "../../tasks_fch/tasklist_1.json",
+ "distance_m": 3800,
+ "deform_profile": {
+  "jump_sigma_m": 20.0,
+  "lane_sigma_m": 4.0,
+  "length_gain_pct": 0.06
+ }
+}

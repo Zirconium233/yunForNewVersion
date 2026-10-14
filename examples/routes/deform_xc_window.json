@@ -1,0 +1,13 @@
+{
+ "coordinate_system": "GCJ-02",
+ "pace_min_km": 6.0,
+ "cadence_spm": 160,
+ "sample_seconds": 2,
+ "seed": 31337,
+ "source_json": "../../tasks_xc/tasklist_4.json",
+ "min_distance_m": 3700,
+ "max_distance_m": 4300,
+ "pace_offset_pct": 0.1,
+ "cadence_offset_pct": 0.1,
+ "length_offset_pct": 0.1
+}
