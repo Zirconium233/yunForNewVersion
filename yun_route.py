@@ -333,6 +333,69 @@ def deform_geometry(source_points, *, seed=31337, profile=None):
     return deform_points(points, seed=int(seed), profile=merged)
 
 
+# 速度调制因子的硬边界：低于/高于此范围的瞬时速度不像人在跑。
+FACTOR_MIN = 0.65
+FACTOR_MAX = 1.5
+
+
+def _bounded_normalize(raw, lo, hi, total):
+    """把 raw 缩放到 sum=total，并严格满足每一项 ∈ [lo, hi]。
+
+    交替投影：先把越界项钉在边界，再把剩余差额均摊给未触界项，直到
+    两项约束同时成立。要求 n*lo <= total <= n*hi，否则无解直接报错。
+
+    这样才真正满足声明的边界——单纯"先限幅再除以均值"会在归一化后
+    重新越界（例如 [0.65, 1.5, 1.5] 归一化后最小值变成 0.534）。
+    """
+    n = len(raw)
+    if n == 0:
+        return []
+    if total < n*lo - 1e-9 or total > n*hi + 1e-9:
+        raise ValueError(
+            f"目标总量 {total:.6f} 不在 [{n*lo:.6f}, {n*hi:.6f}] 内，"
+            f"无法同时满足逐项边界 [{lo}, {hi}]")
+    s = sum(raw)
+    values = [x*total/s for x in raw] if s > 0 else [total/n]*n
+    for _ in range(64):
+        clamped = [min(hi, max(lo, x)) for x in values]
+        diff = total - sum(clamped)
+        if abs(diff) <= 1e-12:
+            return clamped
+        free = [i for i in range(n) if lo < clamped[i] < hi]
+        if not free:
+            # 总量可行时不应发生；保守返回已落在边界内的结果
+            return clamped
+        share = diff/len(free)
+        values = list(clamped)
+        for i in free:
+            values[i] = clamped[i] + share
+    return [min(hi, max(lo, x)) for x in values]
+
+
+def speed_factors(rng, n, variability):
+    """逐段速度调制因子：对数正态 OU 过程，均值恰为 1，逐项 ∈ [0.65, 1.5]。
+
+    仅当 pace_variability > 0 时使用（默认关闭）。按点序推进而非按弧长，
+    因为要打散的是"时间维度的节奏起伏"，与几何形状无关。
+    相关长度取全程 15%，使波动呈低频块状，而不是逐点白噪声。
+
+    边界由 _bounded_normalize 在归一化之后施加，所以 sum 恰为 n（均值 1）
+    与逐项范围同时成立，不依赖分布本身的偶然性。
+    """
+    if variability <= 0 or n <= 0:
+        return [1.0] * n
+    tau = max(1.0, n * 0.15)
+    lo_log, hi_log = math.log(FACTOR_MIN), math.log(FACTOR_MAX)
+    x = 0.0
+    raw = []
+    for _ in range(n):
+        phi = math.exp(-1.0 / tau)
+        x = phi * x + rng.gauss(0.0, variability * math.sqrt(max(0.0, 1.0 - phi * phi)))
+        x = max(lo_log, min(hi_log, x))
+        raw.append(math.exp(x))
+    return _bounded_normalize(raw, FACTOR_MIN, FACTOR_MAX, float(n))
+
+
 def cumulative(points):
     result = [0.0]
     for a, b in zip(points, points[1:]):
@@ -448,9 +511,16 @@ def inside(point, ring):
     return result
 
 
-def validate_polygon_route(route, ring):
-    # 以线段与全部边界的交点切分，再检查每段中点；狭窄凹口不会被采样跳过。
+def validate_polygon_route(route, ring, tolerance_pct=0.0):
+    """以线段与全部边界的交点切分，再检查每段中点；狭窄凹口不会被采样跳过。
+
+    tolerance_pct > 0 时允许给定比例的采样点落在区域外。真人轨迹的进场/离场
+    段与贴边时的定位抖动本来就会踩出边界（实测历史任务表有 1%~8% 的点在外，
+    服务端仍判合格），本地 0 容差会把可用的源轨迹全部拒掉。默认 0 保持原行为。
+    """
     edges = list(zip(ring, ring[1:]+ring[:1]))
+    total = 0
+    outside = 0
     for a, b in zip(route, route[1:]):
         cuts = [0.0, 1.0]
         for c, d in edges:
@@ -458,14 +528,23 @@ def validate_polygon_route(route, ring):
         cuts = sorted(set(cuts))
         for f in cuts[:1]+[(x+y)/2 for x, y in zip(cuts, cuts[1:])]+cuts[-1:]:
             p = (a[0]+(b[0]-a[0])*f, a[1]+(b[1]-a[1])*f)
+            total += 1
             if not inside(p, ring):
-                raise ValueError('生成路线有点或线段超出配置的可跑区域')
+                outside += 1
+    if not outside or not total:
+        return
+    ratio = outside/total
+    if ratio > tolerance_pct + 1e-12:
+        raise ValueError(
+            f'生成路线有点或线段超出配置的可跑区域'
+            f'（{outside}/{total} 个采样点越界 = {ratio*100:.1f}%，'
+            f'容差 {tolerance_pct*100:.1f}%）')
 
 
-def validate_output_polygon(data, ring):
+def validate_output_polygon(data, ring, tolerance_pct=0.0):
     if ring is not None:
         points = [tuple(map(float, p['point'].split(','))) for p in data['pointsList']]
-        validate_polygon_route(points, ring)
+        validate_polygon_route(points, ring, tolerance_pct)
 
 
 # ---------------------------------------------------------------- 生成入口
@@ -503,7 +582,13 @@ def generate_cfg(cfg, base_dir):
     allowed = {"source_json", "coordinate_system", "distance_m", "pace_min_km", "cadence_spm",
                "sample_seconds", "seed", "allowed_polygon_geojson", "deform_profile",
                "min_distance_m", "max_distance_m", "pace_offset_pct", "cadence_offset_pct",
-               "length_offset_pct"}
+               "length_offset_pct",
+               # 以下两项默认关闭，开启后改变输出契约，见 generate_cfg docstring
+               "pace_variability", "auto_fit_deform",
+               # 围栏容差（默认 0 = 原严格行为）与自适应幅度的上限
+               "fence_tolerance_pct", "deform_scale_max",
+               # 出界是否报错：false 时完全跳过围栏校验
+               "fence_strict"}
     if cfg.keys()-allowed:
         raise ValueError(f"未知路线配置项：{sorted(cfg.keys()-allowed)}")
     if cfg.get("coordinate_system") not in ("GCJ-02", "WGS84"):
@@ -527,6 +612,26 @@ def generate_cfg(cfg, base_dir):
     pace_offset = number(cfg, "pace_offset_pct", 0.10, 0, 0.5)
     cadence_offset = number(cfg, "cadence_offset_pct", 0.10, 0, 0.5)
     length_offset = number(cfg, "length_offset_pct", 0.10, 0, 0.5)
+    # 默认 0：保持"等时间+等里程"的匀速契约（tests/test_yun_route.py 钉死）。
+    # 开启后按低频 OU 调制逐段速度，总里程与总时长不变，仅打散"机器匀速"特征。
+    variability = number(cfg, "pace_variability", 0.0, 0, 0.6)
+    # 默认 False：越界仍按原行为报错。开启后按固定比例收敛形变幅度重试。
+    # 严格校验类型：bool("false") 与 bool("0") 都是 True，配置写错会静默生效。
+    raw_auto_fit = cfg.get("auto_fit_deform", False)
+    if not isinstance(raw_auto_fit, bool):
+        raise ValueError(
+            f"auto_fit_deform 必须是 JSON 布尔值 true/false，收到 {raw_auto_fit!r}")
+    auto_fit = raw_auto_fit
+    # 围栏容差：允许给定比例的采样点落在可跑区域外。真人轨迹的进场/离场段
+    # 与贴边抖动本就会踩出去，服务端也接受，本地 0 容差会把可用源全部拒掉。
+    tolerance = number(cfg, "fence_tolerance_pct", 0.0, 0.0, 0.3)
+    # 出界是否报错：false 时完全不校验围栏，轨迹可能踩出边界但也照常生成。
+    fence_strict = cfg.get("fence_strict", True)
+    if not isinstance(fence_strict, bool):
+        raise ValueError(
+            f"fence_strict 必须是 JSON 布尔值 true/false，收到 {fence_strict!r}")
+    # 自适应幅度的上限：>1 时先试放大幅度（与原轨迹差异更大），再逐步缩小。
+    scale_max = number(cfg, "deform_scale_max", 1.0, 0.5, 2.0)
     exact = cfg.get("distance_m")
     if exact is not None:
         exact = number(cfg, "distance_m", 0, 10, 50000)
@@ -559,52 +664,107 @@ def generate_cfg(cfg, base_dir):
         # 长度靠形变自己的长度校准（length_gain_pct）实现：要变长就把校准抬到
         # factor-1（+1% 余量保证可用长度足够），要变短则保持校准并截断尾部。
         gain = min(0.5, max(0.0, factor-1.0) + (0.01 if factor > 1.0 else 0.0))
-        profile_k = dict(profile, length_gain_pct=gain)
-        route = deform_points(points, seed, profile_k)
-        lengths = cumulative(route)
-        if target > lengths[-1]:
-            last = f"目标 {target:.1f} 米超过生成几何可用长度 {lengths[-1]:.1f} 米（形变后可用长度）"
-            continue
         if low is not None and target < low:
             last = f"抽到总里程 {target:.1f} 米低于下限 {low:.0f} 米"
             continue
         if high is not None and target > high:
             last = f"抽到总里程 {target:.1f} 米高于上限 {high:.0f} 米"
             continue
-        # 等时间间隔 + 等里程增量：三个参数互相自洽（见函数 docstring）
+        # 等时间间隔 + 等里程增量：三个参数互相自洽（见函数 docstring）。
+        # pace_variability > 0 时改用低频调制，总里程与总时长保持不变。
         n = max(1, int(round(target/(interval*1000.0/(pace*60.0)))))
         step_m = target/n
         duration = n*interval
-        mileage = [i*step_m for i in range(n+1)]      # 等增量，不做逐点舍入
-        sampled = [position_at(route, lengths, m) for m in mileage]
-        if ring is not None:
-            validate_polygon_route(sampled, ring)
+        if variability > 0:
+            # 只改每段里程、时间保持等间隔：速度 = Δm/Δt 直接等于调制因子，
+            # 不会被平方放大；runTime 仍严格等差，与默认路径同一个时间轴契约。
+            factors = speed_factors(rng, n, variability)
+            raw_m = [step_m*f for f in factors]
+            k_m = target/sum(raw_m)
+            mileage = [0.0]
+            for d in raw_m:
+                mileage.append(mileage[-1]+d*k_m)
+        else:
+            mileage = [i*step_m for i in range(n+1)]      # 等增量，不做逐点舍入
+        times = list(range(0, duration+1, interval))
+        # 形变：auto_fit_deform 开启时按固定比例序列收敛幅度，越界就缩一档重试。
+        # 比例序列是常量，同 seed + 同显式参数仍可复现。
+        # 形变：auto_fit_deform 开启时按比例序列搜索幅度，越界就换下一档。
+        # 从 deform_scale_max 往下试，第一个满足容差的就是"最大可行幅度"——
+        # 幅度越大，轨迹与原轨迹的差异越大，重复度越低。
+        if auto_fit:
+            candidates = (scale_max, 1.25, 1.0, 0.85, 0.72, 0.6, 0.5, 0.37, 0.26, 0.18, 0.13)
+            scales = tuple(sorted({s for s in candidates if s <= scale_max + 1e-9},
+                                  reverse=True))
+        else:
+            scales = (1.0,)
+        route = lengths = sampled = None
+        used_scale = 1.0
+        for ds in scales:
+            profile_k = dict(profile, length_gain_pct=gain)
+            if ds != 1.0:
+                for key in ("lane_sigma_m", "max_lane_m", "drift_sigma_m", "jump_sigma_m"):
+                    if key in profile_k:
+                        profile_k[key] = profile_k[key]*ds
+            cand = deform_points(points, seed, profile_k)
+            ln = cumulative(cand)
+            if target > ln[-1]:
+                last = f"目标 {target:.1f} 米超过生成几何可用长度 {ln[-1]:.1f} 米（形变后可用长度）"
+                continue
+            m_ = [position_at(cand, ln, m) for m in mileage]
+            if ring is not None and fence_strict:
+                try:
+                    validate_polygon_route(m_, ring, tolerance)
+                except ValueError as exc:
+                    # 默认路径保持原文案（tests/test_yun_route.py 匹配"超出"）
+                    last = (f"目标 {target:.1f} 米、形变幅度 x{ds:.2f} 时仍超出可跑区域（{exc}）"
+                            if auto_fit else
+                            "生成路线有点或线段超出配置的可跑区域")
+                    continue
+            route, lengths, sampled, used_scale = cand, ln, m_, ds
+            break
+        if sampled is None:
+            continue
         effective_pace = duration/60.0/(target/1000.0)
         speed_text = client_speed(step_m, interval)
         rows = []
-        for i, (t, p, m) in enumerate(zip(range(0, duration+1, interval), sampled, mileage)):
+        for i, (t, p, m) in enumerate(zip(times, sampled, mileage)):
+            if i == 0:
+                sp = '0.0'
+            elif variability > 0:
+                sp = client_speed(m-mileage[i-1], t-times[i-1])
+            else:
+                sp = speed_text
             rows.append({"point": f"{p[0]:.8f},{p[1]:.8f}", "runMileage": m,
                          "runTime": t, "runStep": round(t*cadence/60),
-                         "speed": speed_text if i else '0.0', "runStatus": "1",
+                         "speed": sp, "runStatus": "1",
                          "isFence": "Y", "isMock": False, "ts": "0"})
         data = {"pointsList": rows, "duration": duration, "recordMileage": target/1000,
                 "recodeCadence": rows[-1]["runStep"]*60/duration,
                 "recodePace": effective_pace,
                 "recodeDislikes": 0, "manageList": []}
-        validate_output_polygon(data, ring)
+        if fence_strict:
+            validate_output_polygon(data, ring, tolerance)
         chord_m = cumulative(sampled)[-1]
-        return {"code": 200, "metadata": {
-            "synthetic": True, "engine": "deform", "coordinate_system": cfg["coordinate_system"],
-            "seed": seed, "source": source_path.name,
-            "source_length_m": round(metrics["length_m"], 3),
-            "source_pace_min_km": None if metrics["pace_min_km"] is None else round(metrics["pace_min_km"], 3),
-            "source_cadence_spm": None if metrics["cadence_spm"] is None else round(metrics["cadence_spm"], 3),
-            "pace_min_km": round(effective_pace, 3), "cadence_spm": cadence,
-            "interval_s": interval, "step_m": round(step_m, 6), "target_m": target,
-            "geometry_chord_m": round(chord_m, 3), "attempt": attempt, "attempts_limit": MAX_ATTEMPTS,
-            "distance_window_m": [low, high] if (low is not None or high is not None) else None,
-            "geometry_spacing_m": profile["spacing_m"], "deform_profile": profile,
-            "server_verified": False}, "data": data}
+        meta = {"synthetic": True, "engine": "deform",
+                "coordinate_system": cfg["coordinate_system"],
+                "seed": seed, "source": source_path.name,
+                "source_length_m": round(metrics["length_m"], 3),
+                "source_pace_min_km": None if metrics["pace_min_km"] is None else round(metrics["pace_min_km"], 3),
+                "source_cadence_spm": None if metrics["cadence_spm"] is None else round(metrics["cadence_spm"], 3),
+                "pace_min_km": round(effective_pace, 3), "cadence_spm": cadence,
+                "interval_s": interval, "step_m": round(step_m, 6), "target_m": target,
+                "geometry_chord_m": round(chord_m, 3), "attempt": attempt,
+                "attempts_limit": MAX_ATTEMPTS,
+                "distance_window_m": [low, high] if (low is not None or high is not None) else None,
+                "geometry_spacing_m": profile["spacing_m"], "deform_profile": profile,
+                "server_verified": False}
+        # 只有真正启用了新行为才追加新键：默认配置的 metadata 与改动前一致。
+        if used_scale != 1.0:
+            meta["deform_scale"] = used_scale
+        if variability > 0:
+            meta["pace_variability"] = variability
+        return {"code": 200, "metadata": meta, "data": data}
     if attempts == 1:
         raise ValueError(last or "目标里程无法生成")
     span = metrics["length_m"]*length_offset

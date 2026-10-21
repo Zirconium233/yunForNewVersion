@@ -10,6 +10,7 @@ import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -50,6 +51,16 @@ def list_geojsons():
         return []
     return sorted(f for f in os.listdir(ROUTES_DIR)
                   if f.endswith(".geojson") and not f.lower().startswith("fence"))
+
+
+def list_fences():
+    """可作可跑区域（单环 Polygon）的 GeoJSON：examples/routes/ 全部 + 仓库根目录。"""
+    out = []
+    if os.path.isdir(ROUTES_DIR):
+        out.extend(f"examples/routes/{f}" for f in sorted(os.listdir(ROUTES_DIR))
+                   if f.endswith(".geojson"))
+    out.extend(f for f in sorted(os.listdir(BASE_DIR)) if f.endswith(".geojson"))
+    return out
 
 
 def list_sources():
@@ -224,28 +235,88 @@ def build_preview(qs):
             return {"error": "seed / 采样间隔必须是整数"}
         cfg = {"source_json": src_path, "coordinate_system": "GCJ-02",
                "seed": seed, "sample_seconds": interval}
-        for key, qk, label in (("min_distance_m", "min", "最短里程"), ("max_distance_m", "max", "最长里程")):
-            raw = (qs.get(qk) or [""])[0].strip()
-            if raw:
-                try:
-                    cfg[key] = float(raw)
-                except ValueError:
-                    return {"error": f"{label}必须是数字（留空=不限制）"}
+        # 速度起伏（默认关闭）：>0 时按低频 OU 调制逐段里程，总里程与总时长不变。
+        # 上限 0.6 与 yun_route 的 number() 校验保持一致，越界由后端报错。
+        raw_var = (qs.get("variability") or [""])[0].strip()
+        if raw_var:
+            try:
+                cfg["pace_variability"] = float(raw_var)
+            except ValueError:
+                return {"error": "速度起伏必须是数字（0~0.6，留空=关闭）"}
+        # 形变自适应（默认关闭）：围栏越界时按固定比例收敛幅度重试。
+        if (qs.get("autofit") or [""])[0].strip() in ("1", "true", "on"):
+            cfg["auto_fit_deform"] = True
+        # 可跑区域（可选）：没有它就没有"越界"可言，auto_fit_deform 不会触发。
+        poly = (qs.get("poly") or [""])[0].strip()
+        if poly:
+            poly_path = poly if os.path.isabs(poly) else os.path.join(BASE_DIR, poly)
+            if not os.path.exists(poly_path):
+                return {"error": "围栏文件不存在：" + poly}
+            cfg["allowed_polygon_geojson"] = poly_path
+        # 围栏容差与形变幅度上限（高级项）
+        raw_tol = (qs.get("tol") or [""])[0].strip()
+        if raw_tol:
+            try:
+                pct = float(raw_tol)
+            except ValueError:
+                return {"error": "围栏容差必须是数字（百分比，如 12 表示 12%）"}
+            # 兼容两种写法：12 → 0.12，0.12 → 0.12
+            cfg["fence_tolerance_pct"] = pct/100.0 if pct > 1 else pct
+        raw_sm = (qs.get("scalemax") or [""])[0].strip()
+        if raw_sm:
+            try:
+                cfg["deform_scale_max"] = float(raw_sm)
+            except ValueError:
+                return {"error": "形变幅度上限必须是数字（1.0~2.0）"}
+        # 出界是否报错：勾选「忽略越界」时完全不校验围栏
+        if (qs.get("nostrict") or [""])[0].strip() in ("1", "true", "on"):
+            cfg["fence_strict"] = False
+        # 精确里程：填了就绕过 ±10% 抽签，直接用 distance_m。
+        # 与 min/max 互斥（generate_cfg 要求 distance_m 落在给定区间内，
+        # 同时给两者只会自相矛盾），所以有 exact 时忽略 min/max。
+        raw_exact = (qs.get("exact") or [""])[0].strip()
+        if raw_exact:
+            try:
+                cfg["distance_m"] = float(raw_exact)
+            except ValueError:
+                return {"error": "精确里程必须是数字（留空=按区间/抽签）"}
+        else:
+            for key, qk, label in (("min_distance_m", "min", "最短里程"), ("max_distance_m", "max", "最长里程")):
+                raw = (qs.get(qk) or [""])[0].strip()
+                if raw:
+                    try:
+                        cfg[key] = float(raw)
+                    except ValueError:
+                        return {"error": f"{label}必须是数字（留空=不限制）"}
         try:
-            task = yun_route.generate_cfg(cfg, BASE_DIR)
+            # generate_cfg 内部用 base_dir/polygon_path 拼路径，必须传 Path：
+            # BASE_DIR 是字符串，直接传会让带围栏的预览报 str / str。
+            task = yun_route.generate_cfg(cfg, Path(BASE_DIR))
         except ValueError as exc:
             return {"error": str(exc), "window_hint": "可放宽最短/最长里程，或改 seed 重抽"}
         md, data = task["metadata"], task["data"]
         points, ref_metrics = yun_route.load_source(src_path)
         rows = data["pointsList"]
+        # 围栏多边形：画在地图上，便于判断轨迹与活动边界的关系。
+        fence = None
+        if cfg.get("allowed_polygon_geojson"):
+            try:
+                fence = [[float(a), float(b)]
+                         for a, b in yun_route.allowed_polygon(cfg["allowed_polygon_geojson"])]
+            except ValueError as exc:
+                return {"error": "围栏解析失败：" + str(exc)}
         try:
             command = _plan_deform(cfg, task)
         except ValueError as exc:
             return {"error": str(exc)}
         return {"ref": [[p[0], p[1]] for p in points],
                 "send": [[float(x) for x in r["point"].split(",")] for r in rows],
+                "fence": fence,
                 "ref_name": f"参考原轨迹：{src}",
-                "send_name": f"合成任务（seed={md['seed']}，第 {md['attempt']} 次抽中）",
+                "send_name": (f"合成任务（seed={md['seed']}，第 {md['attempt']} 次抽中"
+                              + (f"，形变×{md['deform_scale']:.2f}"
+                                 if md.get("deform_scale", 1.0) != 1.0 else "")
+                              + "）"),
                 "send_km": data["recordMileage"],
                 "metrics": {
                     "ref_len_km": round(ref_metrics["length_m"]/1000.0, 3),
@@ -258,6 +329,8 @@ def build_preview(qs):
                     "interval_s": md["interval_s"], "step_m": md["step_m"],
                     "points": len(rows), "attempt": md["attempt"],
                     "window": md["distance_window_m"],
+                    "deform_scale": md.get("deform_scale", 1.0),
+                    "pace_variability": md.get("pace_variability", 0.0),
                 },
                 "note": f"输入 {len(points)} 点 → 输出 {len(rows)} 点",
                 "command": command, "warn": _cadence_gate_warn(data["recodeCadence"])}
@@ -566,6 +639,13 @@ PAGE = """<!DOCTYPE html>
               <span class="mini-field tiny"><label for="deformInterval">采样间隔 / s</label><input id="deformInterval" class="f" style="width:56px" value="2"></span>
               <span class="mini-field tiny"><label for="deformMin">最短 / m</label><input id="deformMin" class="f" style="width:76px" placeholder="不限"></span>
               <span class="mini-field tiny"><label for="deformMax">最长 / m</label><input id="deformMax" class="f" style="width:76px" placeholder="不限"></span>
+              <span class="mini-field tiny" title="填了就精确使用该里程（distance_m），绕过 ±10% 抽签、也忽略最短/最长；源轨迹需足够长（只能截短不能拉长超过抽签范围）"><label for="deformExact">精确 / m</label><input id="deformExact" class="f" style="width:76px" placeholder="可选"></span>
+              <span class="mini-field tiny" title="允许采样点落在可跑区域外的比例（%）。真人轨迹贴边时的定位抖动会踩出边界，本地严格校验会把可用源全部拒掉；0 = 严格"><label for="deformTol">容差 %</label><input id="deformTol" class="f" style="width:56px" placeholder="0"></span>
+              <span class="mini-field tiny" title="勾选后完全不校验越界：轨迹可能踩出可跑区域，但生成不会失败"><label for="deformNoStrict">忽略越界 <input type="checkbox" id="deformNoStrict" checked style="vertical-align:-2px"></label></span>
+              <span class="mini-field tiny" title="自适应幅度的上限（1.0~2.0）。>1 时先试放大幅度，生成的轨迹与原轨迹差异更大、重复度更低"><label for="deformScaleMax">幅度上限</label><input id="deformScaleMax" class="f" style="width:56px" placeholder="1.0"></span>
+              <span class="mini-field tiny" title="0~0.6；留空或 0 = 匀速（保持既有行为）。>0 时按低频 OU 调制逐段里程，总里程与总时长不变"><label for="deformVar">速度起伏</label><input id="deformVar" class="f" style="width:56px" placeholder="0"></span>
+              <span class="mini-field tiny" title="围栏越界时按固定比例自动收敛形变幅度重试，而不是直接报错"><label for="deformFit">形变自适应 <input type="checkbox" id="deformFit" style="vertical-align:-2px"></label></span>
+              <span class="mini-field tiny" title="可选：可跑区域 GeoJSON（单环 Polygon）。填了才会校验越界，形变自适应也才有意义"><label for="deformPoly">围栏</label><select id="deformPoly"><option value="">不使用</option></select></span>
             </span>
             <button class="btn preview-button" onclick="preview()"><svg class="svg-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h4l3-7 4 14 3-7h2"/></svg>刷新预览</button>
           </div>
@@ -609,7 +689,7 @@ PAGE = """<!DOCTYPE html>
   </div>
 </div>
 <script>
-let offset=0, map=null, refLayer=null, sendLayer=null, meta=null, leafletOK=(typeof L!=='undefined');
+let offset=0, map=null, refLayer=null, sendLayer=null, fenceLayer=null, meta=null, leafletOK=(typeof L!=='undefined');
 let lastPlan=null, lastWarn='';   // ②最近一次成功预览：③的命令唯一来源
 document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
   document.querySelectorAll('.tab,.pane').forEach(x=>x.classList.remove('on'));
@@ -617,6 +697,8 @@ document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
   if(t.dataset.p==='p2'){ if(!map&&leafletOK){ map=L.map('map');
       L.tileLayer('https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}',
         {subdomains:['1','2','3','4'],maxNativeZoom:18,maxZoom:20,attribution:'© 高德'}).addTo(map);
+      fenceLayer=L.polygon([],{color:'#e67e22',weight:2,dashArray:'6,4',
+        fillColor:'#e67e22',fillOpacity:0.07}).addTo(map);
       refLayer=L.polyline([],{color:'#999',dashArray:'6,4',weight:3}).addTo(map);
       sendLayer=L.polyline([],{color:'#2379f6',weight:4}).addTo(map); }
     if(map) setTimeout(()=>map.invalidateSize(),50); }
@@ -628,6 +710,8 @@ async function boot(){ meta=await j('/api/meta');
   for(const k of Object.keys(meta.campuses)){ const o=document.createElement('option');o.value=k;o.textContent=k;c.appendChild(o);} 
   const ss=document.getElementById('srcSel'); ss.innerHTML='';
   for(const k of meta.sources){ const o=document.createElement('option');o.value=k;o.textContent=k;ss.appendChild(o);} 
+  const ps=document.getElementById('deformPoly'); ps.innerHTML='<option value="">不使用</option>';
+  for(const k of (meta.polygons||[])){ const o=document.createElement('option');o.value=k;o.textContent=k;ps.appendChild(o);} 
   taskFill(); c.onchange=taskFill; loadCfg();
   document.getElementById('selflink').href=location.href;
   document.getElementById('selflink').textContent=location.href;
@@ -676,13 +760,25 @@ async function preview(){ const s=document.getElementById('scheme').value;
          q.set('interval',document.getElementById('deformInterval').value||'2');
          const mn=document.getElementById('deformMin').value.trim();
          const mx=document.getElementById('deformMax').value.trim();
-         if(mn) q.set('min',mn);
-         if(mx) q.set('max',mx); }
+         const ex=document.getElementById('deformExact').value.trim();
+         if(ex){ q.set('exact',ex); }            /* 精确里程优先，忽略区间 */
+         else { if(mn) q.set('min',mn);
+                if(mx) q.set('max',mx); }
+         const tl=document.getElementById('deformTol').value.trim();
+         if(tl) q.set('tol',tl);
+         if(document.getElementById('deformNoStrict').checked) q.set('nostrict','1');
+         const sm=document.getElementById('deformScaleMax').value.trim();
+         if(sm) q.set('scalemax',sm);
+         const vr=document.getElementById('deformVar').value.trim();
+         if(vr && parseFloat(vr)>0) q.set('variability',vr);
+         if(document.getElementById('deformFit').checked) q.set('autofit','1');
+         const pl=document.getElementById('deformPoly').value.trim();
+         if(pl) q.set('poly',pl); }
   const d=await j('/api/routes?'+q); const info=document.getElementById('pvinfo');
   if(d.error){ lastPlan=null; lastWarn=''; renderCmd();
     info.innerHTML='<b style=color:#c00>预览失败：'+d.error+'</b>'+
     (d.window_hint?'<br><span style=color:#a60>'+d.window_hint+'</span>':'');
-    if(leafletOK){ refLayer.setLatLngs([]); sendLayer.setLatLngs([]); }   /* 失败即清图，③同步失效 */
+    if(leafletOK && refLayer){ refLayer.setLatLngs([]); sendLayer.setLatLngs([]); fenceLayer.setLatLngs([]); }   /* 失败即清图，③同步失效 */
     return; }
   lastPlan=d.command||null; lastWarn=d.warn||''; renderCmd();
   if(d.metrics){ const m=d.metrics; const f=(v,u,s)=>v===null||v===undefined?'—':(v+(u||''));
@@ -697,7 +793,10 @@ async function preview(){ const s=document.getElementById('scheme').value;
       '</td><td style="padding:3px 10px"><b>'+f(m.send_cadence,' spm')+'</b></td></tr>'+
       '</table>'+
       '<div style="font-size:12px;color:#567;margin-top:4px">'+m.points+' 点 ｜ 间隔 '+m.interval_s+
-      's ｜ 每点 '+m.step_m+' m ｜ 几何弦长 '+m.chord_km+' km ｜ '+d.send_name+
+      's ｜ 每点 '+m.step_m+' m ｜ 几何弦长 '+m.chord_km+' km ｜ '+
+      (m.pace_variability>0?'速度起伏 '+m.pace_variability+' ｜ ':'')+
+      (m.deform_scale!==1.0?'形变×'+m.deform_scale.toFixed(2)+' ｜ ':'')+
+      d.send_name+
       (m.window?' ｜ 里程区间 ['+m.window[0]+', '+m.window[1]+']':'')+'</div>'+
       (d.warn?'<div class="gate-warn">'+d.warn+'</div>':'');
   } else {
@@ -707,8 +806,15 @@ async function preview(){ const s=document.getElementById('scheme').value;
                    (d.warn?'<div class="gate-warn">'+d.warn+'</div>':'');
   }
   if(!leafletOK){ info.innerHTML+='<br><b>Leaflet CDN 未能加载（离线？），地图不可用</b>'; return; }
+  /* boot() 结尾会先跑一次 preview()，那时还没切到本选项卡、地图未初始化，
+     refLayer/sendLayer/fenceLayer 均为 null；这里必须先挡住。 */
+  if(!refLayer){ info.innerHTML+='<br><span style="color:#a60">地图尚未初始化：切到「路线预览」选项卡后会自动重画</span>'; return; }
+  if(d.fence && d.fence.length){ fenceLayer.setLatLngs(d.fence.map(p=>[p[1],p[0]]));
+    fenceLayer.bindTooltip('可跑区域 · '+d.fence.length+' 顶点',{sticky:true}); }
+  else { fenceLayer.setLatLngs([]); fenceLayer.unbindTooltip(); }
   refLayer.setLatLngs(d.ref.map(p=>[p[1],p[0]])); sendLayer.setLatLngs(d.send.map(p=>[p[1],p[0]]));
-  if(d.ref.length){ map.fitBounds(L.latLngBounds(d.ref.map(p=>[p[1],p[0]])).pad(0.12)); }
+  const acc=(d.ref||[]).concat(d.fence||[]);      /* 视野同时容纳轨迹与围栏 */
+  if(acc.length){ map.fitBounds(L.latLngBounds(acc.map(p=>[p[1],p[0]])).pad(0.12)); }
   sendLayer.bindTooltip(d.send_name+' · '+d.send_km+' km',{sticky:true}); }
 
 async function runMain(){ const r=await j('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -746,7 +852,8 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/":
             self._send(200, "text/html", PAGE.replace("__URL__", f"http://127.0.0.1:{PORT}/"))
         elif u.path == "/api/meta":
-            self._json({"campuses": list_campuses(), "sources": list_sources()})
+            self._json({"campuses": list_campuses(), "sources": list_sources(),
+                        "polygons": list_fences()})
         elif u.path == "/api/config":
             try:
                 self._json(read_config_masked())

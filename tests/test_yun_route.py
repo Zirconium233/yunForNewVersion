@@ -428,3 +428,114 @@ def test_polygon_detects_narrow_concavity_between_samples():
                                   (117.000040, 31.0)], ring)
     R.validate_polygon_route([(117.000025, 31.0),
                               (117.000040, 31.0)], ring)
+
+
+# --------------------------------------------------------------------------
+# 评审意见回归：speed_factors 的边界必须在归一化之后仍成立（P1）
+# --------------------------------------------------------------------------
+import random as _random
+
+
+@pytest.mark.parametrize('variability', [0.05, 0.1, 0.25, 0.4, 0.6])
+@pytest.mark.parametrize('n', [2, 3, 7, 50, 246])
+def test_speed_factors_bounds_hold_after_normalization(variability, n):
+    """先限幅再除以均值会重新越界（例 [0.65,1.5,1.5] → 最小 0.534）。
+
+    这里要求 min/max 落在声明范围内，且均值恰为 1。
+    """
+    factors = R.speed_factors(_random.Random(1234), n, variability)
+    assert len(factors) == n
+    assert min(factors) >= R.FACTOR_MIN - 1e-9
+    assert max(factors) <= R.FACTOR_MAX + 1e-9
+    assert abs(sum(factors) - n) < 1e-9
+
+
+def test_bounded_normalize_rejects_infeasible_total():
+    with pytest.raises(ValueError, match='无法同时满足逐项边界'):
+        R._bounded_normalize([1.0, 1.0], R.FACTOR_MIN, R.FACTOR_MAX, 10.0)
+
+
+def test_speed_factors_disabled_returns_unit_mean():
+    assert R.speed_factors(_random.Random(1), 10, 0.0) == [1.0]*10
+    assert R.speed_factors(_random.Random(1), 0, 0.3) == []
+
+
+# --------------------------------------------------------------------------
+# 评审意见回归：auto_fit_deform 必须是真正的 JSON 布尔（P1）
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize('bad', ["false", "0", "1", 1, 0, None, [True]])
+def test_auto_fit_deform_requires_real_bool(tmp_path, bad):
+    with pytest.raises(ValueError, match='JSON 布尔值'):
+        R.generate(config(tmp_path, auto_fit_deform=bad))
+
+
+def test_auto_fit_deform_accepts_real_bool(tmp_path):
+    for good in (True, False):
+        task = R.generate(config(tmp_path, auto_fit_deform=good))
+        assert task['data']['recordMileage'] > 0
+
+
+# --------------------------------------------------------------------------
+# 评审意见回归：默认配置的 metadata 不新增键（P1）
+# --------------------------------------------------------------------------
+def test_default_metadata_has_no_new_keys(tmp_path):
+    meta = R.generate(config(tmp_path))['metadata']
+    assert 'deform_scale' not in meta
+    assert 'pace_variability' not in meta
+
+
+def test_new_metadata_keys_only_when_enabled(tmp_path):
+    meta = R.generate(config(tmp_path, pace_variability=0.25))['metadata']
+    assert meta['pace_variability'] == 0.25
+    assert 'deform_scale' not in meta      # 未开 auto_fit 时不该出现
+
+
+# --------------------------------------------------------------------------
+# 评审意见回归：manageList.index 对 inf/nan 也要兜底（P2）
+# --------------------------------------------------------------------------
+def test_manage_list_index_ignores_inf_and_nan():
+    body = M._build_finish_body(
+        record_mileage_km=2.0, recode_cadence=160, recode_pace=5.0,
+        recode_dislikes=2,
+        manage_list=[{"point": "1,2", "marked": "Y", "index": float("inf")},
+                     {"point": "3,4", "marked": "Y", "index": float("nan")},
+                     {"point": "5,6", "marked": "N", "index": ""},
+                     {"point": "7,8", "marked": "N", "index": 3}],
+        ra_run_area="area", ra_id=1, ra_type="T1", record_id=1,
+        duration_s=600, record_start_time="2026-01-01 00:00:00")
+    assert [x["index"] for x in body["manageList"]] == [0, 0, 0, 3]
+
+
+# --------------------------------------------------------------------------
+# 围栏容差与形变幅度上限
+# --------------------------------------------------------------------------
+def test_fence_tolerance_allows_outliers():
+    """容差 > 0 时允许给定比例的采样点越界；默认 0 保持严格。
+
+    真人轨迹有 1%~8% 的点踩在边界外（进场/离场段与贴边抖动），服务端
+    也接受这类历史数据，本地 0 容差会把可用源全部拒掉。
+    """
+    ring = [(0.0, 0.0), (0.001, 0.0), (0.001, 0.001), (0.0, 0.001)]
+    route = [(0.0005, 0.0005), (0.0020, 0.0005)]      # 约一半采样点在外
+    with pytest.raises(ValueError, match='超出'):
+        R.validate_polygon_route(route, ring)
+    with pytest.raises(ValueError, match='容差'):
+        R.validate_polygon_route(route, ring, tolerance_pct=0.3)
+    R.validate_polygon_route(route, ring, tolerance_pct=0.6)
+
+
+def test_fence_tolerance_out_of_range(tmp_path):
+    with pytest.raises(ValueError, match='fence_tolerance_pct'):
+        R.generate(config(tmp_path, fence_tolerance_pct=0.5))
+
+
+@pytest.mark.parametrize('bad', [0.1, 3.0])
+def test_deform_scale_max_range(tmp_path, bad):
+    with pytest.raises(ValueError, match='deform_scale_max'):
+        R.generate(config(tmp_path, auto_fit_deform=True, deform_scale_max=bad))
+
+
+def test_deform_scale_max_above_one_tries_larger_first(tmp_path):
+    """上限 >1 时应从上限往下试：没有围栏时第一档（即上限）直接通过。"""
+    task = R.generate(config(tmp_path, auto_fit_deform=True, deform_scale_max=2.0))
+    assert task['metadata']['deform_scale'] == pytest.approx(2.0)

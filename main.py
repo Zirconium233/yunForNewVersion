@@ -527,13 +527,23 @@ def _sys_edition_field():
 
 
 def _norm_manage_list(manage_list):
-    """manageList 项严格按 P1:2561-2567 的 {point, marked, index}；空则整体省略键。"""
+    """manageList 项严格按 P1:2561-2567 的 {point, marked, index}；空则整体省略键。
+
+    3.6.7 兼容：旧任务表与第三方生成器会把未打卡点的 index 写成空字符串，
+    这里统一归一为整数、非法值兜底 0，避免脏数据让 finish 整体失败。
+    """
     out = []
     for item in (manage_list or []):
+        try:
+            idx = int(float(item.get("index", 0) or 0))
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError：int(float("inf")) / int(float("nan")) 会抛，
+            # 与空字符串一样属于脏数据，统一兜底为 0。
+            idx = 0
         out.append({
             "point": str(item.get("point", "")),
             "marked": str(item.get("marked", "")),
-            "index": int(float(item.get("index", 0))),
+            "index": idx,
         })
     return out
 
@@ -568,6 +578,41 @@ def _build_finish_body(record_mileage_km, recode_cadence, recode_pace, recode_di
 
 class Yun_For_New:
 
+    def _probe_face_status(self, data):
+        """runFaceStatus 缺失时（3.6.7+）用 getRlStatus.runFaceStudentStatus 判定准入。
+
+        3.6.7 实测：getHomeRunInfo 的 cralist 不再下发 runFaceStatus 字段。
+        APK 证据（NewRunningFragment.java:929-932 构造、:640-698 消费）表明
+        真实准入信号是 /run/getRlStatus 的 runFaceStudentStatus：
+            'Y'  已认证成功 → 正版 APP 直接开跑，无需当场核验
+            'N'  需先采集    → 需要真人操作
+            'N0' 认证失败需重新采集
+            'N1' 审核中      → APP 自身拒绝开跑
+        本方法只在 'Y' 时映射为 'N'（不需要人脸窗口）放行，其余一律返回 ''，
+        继续走原停止门，保持既有保守策略。
+        """
+        area = (data or {}).get('raRunArea') or ''
+        try:
+            obj = self.client.post_json('/run/getRlStatus',
+                                        json.dumps({'raRunArea': area}),
+                                        raise_on_business_code=False)
+        except Exception as exc:
+            print(f"[人脸状态] getRlStatus 探测异常：{exc}；保持停止门")
+            return ''
+        if not isinstance(obj, dict) or obj.get('code') != 200:
+            print(f"[人脸状态] getRlStatus 响应异常，保持停止门：{obj!r}")
+            return ''
+        status = str((obj.get('data') or {}).get('runFaceStudentStatus', '')).strip().upper()
+        if status == 'Y':
+            print("[人脸状态] cralist 未下发 runFaceStatus（3.6.7+），"
+                  "getRlStatus.runFaceStudentStatus='Y'（已认证成功），按无需当场核验放行")
+            return 'N'
+        hint = {'N': '需先完成人脸采集', 'N0': '认证失败需重新采集',
+                'N1': '审核中，APP 自身也拒绝开跑'}.get(status, '未知状态')
+        print(f"[人脸状态] getRlStatus.runFaceStudentStatus={status!r}（{hint}），"
+              "按未通过处理，自动流程停止；请用官方 App 完成核验")
+        return ''
+
     def __init__(self, auto_generate_task=False, client: YunClient = None, home_info=None,
                  face_runner=None):
         """home_info: getHomeRunInfo 响应 dict（离线注入用）。不传才发真实请求。
@@ -593,6 +638,11 @@ class Yun_For_New:
         # （SportRunMapActivity.java:4314），faceTime 只是窗口参数。
         # 'N' 放行；'Y' 且无照片源 → 停止（A 阶段行为保持）；缺失/未知不假设通过。
         face_status = str(data.get('runFaceStatus', '')).strip().upper()
+        if not face_status:
+            # 3.6.7 兼容：实测 getHomeRunInfo 的 cralist 已不再下发 runFaceStatus。
+            # 依据 NewRunningFragment.java:929-932 / 640-698，真实准入信号是
+            # /run/getRlStatus 返回的 runFaceStudentStatus（'Y' = 已认证、可直接开跑）。
+            face_status = self._probe_face_status(data)
         self.face_runner = face_runner
         self._face_trigger = None
         if face_status == 'Y':
