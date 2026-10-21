@@ -634,6 +634,23 @@ class Yun_For_New:
             raise ValueError('上传批次至少需要两个点')
         self.raCadenceMin = data['raCadenceMin'] + cadence_min_offset
         self.raCadenceMax = data['raCadenceMax'] + cadence_max_offset
+        # 打卡点与踩点半径：生成模式需要据此校验覆盖，不再对 raDislikes > 0
+        # 的任务一刀切拒绝（见 validate_generated_route）。
+        self.card_points = []
+        for seg in (data.get('points') or '').split('|'):
+            seg = seg.strip()
+            if not seg:
+                continue
+            try:
+                lon, lat = seg.split(',')
+                self.card_points.append((float(lon), float(lat)))
+            except (TypeError, ValueError):
+                raise DecodeException('任务 points 存在非法坐标') from None
+        try:
+            self.card_range_m = float(data.get('cardRange') or 20)
+        except (TypeError, ValueError):
+            self.card_range_m = 20.0
+
         points = data['points'].split('|')
         if auto_generate_task:
             # 如果只要打表，完全可以不执行下面初始化代码
@@ -970,13 +987,52 @@ class Yun_For_New:
                 self.client.sleep(sleep_time)
             print('第' + str(task_index + 1) + '个点处理完毕！')
 
+    def _covered_cards(self, data):
+        """返回被轨迹覆盖的打卡点索引（半径 card_range_m 内至少有一个轨迹点）。"""
+        pts = []
+        for row in data.get('pointsList') or []:
+            seg = str(row.get('point', ''))
+            if ',' not in seg:
+                continue
+            try:
+                lon, lat = seg.split(',')
+                pts.append((float(lon), float(lat)))
+            except (TypeError, ValueError):
+                continue
+        if not pts:
+            return []
+        return [i for i, cp in enumerate(self.card_points)
+                if any(yun_route.distance(cp, p) <= self.card_range_m for p in pts)]
+
     def validate_generated_route(self, task):
         """在 start 前校验任务约束；几何生成不能替代学校的踩点要求。"""
         data = task['data']
         if task['metadata']['coordinate_system'] != 'GCJ-02':
             raise ValueError("当前客户端上传要求 GCJ-02；生成器不会自动转换 WGS84")
         if int(self.raDislikes) > 0:
-            raise ValueError("生成模式暂不支持要求踩点的任务（raDislikes > 0）")
+            # 原先对 raDislikes > 0 一刀切拒绝，使所有要求踩点的学校都无法使用
+            # 生成模式；改为按任务下发的 points 与 cardRange 逐点校验覆盖。
+            need = max(1, int(self.raDislikes))
+            if not self.card_points:
+                raise ValueError("任务要求踩点，但 cralist 未下发 points，无法校验覆盖")
+            hit = self._covered_cards(data)
+            if len(hit) < need:
+                raise ValueError(
+                    f"生成轨迹只覆盖 {len(hit)}/{len(self.card_points)} 个踩点"
+                    f"（任务要求 {need} 个，半径 {self.card_range_m:.0f} m）；"
+                    f"请更换源轨迹或调整 deform 幅度后重试")
+            # 回填踩点字段：生成器输出 recodeDislikes=0 / manageList=[]，
+            # 服务端以 recodeDislikes 作为"踩点数"计数，会直接判
+            # "踩点数至少3个点" 为 N（实测：轨迹已覆盖 6/6、里程配速步频
+            # 全 Y，唯独踩点 N）。这里按实际覆盖回填，与打表模式一致。
+            chosen = set(hit[:need])
+            data['manageList'] = [
+                {"point": f"{lon:.6f},{lat:.6f}",
+                 "marked": "Y" if i in chosen else "N",
+                 "index": i}
+                for i, (lon, lat) in enumerate(self.card_points)
+            ]
+            data['recodeDislikes'] = len(chosen)
         km = float(data['recordMileage'])
         effective_km = min(km, self.distance_cap_m/1000)
         if effective_km < max(float(self.raSingleMileageMin), self.server_min_mileage_km):
