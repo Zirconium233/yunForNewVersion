@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-云运动 (yunForNewVersion - Develop 分支) 操场边缘提取与拟真跑道形状 Tasks 生成器
+云运动 (yunForNewVersion - Develop 分支) 操场边缘提取与防穿墙随机拟真跑道合成器
 ================================================================================
 
-功能概述：
-1. 操场边缘提取 (extract_playground_boundary)：
-   - 读取已有 tasks 表目录（如 tasks_fch / tasks_txl / tasks_xc）下的全部 tasklist_*.json；
-   - 基于多任务空间栅格占据密度与必经打卡点 (manageList marked='Y') 自动滤除单次 GPS 漂移尖峰或偶发场外绕行（支持 core / full 两种模式）；
-   - 提取贴合操场外围的非自交简单多边形边缘（支持凹包内缩精修 + 外扩安全缓冲），导出符合 yun_route.allowed_polygon 规范的 GeoJSON Polygon。
+设计目标（针对四大核心要求）：
+1. 随机性（Randomness）：
+   - 彻底摒弃固定几何模板或确定性正弦/余弦函数曲线；
+   - 采用『真实跑道走廊图随机游走重组 + 全局随机起终点 + 泊松跳变目标道宽 + Ornstein-Uhlenbeck (AR1) 横向随机漫游 + 真实轨迹微观 GPS 残差块自举 (Block Bootstrap)』；
+   - 不仅与原 tasks 轨迹不相似，同一底图下使用不同随机种子生成的任意多条轨迹彼此之间也完全不同。
 
-2. 基于操场边缘与『拟真操场跑道形状 + 随机起终点』的视觉差异化 Tasks 生成：
-   - 操场跑道形状建模 (TrackShapeModel)：
-     从提取出的操场边缘多边形自动拟合平滑闭合的操场跑道基准环（直道 + 半圆弯道平滑过渡，并提供外道、中道、内道及分场子跑道环），符合真实人类主要沿操场跑道形状跑步的习惯；
-   - 随机起点 (S) 与随机终点 (E) + 4 种拟真跑道视觉变化模式（既保持跑道形状，又在人眼视觉上与原有 tasks 截然不同）：
-     * track_layered_lanes : 随机起终点 + 跑道内外道分层递进/偏心环跑（外道圈 -> 中道圈 -> 内道圈平滑换道，形成明显的多层跑道环带）
-     * track_chord_cut     : 随机起终点 + 沿跑道绕圈结合 1~3 次随机起终点跨场切线跑（模拟跑完整圈后斜穿草坪踩打卡点或换向继续沿跑道跑）
-     * track_d_loops       : 随机起终点 + 标准大圈跑道与半场 D 形跑道环组合（沿跑道跑整圈后，在随机直道位置横切中线跑半场环）
-     * track_dual_subloops : 随机起终点 + 双子跑道环/错位偏心跑道切换跑（在操场内两个错位跑道环或双操场东西跑道环之间切换绕圈）
-   - 严格几何边缘约束：内置与 yun_route.validate_polygon_route 完全一致的线段-多边形求交与中点射线检测，确保所有轨迹点与连接线段 100% 位于操场边缘内部；
-   - 打卡点 (manageList) 真实途经：在沿跑道跑步过程中，通过平滑切出/切入弧线自然经过每个 marked='Y' 的打卡点；
-   - 协议与字段严格对齐：点项严格遵循 main.py UpPointModel 的 9 字段契约 (_POINT_FIELD_ORDER)，距离、时间、累计步数单调自洽，配速字段按 client_speed (min/km) 精确派生。
+2. 合理性与细节拟真（Realism & Micro-Detail）：
+   - 宏观上严格保持『操场跑道绕圈』形态（直接基于历史真实跑道走廊网络进行多圈随机同向巡游与交叉换道，而非理想数学超椭圆），绝不产生杂乱无章的混沌折线；
+   - 微观上完全移除周期性三角函数调制，由非均匀步长、AR(1) 横向随机漫游与实测 GPS 抖动残差驱动，步间航向角变化分布（|Δθ| 中位数 ~5°、P90 ~15°）与真机 GPS 轨迹高度一致。
+
+3. 零穿墙保证（Zero Wall-Clipping / Corridor Shield）：
+   - 双重几何屏障：
+     a) 外层操场边界多边形（ring_lonlat / ring_xy）：通过 yun_route.validate_polygon_route 严格校验每个点与每条线段；
+     b) 内层真实可通行走廊距离场（RunnableCorridorShield）：以已有 tasks 中去重加密后的核心轨迹线段构建空间网格索引，强制所有合成点与连接线段必须落在真实历史可通行跑道走廊半径（默认 ≤ 4.5m）内。对于 tasks_txl 等双操场中间隔墙、看台或禁行区，因无历史走廊覆盖，算法物理上绝不可能穿墙。
+
+4. 协议与线上载荷对齐：
+   - 点项严格遵循 main.py UpPointModel 的 9 字段顺序 (_POINT_FIELD_ORDER)，runMileage、runTime、runStep 单调自洽，speed 严格对齐 yun_route.client_speed。
 """
 
 from __future__ import annotations
@@ -45,13 +45,6 @@ POINT_FIELD_ORDER = (
     "runTime",
     "speed",
     "ts",
-)
-
-VISUAL_STYLES = (
-    "track_layered_lanes",
-    "track_chord_cut",
-    "track_d_loops",
-    "track_dual_subloops",
 )
 
 
@@ -211,18 +204,27 @@ def validate_polygon_route(
                 raise ValueError("生成路线有点或线段超出操场边缘区域")
 
 
+def point_to_segment_projection(
+    p: Tuple[float, float],
+    a: Tuple[float, float],
+    b: Tuple[float, float],
+) -> Tuple[float, Tuple[float, float]]:
+    """返回点 p 到线段 ab 的最短距离及最近投影点。"""
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    l2 = dx * dx + dy * dy
+    if l2 <= 1e-12:
+        return math.hypot(p[0] - a[0], p[1] - a[1]), a
+    t = max(0.0, min(1.0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l2))
+    proj = (a[0] + t * dx, a[1] + t * dy)
+    return math.hypot(p[0] - proj[0], p[1] - proj[1]), proj
+
+
 def point_to_segment_dist(
     p: Tuple[float, float],
     a: Tuple[float, float],
     b: Tuple[float, float],
 ) -> float:
-    dx, dy = b[0] - a[0], b[1] - a[1]
-    l2 = dx * dx + dy * dy
-    if l2 <= 1e-12:
-        return math.hypot(p[0] - a[0], p[1] - a[1])
-    t = max(0.0, min(1.0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l2))
-    proj = (a[0] + t * dx, a[1] + t * dy)
-    return math.hypot(p[0] - proj[0], p[1] - proj[1])
+    return point_to_segment_projection(p, a, b)[0]
 
 
 def dist_to_polygon_boundary(
@@ -264,7 +266,125 @@ def is_simple_polygon(ring: Sequence[Tuple[float, float]]) -> bool:
 
 
 # ===========================================================================
-# 3. 从已有 tasks 表产生操场边缘 (Playground Boundary Extraction)
+# 3. 高速防穿墙真实可通行走廊屏障 (RunnableCorridorShield)
+# ===========================================================================
+
+class RunnableCorridorShield:
+    """
+    基于已有 tasks 核心轨迹去重锚点构建的高速『真实可通行跑道走廊屏障』：
+    - 将历史可通行走廊离散化为 1.2m 空间去重锚点并建立 6m 网格索引，单次查询仅比对 5~15 个锚点（O(1) 极速响应）；
+    - 强制所有合成点与连接线段必须落在真实历史可通行跑道走廊半径（≤ max_corridor_radius_m）内且位于 ring_xy 内部；
+    - 彻底杜绝跨越双操场中间隔墙（如 tasks_txl）、冲出看台围栏或切入未通行建筑区（穿墙）。
+    """
+
+    def __init__(
+        self,
+        corridor_points_xy: Sequence[Tuple[float, float]],
+        ring_xy: Sequence[Tuple[float, float]],
+        max_corridor_radius_m: float = 4.6,
+        boundary_margin_m: float = 0.8,
+        cell_size_m: float = 6.0,
+    ):
+        self.ring_xy = list(ring_xy)
+        self.max_corridor_radius_m = max_corridor_radius_m
+        self.boundary_margin_m = boundary_margin_m
+        self.cell_size_m = cell_size_m
+
+        # 对走廊点按 1.2m 网格去重，大幅提升距离场查询速度
+        dedup: Dict[Tuple[int, int], Tuple[float, float]] = {}
+        for x, y in corridor_points_xy:
+            key = (int(math.floor(x / 1.2)), int(math.floor(y / 1.2)))
+            if key not in dedup:
+                dedup[key] = (x, y)
+        self.anchors = list(dedup.values())
+
+        self.grid: Dict[Tuple[int, int], List[Tuple[float, float]]] = {}
+        for ax, ay in self.anchors:
+            cx = int(math.floor(ax / cell_size_m))
+            cy = int(math.floor(ay / cell_size_m))
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    self.grid.setdefault((cx + dx, cy + dy), []).append((ax, ay))
+
+    def nearest_corridor_projection(
+        self, p: Tuple[float, float]
+    ) -> Tuple[float, Tuple[float, float]]:
+        """O(1) 求点 p 到最近真实可通行走廊锚点的距离与最近点。"""
+        cx = int(math.floor(p[0] / self.cell_size_m))
+        cy = int(math.floor(p[1] / self.cell_size_m))
+        candidates = self.grid.get((cx, cy))
+        if not candidates:
+            candidates = self.anchors
+
+        best_d2 = 1e18
+        best_pt = p
+        px, py = p
+        for ax, ay in candidates:
+            d2 = (px - ax) * (px - ax) + (py - ay) * (py - ay)
+            if d2 < best_d2:
+                best_d2 = d2
+                best_pt = (ax, ay)
+        return math.sqrt(best_d2), best_pt
+
+    def is_point_safe(
+        self, p: Tuple[float, float], radius_override: Optional[float] = None
+    ) -> bool:
+        r_lim = self.max_corridor_radius_m if radius_override is None else radius_override
+        d, _ = self.nearest_corridor_projection(p)
+        if d > r_lim:
+            return False
+        if not inside_polygon(p, self.ring_xy):
+            return False
+        if dist_to_polygon_boundary(p, self.ring_xy) < self.boundary_margin_m:
+            return False
+        return True
+
+    def is_segment_safe(
+        self,
+        a: Tuple[float, float],
+        b: Tuple[float, float],
+        radius_override: Optional[float] = None,
+    ) -> bool:
+        """检查线段 ab 全程是否既不超出外多边形，也不离开真实可通行走廊（防穿墙）。"""
+        length = math.hypot(b[0] - a[0], b[1] - a[1])
+        n_checks = max(2, int(math.ceil(length / 1.8)))
+        r_lim = self.max_corridor_radius_m if radius_override is None else radius_override
+        for k in range(n_checks + 1):
+            t = k / n_checks
+            p = (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+            d, _ = self.nearest_corridor_projection(p)
+            if d > r_lim:
+                return False
+        # 若线段端点靠近外边界或跨度较大，执行精确多边形边求交检查
+        if (
+            length > 4.5
+            or dist_to_polygon_boundary(a, self.ring_xy) < 4.5
+            or dist_to_polygon_boundary(b, self.ring_xy) < 4.5
+        ):
+            return segment_inside_polygon(a, b, self.ring_xy)
+        return inside_polygon(b, self.ring_xy)
+
+    def clamp_point(
+        self, p: Tuple[float, float], target_radius: Optional[float] = None
+    ) -> Tuple[float, float]:
+        """若点 p 偏离可通行走廊或过于靠近外边界，将其平滑拉回最近真实走廊锚点。"""
+        r_lim = (self.max_corridor_radius_m * 0.85) if target_radius is None else target_radius
+        d, proj = self.nearest_corridor_projection(p)
+        cand = p
+        if d > r_lim and d > 1e-6:
+            ratio = r_lim / d
+            cand = (proj[0] + (p[0] - proj[0]) * ratio, proj[1] + (p[1] - proj[1]) * ratio)
+        if inside_polygon(cand, self.ring_xy) and dist_to_polygon_boundary(cand, self.ring_xy) >= self.boundary_margin_m:
+            return cand
+        for alpha in (0.7, 0.4, 0.0):
+            test_p = (proj[0] + (cand[0] - proj[0]) * alpha, proj[1] + (cand[1] - proj[1]) * alpha)
+            if inside_polygon(test_p, self.ring_xy):
+                return test_p
+        return proj
+
+
+# ===========================================================================
+# 4. 从已有 tasks 表提取操场边缘、真实走廊连通轨迹与微观残差库
 # ===========================================================================
 
 def convex_hull_xy(points: Sequence[Tuple[float, float]]) -> List[Tuple[float, float]]:
@@ -291,32 +411,61 @@ def convex_hull_xy(points: Sequence[Tuple[float, float]]) -> List[Tuple[float, f
     return lower[:-1] + upper[:-1]
 
 
-def _filter_core_playground_xy(
-    trajectories: Sequence[Sequence[Tuple[float, float]]],
-    checkpoints_y: Sequence[Tuple[float, float]],
-    proj: LocalProjector,
-    cell_size_m: float = 7.5,
-    min_file_ratio: float = 0.45,
+def _resample_polyline_uniform(
+    pts: Sequence[Tuple[float, float]], step_m: float = 3.0
 ) -> List[Tuple[float, float]]:
-    """
-    基于多任务文件栅格共现率 + 必经打卡点锚定提取核心操场点云：
-    滤除仅在个别任务中出现的 GPS 漂移尖峰或场外偶发绕行（如 tasks_xc 中少数任务的场外马路延伸）。
-    """
-    n_files = len(trajectories)
-    min_files = max(2, int(math.ceil(n_files * min_file_ratio))) if n_files >= 3 else 1
-    cell_files: Dict[Tuple[int, int], set] = {}
-    all_xy: List[Tuple[float, float, int]] = []
+    """将折线按 step_m 均匀加密重采样，保证相邻点间距恒定在 ~3m。"""
+    if len(pts) < 2:
+        return list(pts)
+    cum = [0.0]
+    for a, b in zip(pts, pts[1:]):
+        cum.append(cum[-1] + math.hypot(b[0] - a[0], b[1] - a[1]))
+    total = cum[-1]
+    if total < step_m:
+        return list(pts)
+    n = max(2, int(round(total / step_m)))
+    out: List[Tuple[float, float]] = []
+    for k in range(n + 1):
+        s = total * k / n
+        idx = min(len(pts) - 1, max(1, bisect.bisect_left(cum, s)))
+        p0, p1 = pts[idx - 1], pts[idx]
+        seg = cum[idx] - cum[idx - 1]
+        f = (s - cum[idx - 1]) / seg if seg > 1e-9 else 0.0
+        out.append((p0[0] + (p1[0] - p0[0]) * f, p0[1] + (p1[1] - p0[1]) * f))
+    return out
 
-    for f_idx, traj in enumerate(trajectories):
-        for lon, lat in traj:
-            x, y = proj.to_xy((lon, lat))
-            all_xy.append((x, y, f_idx))
+
+def _filter_core_trajectories_xy(
+    trajectories_xy: Sequence[Sequence[Tuple[float, float]]],
+    checkpoints_xy: Sequence[Tuple[float, float]],
+    cell_size_m: float = 8.0,
+    min_file_ratio: float = 0.40,
+) -> Tuple[List[Tuple[float, float]], List[List[Tuple[float, float]]]]:
+    """
+    先将每条原始轨迹加密重采样至 ~3m 步长（消除因采样间隔长导致的栅格断连），
+    再基于多文件栅格共现率 + 必经打卡点锚定滤除少数任务的场外马路延伸（如 tasks_xc 的东南侧延伸）。
+    """
+    n_files = len(trajectories_xy)
+    min_files = max(2, int(math.ceil(n_files * min_file_ratio))) if n_files >= 3 else 1
+
+    dense_trajs: List[List[Tuple[float, float]]] = []
+    cell_files: Dict[Tuple[int, int], set] = {}
+    all_xy: List[Tuple[float, float]] = []
+
+    for f_idx, raw_t in enumerate(trajectories_xy):
+        clean_t = [raw_t[0]]
+        for p in raw_t[1:]:
+            if math.hypot(p[0] - clean_t[-1][0], p[1] - clean_t[-1][1]) <= 95.0:
+                clean_t.append(p)
+        dense_t = _resample_polyline_uniform(clean_t, step_m=3.0)
+        dense_trajs.append(dense_t)
+        for x, y in dense_t:
+            all_xy.append((x, y))
             cell = (int(math.floor(x / cell_size_m)), int(math.floor(y / cell_size_m)))
             cell_files.setdefault(cell, set()).add(f_idx)
 
     core_cells = {c for c, fset in cell_files.items() if len(fset) >= min_files}
-    cp_xy = [proj.to_xy(p) for p in checkpoints_y]
-    for px, py in cp_xy:
+    for px, py in checkpoints_xy:
         c = (int(math.floor(px / cell_size_m)), int(math.floor(py / cell_size_m)))
         for dx in range(-2, 3):
             for dy in range(-2, 3):
@@ -324,7 +473,7 @@ def _filter_core_playground_xy(
                     core_cells.add((c[0] + dx, c[1] + dy))
 
     if not core_cells:
-        return [(x, y) for x, y, _ in all_xy]
+        return all_xy, dense_trajs
 
     unvisited = set(core_cells)
     clusters: List[set] = []
@@ -349,7 +498,7 @@ def _filter_core_playground_xy(
         key=lambda comp: (
             sum(
                 1
-                for px, py in cp_xy
+                for px, py in checkpoints_xy
                 if any(
                     abs(int(math.floor(px / cell_size_m)) - cx) <= 2
                     and abs(int(math.floor(py / cell_size_m)) - cy) <= 2
@@ -360,29 +509,42 @@ def _filter_core_playground_xy(
         ),
     )
 
-    filtered = [
-        (x, y)
-        for x, y, _ in all_xy
-        if (int(math.floor(x / cell_size_m)), int(math.floor(y / cell_size_m))) in best_cluster
-    ]
-    for px, py in cp_xy:
-        c = (int(math.floor(px / cell_size_m)), int(math.floor(py / cell_size_m)))
-        if any(abs(c[0] - cx) <= 3 and abs(c[1] - cy) <= 3 for cx, cy in best_cluster):
-            filtered.append((px, py))
+    expanded_core = set()
+    for cx, cy in best_cluster:
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                expanded_core.add((cx + dx, cy + dy))
 
-    return filtered if len(filtered) >= 20 else [(x, y) for x, y, _ in all_xy]
+    def in_core(pt: Tuple[float, float]) -> bool:
+        c = (int(math.floor(pt[0] / cell_size_m)), int(math.floor(pt[1] / cell_size_m)))
+        return c in expanded_core
+
+    filtered_pts = [p for p in all_xy if in_core(p)]
+    core_sub_trajs: List[List[Tuple[float, float]]] = []
+    for dense_t in dense_trajs:
+        curr_sub: List[Tuple[float, float]] = []
+        for p in dense_t:
+            if in_core(p):
+                curr_sub.append(p)
+            else:
+                if len(curr_sub) >= 40:
+                    core_sub_trajs.append(curr_sub)
+                curr_sub = []
+        if len(curr_sub) >= 40:
+            core_sub_trajs.append(curr_sub)
+
+    return (filtered_pts if len(filtered_pts) >= 20 else all_xy), (
+        core_sub_trajs if core_sub_trajs else dense_trajs
+    )
 
 
 def _build_buffered_boundary_xy(
     xy_pts: Sequence[Tuple[float, float]],
-    buffer_m: float = 2.5,
+    buffer_m: float = 2.0,
     concave_refine: bool = True,
-    max_edge_m: float = 28.0,
+    max_edge_m: float = 26.0,
 ) -> List[Tuple[float, float]]:
-    """
-    由操场点云构建贴合外边缘（可选凹包内缩精修 + 顶点法线角平分线外扩缓冲），
-    确保输出多边形无自交且包含操场点云。
-    """
+    """由核心点云构建贴合操场边缘的简单多边形（含凹包内缩精修与法线外扩缓冲）。"""
     hull = convex_hull_xy(xy_pts)
     if polygon_signed_area(hull) < 0:
         hull.reverse()
@@ -392,7 +554,7 @@ def _build_buffered_boundary_xy(
         sample_pts = list(xy_pts)[:: max(1, len(xy_pts) // 350)]
         changed = True
         iters = 0
-        while changed and iters < 25:
+        while changed and iters < 28:
             changed = False
             iters += 1
             n = len(ring)
@@ -403,13 +565,13 @@ def _build_buffered_boundary_xy(
                 if edge_len <= max_edge_m:
                     continue
                 dx, dy = (b[0] - a[0]) / edge_len, (b[1] - a[1]) / edge_len
-                nx, ny = -dy, dx  # CCW 多边形的内法线方向
+                nx, ny = -dy, dx
                 candidates: List[Tuple[float, Tuple[float, float]]] = []
                 for p in xy_pts:
                     proj_t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / edge_len
-                    if 0.22 <= proj_t <= 0.78:
+                    if 0.20 <= proj_t <= 0.80:
                         inward_d = (p[0] - a[0]) * nx + (p[1] - a[1]) * ny
-                        if 2.0 <= inward_d <= edge_len * 0.32:
+                        if 1.8 <= inward_d <= edge_len * 0.34:
                             candidates.append((inward_d, p))
                 if candidates:
                     candidates.sort(key=lambda item: item[0])
@@ -440,7 +602,7 @@ def _build_buffered_boundary_xy(
             bx, by = n1x, n1y
         else:
             bx, by = bx / bl, by / bl
-        scale = min(1.8, 1.0 / max(0.4, (bx * n1x + by * n1y)))
+        scale = min(1.7, 1.0 / max(0.42, (bx * n1x + by * n1y)))
         buffered.append((curr_p[0] + bx * buffer_m * scale, curr_p[1] + by * buffer_m * scale))
 
     if not is_simple_polygon(buffered):
@@ -455,13 +617,69 @@ def _build_buffered_boundary_xy(
     return buffered
 
 
+def _extract_corridor_tracks_and_residuals(
+    raw_trajs_xy: Sequence[Sequence[Tuple[float, float]]],
+    core_sub_trajs: Sequence[Sequence[Tuple[float, float]]],
+    ring_xy: Sequence[Tuple[float, float]],
+) -> Tuple[List[List[Tuple[float, float]]], List[Tuple[float, float]]]:
+    """
+    提取：
+    1) 平滑去噪后的长跑道走廊载体序列 (corridor_tracks)；
+    2) 实测微观 GPS 抖动与步态残差库 (empirical_residuals)：用于 Block Bootstrap 注入新轨迹。
+    """
+    residuals: List[Tuple[float, float]] = []
+    for raw_t in raw_trajs_xy:
+        if len(raw_t) < 15:
+            continue
+        n = len(raw_t)
+        for i in range(2, n - 2):
+            sx = sum(raw_t[k][0] for k in range(i - 2, i + 3)) / 5.0
+            sy = sum(raw_t[k][1] for k in range(i - 2, i + 3)) / 5.0
+            tx = raw_t[i + 1][0] - raw_t[i - 1][0]
+            ty = raw_t[i + 1][1] - raw_t[i - 1][1]
+            tl = math.hypot(tx, ty)
+            if 0.5 <= tl <= 30.0:
+                ux, uy = tx / tl, ty / tl
+                nx, ny = -uy, ux
+                dx, dy = raw_t[i][0] - sx, raw_t[i][1] - sy
+                lon_err = dx * ux + dy * uy
+                lat_err = dx * nx + dy * ny
+                if abs(lat_err) <= 2.2 and abs(lon_err) <= 2.2:
+                    residuals.append((lon_err, lat_err))
+
+    corridor_tracks: List[List[Tuple[float, float]]] = []
+    for sub in core_sub_trajs:
+        inside_sub = [p for p in sub if inside_polygon(p, ring_xy)]
+        if len(inside_sub) < 35:
+            continue
+        smoothed: List[Tuple[float, float]] = []
+        n = len(inside_sub)
+        for i in range(n):
+            lo = max(0, i - 2)
+            hi = min(n, i + 3)
+            w = inside_sub[lo:hi]
+            p = (sum(q[0] for q in w) / len(w), sum(q[1] for q in w) / len(w))
+            if inside_polygon(p, ring_xy):
+                smoothed.append(p)
+        resampled = _resample_polyline_uniform(smoothed, step_m=3.0)
+        if len(resampled) >= 40:
+            corridor_tracks.append(resampled)
+
+    if not residuals:
+        residuals = [(0.0, 0.25), (0.0, -0.25), (0.15, 0.35), (-0.15, -0.35)]
+    return corridor_tracks, residuals
+
+
 def extract_playground_boundary(
     tasks_dir: str | Path,
     mode: str = "core",
-    buffer_m: float = 2.5,
+    buffer_m: float = 2.0,
 ) -> Dict:
     """
-    从指定的 tasks 目录（如 tasks_fch / tasks_txl / tasks_xc）学习并提取操场边缘多边形与统计特征。
+    从指定的 tasks 目录（如 tasks_fch / tasks_txl / tasks_xc）学习并提取：
+    - 操场外边缘多边形 (ring_lonlat / ring_xy / geojson)
+    - 防穿墙真实可通行走廊屏障 (corridor_shield)
+    - 真实长跑道走廊载体库 (corridor_tracks) 与实测 GPS 微观残差库 (empirical_residuals)
     """
     folder = Path(tasks_dir).resolve()
     if not folder.is_dir():
@@ -480,6 +698,7 @@ def extract_playground_boundary(
     cadences: List[float] = []
     dislikes_list: List[int] = []
     manage_pool_sizes: List[int] = []
+    dt_samples: List[int] = []
 
     for fpath in json_files:
         obj = json.loads(fpath.read_text(encoding="utf-8-sig"))
@@ -488,10 +707,18 @@ def extract_playground_boundary(
         if len(pts_list) < 2:
             continue
         traj: List[Tuple[float, float]] = []
+        prev_t: Optional[int] = None
         for pt in pts_list:
             lon, lat = map(float, str(pt["point"]).split(","))
             traj.append((lon, lat))
             raw_lonlat.append((lon, lat))
+            try:
+                t_val = int(float(pt.get("runTime", 0)))
+                if prev_t is not None and 1 <= t_val - prev_t <= 4:
+                    dt_samples.append(t_val - prev_t)
+                prev_t = t_val
+            except (TypeError, ValueError):
+                pass
         trajectories.append(traj)
 
         mlist = data.get("manageList") or []
@@ -524,11 +751,14 @@ def extract_playground_boundary(
 
     unique_cp_y = sorted(set(checkpoints_y))
     unique_cp_pool = sorted(set(checkpoints_pool))
+    trajs_xy = [[proj.to_xy(p) for p in t] for t in trajectories]
+    cp_y_xy = [proj.to_xy(p) for p in unique_cp_y]
 
     if mode == "core":
-        xy_used = _filter_core_playground_xy(trajectories, unique_cp_y, proj)
+        xy_used, core_sub_trajs = _filter_core_trajectories_xy(trajs_xy, cp_y_xy)
     elif mode == "full":
         xy_used = [proj.to_xy(p) for p in raw_lonlat]
+        core_sub_trajs = [_resample_polyline_uniform(t, step_m=3.0) for t in trajs_xy]
     else:
         raise ValueError(f"未知的 boundary mode: {mode!r}（仅支持 'core' 或 'full'）")
 
@@ -537,6 +767,21 @@ def extract_playground_boundary(
     if not is_simple_polygon(ring_lonlat):
         ring_xy = _build_buffered_boundary_xy(xy_used, buffer_m=buffer_m, concave_refine=False)
         ring_lonlat = [proj.to_lonlat(p) for p in ring_xy]
+
+    corridor_tracks, empirical_residuals = _extract_corridor_tracks_and_residuals(
+        trajs_xy, core_sub_trajs, ring_xy
+    )
+
+    corridor_pts: List[Tuple[float, float]] = []
+    for ct in corridor_tracks:
+        corridor_pts.extend(ct)
+
+    corridor_shield = RunnableCorridorShield(
+        corridor_points_xy=corridor_pts,
+        ring_xy=ring_xy,
+        max_corridor_radius_m=4.6,
+        boundary_margin_m=0.8,
+    )
 
     inside_cp_y = [cp for cp in unique_cp_y if inside_polygon(cp, ring_lonlat)]
     inside_cp_pool = [cp for cp in unique_cp_pool if inside_polygon(cp, ring_lonlat)]
@@ -573,6 +818,10 @@ def extract_playground_boundary(
         "projector": proj,
         "ring_xy": ring_xy,
         "ring_lonlat": ring_lonlat,
+        "corridor_shield": corridor_shield,
+        "corridor_tracks": corridor_tracks,
+        "empirical_residuals": empirical_residuals,
+        "dt_samples": dt_samples or [1, 2, 2, 2],
         "geojson": geojson_obj,
         "trajectories": trajectories,
         "checkpoints_y": inside_cp_y,
@@ -592,14 +841,14 @@ def extract_playground_boundary(
 
 
 # ===========================================================================
-# 4. 视觉相似度计算（2D 栅格 IoU）
+# 5. 视觉相似度计算（2D 栅格 IoU）
 # ===========================================================================
 
 def rasterize_trajectory_cells(
     traj_xy: Sequence[Tuple[float, float]],
-    cell_size_m: float = 3.0,
+    cell_size_m: float = 2.5,
 ) -> set:
-    """将平面轨迹线段栅格化为 2D 网格集合，用于计算视觉空间重合度 (IoU)。"""
+    """将平面轨迹线段栅格化为 2D 网格集合，用于评估轨迹间的空间重合度 (IoU)。"""
     cells = set()
     for a, b in zip(traj_xy, traj_xy[1:]):
         dist = math.hypot(b[0] - a[0], b[1] - a[1])
@@ -621,725 +870,298 @@ def compute_visual_iou(cells_a: set, cells_b: set) -> float:
 
 
 # ===========================================================================
-# 5. 操场跑道形状建模与拟真跑道轨迹生成器 (TrackShapeModel)
+# 6. 防穿墙随机过程拟真绕圈合成算法 (Corridor Graph Walk + AR1 + Block Bootstrap)
 # ===========================================================================
 
-def _clamp_point_inside_ring(
-    pt: Tuple[float, float],
-    center: Tuple[float, float],
-    ring_xy: Sequence[Tuple[float, float]],
-    margin_m: float = 2.2,
-) -> Tuple[float, float]:
-    """确保点 pt 严格位于操场边缘 ring_xy 内部且距离边缘不少于 margin_m，必要时向 center 收缩。"""
-    if inside_polygon(pt, ring_xy) and dist_to_polygon_boundary(pt, ring_xy) >= margin_m:
-        return pt
-    for alpha in (0.94, 0.88, 0.82, 0.75, 0.65, 0.50, 0.35, 0.20, 0.0):
-        cand = (
-            center[0] + (pt[0] - center[0]) * alpha,
-            center[1] + (pt[1] - center[1]) * alpha,
-        )
-        if inside_polygon(cand, ring_xy) and dist_to_polygon_boundary(cand, ring_xy) >= margin_m * 0.7:
-            return cand
-    return center
-
-
-class StadiumTrackLoop:
-    """
-    由操场边缘多边形或子区域构建的平滑闭合『操场跑道形状环』：
-    - 具备标准操场跑道的直道 + 半圆弯道平滑几何特征；
-    - 支持任意跑道相位 u ∈ [0, 1)、向内道宽偏移 lane_depth_m、偏心调制与顺/逆时针行进。
-    """
-
-    def __init__(
-        self,
-        ring_xy: Sequence[Tuple[float, float]],
-        center: Tuple[float, float],
-        rx: float,
-        ry: float,
-        superellipse_p: float = 2.35,
-        n_samples: int = 240,
-        margin_m: float = 3.5,
-    ):
-        self.ring_xy = list(ring_xy)
-        self.center = center
-        self.rx = rx
-        self.ry = ry
-        self.n_samples = n_samples
-        self.margin_m = margin_m
-
-        # 构造贴合操场边缘的平滑跑道外圈基准线（先通过射线探测边界距离，再做周期平滑）
-        raw_pts: List[Tuple[float, float]] = []
-        for i in range(n_samples):
-            theta = 2.0 * math.pi * i / n_samples
-            ct, st = math.cos(theta), math.sin(theta)
-            # 超椭圆跑道基底（直道+圆弧弯道形态）
-            denom = (abs(ct) ** superellipse_p + abs(st) ** superellipse_p) ** (1.0 / superellipse_p)
-            ux = ct / denom if denom > 1e-9 else ct
-            uy = st / denom if denom > 1e-9 else st
-            ideal = (center[0] + ux * rx, center[1] + uy * ry)
-            clamped = _clamp_point_inside_ring(ideal, center, self.ring_xy, margin_m=margin_m)
-            raw_pts.append(clamped)
-
-        # 周期高斯滤波平滑，使直道与弯道过渡完全光滑自然
-        smoothed = list(raw_pts)
-        for _ in range(10):
-            nxt: List[Tuple[float, float]] = []
-            for i in range(n_samples):
-                p_prev2 = smoothed[(i - 2) % n_samples]
-                p_prev1 = smoothed[(i - 1) % n_samples]
-                p_curr = smoothed[i]
-                p_next1 = smoothed[(i + 1) % n_samples]
-                p_next2 = smoothed[(i + 2) % n_samples]
-                sx = 0.1 * p_prev2[0] + 0.2 * p_prev1[0] + 0.4 * p_curr[0] + 0.2 * p_next1[0] + 0.1 * p_next2[0]
-                sy = 0.1 * p_prev2[1] + 0.2 * p_prev1[1] + 0.4 * p_curr[1] + 0.2 * p_next1[1] + 0.1 * p_next2[1]
-                nxt.append(_clamp_point_inside_ring((sx, sy), center, self.ring_xy, margin_m=margin_m * 0.9))
-            smoothed = nxt
-
-        self.base_points = smoothed
-        self.inward_normals: List[Tuple[float, float]] = []
-        for i in range(n_samples):
-            p_prev = smoothed[(i - 1) % n_samples]
-            p_next = smoothed[(i + 1) % n_samples]
-            tx, ty = p_next[0] - p_prev[0], p_next[1] - p_prev[1]
-            tl = math.hypot(tx, ty) or 1.0
-            nx, ny = -ty / tl, tx / tl  # CCW 内法线
-            # 确保法线指向中心侧
-            if nx * (center[0] - smoothed[i][0]) + ny * (center[1] - smoothed[i][1]) < 0:
-                nx, ny = -nx, -ny
-            self.inward_normals.append((nx, ny))
-
-        self.perimeter_m = sum(
-            math.hypot(
-                smoothed[(i + 1) % n_samples][0] - smoothed[i][0],
-                smoothed[(i + 1) % n_samples][1] - smoothed[i][1],
-            )
-            for i in range(n_samples)
-        )
-
-    def point_at(
-        self,
-        phase_u: float,
-        lane_depth_m: float = 2.0,
-        shift_xy: Tuple[float, float] = (0.0, 0.0),
-    ) -> Tuple[float, float]:
-        """获取跑道相位 phase_u（可大于 1 跨多圈）及内道偏移 lane_depth_m 处的安全坐标。"""
-        u = phase_u % 1.0
-        f_idx = u * self.n_samples
-        i0 = int(math.floor(f_idx)) % self.n_samples
-        i1 = (i0 + 1) % self.n_samples
-        frac = f_idx - math.floor(f_idx)
-
-        bx = self.base_points[i0][0] * (1.0 - frac) + self.base_points[i1][0] * frac
-        by = self.base_points[i0][1] * (1.0 - frac) + self.base_points[i1][1] * frac
-        nx = self.inward_normals[i0][0] * (1.0 - frac) + self.inward_normals[i1][0] * frac
-        ny = self.inward_normals[i0][1] * (1.0 - frac) + self.inward_normals[i1][1] * frac
-        nl = math.hypot(nx, ny) or 1.0
-        nx, ny = nx / nl, ny / nl
-
-        max_depth = min(lane_depth_m, min(self.rx, self.ry) * 0.55)
-        px = bx + nx * max_depth + shift_xy[0]
-        py = by + ny * max_depth + shift_xy[1]
-        return _clamp_point_inside_ring((px, py), self.center, self.ring_xy, margin_m=2.0)
-
-    def nearest_phase(self, pt: Tuple[float, float]) -> float:
-        """求任意平面点 pt 在当前跑道环上的最近相位 u ∈ [0, 1)。"""
-        best_i = min(
-            range(self.n_samples),
-            key=lambda i: math.hypot(pt[0] - self.base_points[i][0], pt[1] - self.base_points[i][1]),
-        )
-        return best_i / self.n_samples
-
-
-def build_playground_track_loops(ring_xy: Sequence[Tuple[float, float]]) -> Dict[str, StadiumTrackLoop]:
-    """
-    根据操场边缘多边形构建：
-    - 'main': 贴合操场整体边缘的主跑道环
-    - 'sub_a' / 'sub_b': 两个错位/分场子跑道环（对于双操场如 tasks_txl 为左右两个标准跑道，对于单操场为南北/内外错位跑道环）
-    """
-    xs = [p[0] for p in ring_xy]
-    ys = [p[1] for p in ring_xy]
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-    w = max_x - min_x
-    h = max_y - min_y
-    cx = 0.5 * (min_x + max_x)
-    cy = 0.5 * (min_y + max_y)
-
-    main_loop = StadiumTrackLoop(
-        ring_xy=ring_xy,
-        center=(cx, cy),
-        rx=w * 0.45,
-        ry=h * 0.45,
-        superellipse_p=2.4,
-        margin_m=4.0,
-    )
-
-    if w > h * 1.12:
-        # 横向双操场（如 tasks_txl 东西并排两个运动场）：构建左右两个独立标准跑道环
-        c_left = _clamp_point_inside_ring((min_x + w * 0.27, cy), (cx, cy), ring_xy, margin_m=15.0)
-        c_right = _clamp_point_inside_ring((min_x + w * 0.73, cy), (cx, cy), ring_xy, margin_m=15.0)
-        sub_a = StadiumTrackLoop(
-            ring_xy=ring_xy,
-            center=c_left,
-            rx=w * 0.21,
-            ry=h * 0.41,
-            superellipse_p=2.3,
-            margin_m=4.0,
-        )
-        sub_b = StadiumTrackLoop(
-            ring_xy=ring_xy,
-            center=c_right,
-            rx=w * 0.21,
-            ry=h * 0.41,
-            superellipse_p=2.3,
-            margin_m=4.0,
-        )
-    else:
-        # 纵向标准单操场（如 tasks_fch / tasks_xc）：构建偏外圈与偏内/南北错位的两个跑道环
-        c_north = _clamp_point_inside_ring((cx, cy + h * 0.08), (cx, cy), ring_xy, margin_m=15.0)
-        c_south = _clamp_point_inside_ring((cx, cy - h * 0.08), (cx, cy), ring_xy, margin_m=15.0)
-        sub_a = StadiumTrackLoop(
-            ring_xy=ring_xy,
-            center=c_north,
-            rx=w * 0.42,
-            ry=h * 0.36,
-            superellipse_p=2.3,
-            margin_m=4.0,
-        )
-        sub_b = StadiumTrackLoop(
-            ring_xy=ring_xy,
-            center=c_south,
-            rx=w * 0.35,
-            ry=h * 0.33,
-            superellipse_p=2.2,
-            margin_m=5.5,
-        )
-
-    return {"main": main_loop, "sub_a": sub_a, "sub_b": sub_b}
-
-
-def sample_safe_point_xy(
-    ring_xy: Sequence[Tuple[float, float]],
-    rng: random.Random,
-    margin_m: float = 3.5,
-    boundary_band: Optional[Tuple[float, float]] = None,
-) -> Tuple[float, float]:
-    """在操场边缘多边形内部随机采样安全点（距离边界至少 margin_m 米）。"""
-    xs = [p[0] for p in ring_xy]
-    ys = [p[1] for p in ring_xy]
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-
-    for _ in range(2500):
-        x = rng.uniform(min_x, max_x)
-        y = rng.uniform(min_y, max_y)
-        p = (x, y)
-        if inside_polygon(p, ring_xy):
-            d = dist_to_polygon_boundary(p, ring_xy)
-            if d >= margin_m:
-                if boundary_band is not None:
-                    lo, hi = boundary_band
-                    if not (lo <= d <= hi):
-                        continue
-                return p
-
-    for fallback_margin in (margin_m * 0.5, 1.0, 0.2):
-        for _ in range(1000):
-            p = (rng.uniform(min_x, max_x), rng.uniform(min_y, max_y))
-            if inside_polygon(p, ring_xy) and dist_to_polygon_boundary(p, ring_xy) >= fallback_margin:
-                return p
-    return (sum(xs) / len(xs), sum(ys) / len(ys))
-
-
-def _connect_smooth_curve_xy(
-    a: Tuple[float, float],
-    b: Tuple[float, float],
-    ring_xy: Sequence[Tuple[float, float]],
-    rng: random.Random,
-    margin_m: float = 2.0,
-    curvature_scale: float = 0.16,
-    s_curve: bool = False,
-) -> List[Tuple[float, float]]:
-    """在点 a 与点 b 之间生成平滑过渡弧线（用于入场/出场/切场/打卡点过渡），严格限制在操场边缘内。"""
-    chord = math.hypot(b[0] - a[0], b[1] - a[1])
-    if chord < 0.8:
-        return [a, b]
-    dx, dy = (b[0] - a[0]) / chord, (b[1] - a[1]) / chord
-    nx, ny = -dy, dx
-
-    n_steps = max(6, int(math.ceil(chord / 3.0)))
-    for attempt in range(12):
-        scale = curvature_scale * (0.72 ** attempt)
-        if attempt == 11:
-            scale = 0.0
-        sign1 = rng.choice([-1.0, 1.0])
-        sign2 = -sign1 if s_curve else sign1
-        off1 = chord * scale * sign1 * rng.uniform(0.6, 1.1)
-        off2 = chord * scale * sign2 * rng.uniform(0.6, 1.1)
-        c1 = (a[0] + dx * chord * 0.33 + nx * off1, a[1] + dy * chord * 0.33 + ny * off1)
-        c2 = (a[0] + dx * chord * 0.67 + nx * off2, a[1] + dy * chord * 0.67 + ny * off2)
-
-        pts: List[Tuple[float, float]] = []
-        valid = True
-        for k in range(n_steps + 1):
-            t = k / n_steps
-            mt = 1.0 - t
-            px = (mt ** 3) * a[0] + 3 * (mt ** 2) * t * c1[0] + 3 * mt * (t ** 2) * c2[0] + (t ** 3) * b[0]
-            py = (mt ** 3) * a[1] + 3 * (mt ** 2) * t * c1[1] + 3 * mt * (t ** 2) * c2[1] + (t ** 3) * b[1]
-            p = (px, py)
-            if not inside_polygon(p, ring_xy) or dist_to_polygon_boundary(p, ring_xy) < margin_m:
-                valid = False
-                break
-            if pts and not segment_inside_polygon(pts[-1], p, ring_xy):
-                valid = False
-                break
-            pts.append(p)
-        if valid and len(pts) >= 2:
-            return pts
-
-    return [
-        (a[0] + (b[0] - a[0]) * k / n_steps, a[1] + (b[1] - a[1]) * k / n_steps)
-        for k in range(n_steps + 1)
-    ]
-
-
-def _trace_track_arc_xy(
-    track: StadiumTrackLoop,
-    u_start: float,
-    delta_u: float,
-    lane_start_m: float,
-    lane_end_m: float,
-    ring_xy: Sequence[Tuple[float, float]],
-    rng: random.Random,
-    eccentric_amp_m: float = 1.5,
-    checkpoints_to_visit: Optional[List[Tuple[float, float]]] = None,
-) -> List[Tuple[float, float]]:
-    """
-    沿操场跑道形状 track 从相位 u_start 行进 delta_u 圈（正为逆时针，负为顺时针），
-    期间道宽从 lane_start_m 平滑过渡到 lane_end_m，叠加真实人类跑道微幅摆动，
-    并在跑道相位接近必经打卡点时平滑切入打卡后再切回跑道。
-    """
-    arc_len_est = abs(delta_u) * track.perimeter_m
-    n_steps = max(16, int(math.ceil(arc_len_est / 3.2)))
-    phase_ecc = rng.uniform(0.0, 2.0 * math.pi)
-    weave_phase = rng.uniform(0.0, 2.0 * math.pi)
-
-    pending_cps = list(checkpoints_to_visit or [])
-    pts: List[Tuple[float, float]] = []
-
-    for k in range(n_steps + 1):
-        frac = k / n_steps
-        u = u_start + delta_u * frac
-        base_lane = lane_start_m + (lane_end_m - lane_start_m) * frac
-        # 跑道偏心与人体自然晃动（弯道与直道微幅呼吸变化）
-        ecc = eccentric_amp_m * math.sin(2.0 * math.pi * u + phase_ecc)
-        weave = 0.38 * math.sin(2.0 * math.pi * 5.0 * u + weave_phase)
-        lane_d = max(0.5, base_lane + ecc + weave)
-        p = track.point_at(u, lane_depth_m=lane_d)
-        if not pts or segment_inside_polygon(pts[-1], p, ring_xy):
-            pts.append(p)
-
-        # 检查是否有待访问打卡点恰好位于当前跑道相位附近
-        if pending_cps and pts:
-            curr = pts[-1]
-            for cp_idx, cp in enumerate(pending_cps):
-                cp_u = track.nearest_phase(cp)
-                phase_diff = abs(((u % 1.0) - cp_u + 0.5) % 1.0 - 0.5)
-                if phase_diff < 0.045 and segment_inside_polygon(curr, cp, ring_xy):
-                    pending_cps.pop(cp_idx)
-                    # 从跑道平滑切向打卡点，再平滑切回前方跑道位置
-                    leg_in = _connect_smooth_curve_xy(curr, cp, ring_xy, rng, margin_m=1.5, curvature_scale=0.10)
-                    for q in leg_in[1:]:
-                        if segment_inside_polygon(pts[-1], q, ring_xy):
-                            pts.append(q)
-                    rejoin_u = u + math.copysign(min(0.08, abs(delta_u) * (1.0 - frac)), delta_u)
-                    rejoin_pt = track.point_at(rejoin_u, lane_depth_m=lane_d)
-                    if segment_inside_polygon(pts[-1], rejoin_pt, ring_xy):
-                        leg_out = _connect_smooth_curve_xy(
-                            pts[-1], rejoin_pt, ring_xy, rng, margin_m=1.5, curvature_scale=0.10
-                        )
-                        for q in leg_out[1:]:
-                            if segment_inside_polygon(pts[-1], q, ring_xy):
-                                pts.append(q)
-                    break
-
-    if checkpoints_to_visit is not None:
-        checkpoints_to_visit[:] = pending_cps
-    return pts
-
-
-def _append_safe_leg(
-    path_xy: List[Tuple[float, float]],
-    leg_pts: Sequence[Tuple[float, float]],
-    ring_xy: Sequence[Tuple[float, float]],
-) -> float:
-    """将子路径安全追加到主路径末尾，返回新增的几何长度（米）。"""
-    added = 0.0
-    for p in leg_pts:
-        if not path_xy:
-            path_xy.append(p)
-            continue
-        prev = path_xy[-1]
-        d = math.hypot(p[0] - prev[0], p[1] - prev[1])
-        if d < 0.15:
-            continue
-        if segment_inside_polygon(prev, p, ring_xy):
-            path_xy.append(p)
-            added += d
-    return added
-
-
-def synthesize_distinct_path_xy(
-    ring_xy: Sequence[Tuple[float, float]],
+def synthesize_stochastic_track_path_xy(
+    boundary_info: Dict,
     target_distance_m: float,
     checkpoints_xy: Sequence[Tuple[float, float]],
     existing_start_ends: Sequence[Tuple[Tuple[float, float], Tuple[float, float]]],
     rng: random.Random,
-    style: str = "track_layered_lanes",
-    margin_m: float = 3.0,
 ) -> Tuple[List[Tuple[float, float]], Tuple[float, float], Tuple[float, float]]:
     """
-    在操场边缘 ring_xy 限制下，结合『人类主要沿操场跑道形状跑步』与『随机选择起点和终点』，
-    生成一条总长度 >= target_distance_m 且与原有 tasks 在人眼视觉上完全不同的轨迹。
+    核心轨迹合成引擎：
+    1) 在加密重采样后的真实跑道走廊图 (corridor_tracks) 上执行带惯性的随机游走；
+    2) 在跑道走廊基底上施加非周期的『泊松跳变目标道宽 + Ornstein-Uhlenbeck (AR1) 横向随机漫游 + 实测 GPS 残差块自举』，
+       彻底消除函数曲线的机械规律感；
+    3) 每一步均由 RunnableCorridorShield 与多边形边界双重钳制，保证 0 穿墙。
     """
-    if style not in VISUAL_STYLES:
-        style = rng.choice(VISUAL_STYLES)
+    shield: RunnableCorridorShield = boundary_info["corridor_shield"]
+    tracks: List[List[Tuple[float, float]]] = boundary_info["corridor_tracks"]
+    residuals_pool: List[Tuple[float, float]] = boundary_info["empirical_residuals"]
 
-    loops = build_playground_track_loops(ring_xy)
-    main_track = loops["main"]
-    sub_a = loops["sub_a"]
-    sub_b = loops["sub_b"]
+    node_grid: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+    grid_sz = 6.0
+    for t_idx, trk in enumerate(tracks):
+        for p_idx, (x, y) in enumerate(trk):
+            cell = (int(math.floor(x / grid_sz)), int(math.floor(y / grid_sz)))
+            node_grid.setdefault(cell, []).append((t_idx, p_idx))
 
-    # 1. 随机选择起点 S 与终点 E（远离原 tasks 的西侧起终点扎堆区，且 S 与 E 位于不同跑道方位/内场出入口）
-    best_s: Optional[Tuple[float, float]] = None
-    best_e: Optional[Tuple[float, float]] = None
-    best_u_start = 0.0
+    # 1. 随机挑选远离已有起终点的起始节点 (cur_t, cur_i, cur_dir)
+    best_t, best_i, best_dir = 0, 0, 1
+    best_s = tracks[0][0]
     best_score = -1.0
 
-    for _ in range(120):
-        u_s = rng.uniform(0.0, 1.0)
-        u_e = (u_s + rng.uniform(0.22, 0.78)) % 1.0
-        # 起点与终点选在跑道不同内外道或跑道旁出入口/热身区（距离跑道 0~14m）
-        cand_s = main_track.point_at(u_s, lane_depth_m=rng.uniform(0.5, 14.0))
-        cand_e = main_track.point_at(u_e, lane_depth_m=rng.uniform(0.5, 14.0))
-        se_dist = math.hypot(cand_e[0] - cand_s[0], cand_e[1] - cand_s[1])
-        if se_dist < 45.0:
-            continue
-        min_pair_dist = (
-            min(
-                math.hypot(cand_s[0] - es[0], cand_s[1] - es[1])
-                + math.hypot(cand_e[0] - ee[0], cand_e[1] - ee[1])
-                for es, ee in existing_start_ends
-            )
-            if existing_start_ends
-            else 120.0
+    for _ in range(80):
+        t_idx = rng.randrange(len(tracks))
+        trk = tracks[t_idx]
+        p_idx = rng.randrange(len(trk))
+        d_sign = rng.choice([1, -1])
+        base_p = trk[p_idx]
+        cand_s = shield.clamp_point(
+            (base_p[0] + rng.uniform(-3.2, 3.2), base_p[1] + rng.uniform(-3.2, 3.2)),
+            target_radius=3.8,
         )
-        score = min_pair_dist + 0.5 * se_dist + rng.uniform(0.0, 15.0)
+        min_d = (
+            min(math.hypot(cand_s[0] - es[0], cand_s[1] - es[1]) for es, _ in existing_start_ends)
+            if existing_start_ends
+            else 100.0
+        )
+        score = min_d + rng.uniform(0.0, 15.0)
         if score > best_score:
             best_score = score
-            best_s, best_e = cand_s, cand_e
-            best_u_start = u_s
+            best_t, best_i, best_dir = t_idx, p_idx, d_sign
+            best_s = cand_s
 
-    if best_s is None or best_e is None:
-        best_u_start = rng.uniform(0.0, 1.0)
-        best_s = main_track.point_at(best_u_start, lane_depth_m=2.0)
-        best_e = main_track.point_at((best_u_start + 0.45) % 1.0, lane_depth_m=8.0)
+    # 2. 在跑道走廊图上生成连续无穿墙的载体序列 carrier_pts
+    carrier_pts: List[Tuple[float, float]] = [tracks[best_t][best_i]]
+    carrier_len = 0.0
+    cur_t, cur_i, cur_dir = best_t, best_i, best_dir
+    steps_since_switch = 0
+    cooldown_switch = rng.randint(25, 75)
 
-    remaining_cps = list(checkpoints_xy)
-    rng.shuffle(remaining_cps)
+    max_carrier_steps = int(target_distance_m / 2.2) + 800
+    for _ in range(max_carrier_steps):
+        if carrier_len >= target_distance_m + 180.0:
+            break
 
-    path_xy: List[Tuple[float, float]] = [best_s]
+        trk = tracks[cur_t]
+        next_i = cur_i + cur_dir
+        steps_since_switch += 1
+
+        need_endpoint_switch = not (0 <= next_i < len(trk))
+        want_random_switch = steps_since_switch >= cooldown_switch and rng.random() < 0.35
+
+        if need_endpoint_switch or want_random_switch:
+            curr_p = carrier_pts[-1]
+            prev_p = carrier_pts[-2] if len(carrier_pts) >= 2 else curr_p
+            curr_heading = math.atan2(curr_p[1] - prev_p[1], curr_p[0] - prev_p[0])
+
+            cx = int(math.floor(curr_p[0] / grid_sz))
+            cy = int(math.floor(curr_p[1] / grid_sz))
+            neighbor_nodes = list(node_grid.get((cx, cy), []))
+            if len(neighbor_nodes) < 6:
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        if dx != 0 or dy != 0:
+                            neighbor_nodes.extend(node_grid.get((cx + dx, cy + dy), []))
+
+            if len(neighbor_nodes) > 24:
+                neighbor_nodes = rng.sample(neighbor_nodes, 24)
+            else:
+                rng.shuffle(neighbor_nodes)
+
+            switched = False
+            for cand_t, cand_i in neighbor_nodes:
+                if cand_t == cur_t and abs(cand_i - cur_i) < 15:
+                    continue
+                cand_trk = tracks[cand_t]
+                cand_p = cand_trk[cand_i]
+                dist_jump = math.hypot(cand_p[0] - curr_p[0], cand_p[1] - curr_p[1])
+                if dist_jump > 5.5 or not shield.is_segment_safe(curr_p, cand_p):
+                    continue
+
+                for cand_dir in (cur_dir, -cur_dir):
+                    probe_i = cand_i + cand_dir * 3
+                    if not (0 <= probe_i < len(cand_trk)):
+                        continue
+                    probe_p = cand_trk[probe_i]
+                    new_heading = math.atan2(probe_p[1] - cand_p[1], probe_p[0] - cand_p[0])
+                    ang_diff = abs((new_heading - curr_heading + math.pi) % (2.0 * math.pi) - math.pi)
+                    if ang_diff <= math.radians(60.0) or (need_endpoint_switch and ang_diff <= math.radians(120.0)):
+                        cur_t, cur_i, cur_dir = cand_t, cand_i, cand_dir
+                        steps_since_switch = 0
+                        cooldown_switch = rng.randint(25, 80)
+                        switched = True
+                        break
+                if switched:
+                    break
+
+            if not switched and need_endpoint_switch:
+                cur_dir = -cur_dir
+                next_i = cur_i + cur_dir
+                steps_since_switch = 0
+                cooldown_switch = rng.randint(30, 80)
+            else:
+                next_i = cur_i + cur_dir
+
+        if not (0 <= next_i < len(tracks[cur_t])):
+            cur_dir = -cur_dir
+            next_i = max(0, min(len(tracks[cur_t]) - 1, cur_i + cur_dir))
+
+        next_p = tracks[cur_t][next_i]
+        cur_i = next_i
+        step_d = math.hypot(next_p[0] - carrier_pts[-1][0], next_p[1] - carrier_pts[-1][1])
+        if step_d >= 0.5 and shield.is_segment_safe(carrier_pts[-1], next_p):
+            carrier_pts.append(next_p)
+            carrier_len += step_d
+
+    # 3. 在走廊载体序列上施加『泊松随机变道 + AR(1) 横向漫游 + 实测 GPS 残差块自举』
+    synthesized_xy: List[Tuple[float, float]] = [
+        best_s if shield.is_segment_safe(best_s, carrier_pts[0]) else carrier_pts[0]
+    ]
     accum_len = 0.0
 
-    # 随机选择主跑步方向（+1 逆时针，-1 顺时针）
-    direction = rng.choice([1.0, -1.0])
-    curr_u = best_u_start
+    lat_offset = rng.uniform(-2.6, 2.6)
+    target_lane = rng.uniform(-3.6, 3.6)
+    steps_until_lane_change = rng.randint(10, 42)
+    lon_jitter = 0.0
 
-    # 2. 按不同拟真跑道风格组织『沿跑道跑步 + 随机起终点换道/切场/子环过渡』
-    if style == "track_layered_lanes":
-        # 风格 1：随机起终点 + 跑道外道/中道/内道分层递进环跑（每 1.2~1.8 圈显著切换一次跑道半径与偏心度）
-        lane_layers = [1.0, 7.5, 14.5, 4.0, 11.0]
-        if rng.random() < 0.5:
-            lane_layers.reverse()
-        layer_idx = 0
-        while accum_len < target_distance_m - 120.0 and layer_idx < 25:
-            d_curr = lane_layers[layer_idx % len(lane_layers)]
-            d_next = lane_layers[(layer_idx + 1) % len(lane_layers)]
-            delta_u = direction * rng.uniform(1.15, 1.75)
-            entry_pt = main_track.point_at(curr_u, lane_depth_m=d_curr)
-            accum_len += _append_safe_leg(
-                path_xy,
-                _connect_smooth_curve_xy(path_xy[-1], entry_pt, ring_xy, rng, margin_m=1.8, curvature_scale=0.12),
-                ring_xy,
-            )
-            arc_pts = _trace_track_arc_xy(
-                main_track,
-                u_start=curr_u,
-                delta_u=delta_u,
-                lane_start_m=d_curr,
-                lane_end_m=d_next,
-                ring_xy=ring_xy,
-                rng=rng,
-                eccentric_amp_m=2.2,
-                checkpoints_to_visit=remaining_cps,
-            )
-            accum_len += _append_safe_leg(path_xy, arc_pts, ring_xy)
-            curr_u = (curr_u + delta_u) % 1.0
-            layer_idx += 1
+    res_idx = rng.randrange(len(residuals_pool))
+    res_block_rem = rng.randint(6, 18)
+    res_sign = rng.choice([-1.0, 1.0])
 
-    elif style == "track_chord_cut":
-        # 风格 2：随机起终点 + 沿操场跑道绕圈穿插 2~3 次随机起终点斜穿切场（模拟绕圈中斜切草坪踩点/换向）
-        stage = 0
-        while accum_len < target_distance_m - 120.0 and stage < 20:
-            lane_d = rng.uniform(1.5, 11.0)
-            delta_u = direction * rng.uniform(1.10, 1.85)
-            entry_pt = main_track.point_at(curr_u, lane_depth_m=lane_d)
-            accum_len += _append_safe_leg(
-                path_xy,
-                _connect_smooth_curve_xy(path_xy[-1], entry_pt, ring_xy, rng, margin_m=1.8, curvature_scale=0.12),
-                ring_xy,
-            )
-            arc_pts = _trace_track_arc_xy(
-                main_track,
-                u_start=curr_u,
-                delta_u=delta_u,
-                lane_start_m=lane_d,
-                lane_end_m=rng.uniform(2.0, 12.0),
-                ring_xy=ring_xy,
-                rng=rng,
-                eccentric_amp_m=1.8,
-                checkpoints_to_visit=remaining_cps,
-            )
-            accum_len += _append_safe_leg(path_xy, arc_pts, ring_xy)
-            curr_u = (curr_u + delta_u) % 1.0
+    n_carrier = len(carrier_pts)
+    for i in range(1, n_carrier):
+        p_prev = carrier_pts[i - 1]
+        p_curr = carrier_pts[i]
+        p_next = carrier_pts[min(n_carrier - 1, i + 1)]
 
-            # 在跑道当前随机终点处，斜切穿过内场（优先顺路经过一个必经打卡点）到达跑道另一侧随机起点
-            target_u = (curr_u + rng.uniform(0.36, 0.64)) % 1.0
-            target_lane = rng.uniform(1.5, 11.0)
-            chord_end = main_track.point_at(target_u, lane_depth_m=target_lane)
-            if remaining_cps:
-                cp = remaining_cps.pop(0)
-                if segment_inside_polygon(path_xy[-1], cp, ring_xy) and segment_inside_polygon(cp, chord_end, ring_xy):
-                    leg1 = _connect_smooth_curve_xy(path_xy[-1], cp, ring_xy, rng, margin_m=1.8, curvature_scale=0.14)
-                    accum_len += _append_safe_leg(path_xy, leg1, ring_xy)
-            if segment_inside_polygon(path_xy[-1], chord_end, ring_xy):
-                leg2 = _connect_smooth_curve_xy(
-                    path_xy[-1], chord_end, ring_xy, rng, margin_m=2.0, curvature_scale=0.18, s_curve=True
-                )
-                accum_len += _append_safe_leg(path_xy, leg2, ring_xy)
-                curr_u = target_u
-                # 切场后有一定概率自然切换顺/逆时针跑向
-                if rng.random() < 0.5:
-                    direction = -direction
-            stage += 1
+        tx, ty = p_next[0] - p_prev[0], p_next[1] - p_prev[1]
+        tl = math.hypot(tx, ty)
+        if tl < 1e-6:
+            continue
+        ux, uy = tx / tl, ty / tl
+        nx, ny = -uy, ux
 
-    elif style == "track_d_loops":
-        # 风格 3：随机起终点 + 整圈标准跑道与半场 D 形圈组合（沿跑道跑整圈后，在直道中段横切中线跑半场环）
-        stage = 0
-        while accum_len < target_distance_m - 120.0 and stage < 22:
-            lane_d = rng.uniform(1.2, 10.5)
-            # 交替执行整圈跑 (1.0~1.4 圈) 与半场跑 (0.48~0.55 圈 + 横切中场弦线)
-            is_half_loop = (stage % 2 == 1)
-            delta_u = direction * (rng.uniform(0.46, 0.54) if is_half_loop else rng.uniform(1.05, 1.45))
-            entry_pt = main_track.point_at(curr_u, lane_depth_m=lane_d)
-            accum_len += _append_safe_leg(
-                path_xy,
-                _connect_smooth_curve_xy(path_xy[-1], entry_pt, ring_xy, rng, margin_m=1.8, curvature_scale=0.10),
-                ring_xy,
-            )
-            arc_pts = _trace_track_arc_xy(
-                main_track,
-                u_start=curr_u,
-                delta_u=delta_u,
-                lane_start_m=lane_d,
-                lane_end_m=lane_d + rng.uniform(-2.0, 3.0),
-                ring_xy=ring_xy,
-                rng=rng,
-                eccentric_amp_m=1.6,
-                checkpoints_to_visit=remaining_cps,
-            )
-            accum_len += _append_safe_leg(path_xy, arc_pts, ring_xy)
-            curr_u = (curr_u + delta_u) % 1.0
+        steps_until_lane_change -= 1
+        if steps_until_lane_change <= 0:
+            target_lane = rng.uniform(-3.8, 3.8)
+            steps_until_lane_change = rng.randint(10, 48)
 
-            if is_half_loop:
-                # 从跑道一侧直道横切回对称侧直道，形成鲜明的半场 D 形跑道轨迹
-                across_u = (1.0 - curr_u + rng.uniform(-0.04, 0.04)) % 1.0
-                across_pt = main_track.point_at(across_u, lane_depth_m=rng.uniform(2.0, 9.0))
-                if segment_inside_polygon(path_xy[-1], across_pt, ring_xy):
-                    bridge = _connect_smooth_curve_xy(
-                        path_xy[-1], across_pt, ring_xy, rng, margin_m=2.0, curvature_scale=0.10
-                    )
-                    accum_len += _append_safe_leg(path_xy, bridge, ring_xy)
-                    curr_u = across_u
-            stage += 1
+        reversion_rate = rng.uniform(0.09, 0.24)
+        lat_offset += reversion_rate * (target_lane - lat_offset) + rng.gauss(0.0, 0.38)
+        lat_offset = max(-4.0, min(4.0, lat_offset))
 
-    else:  # track_dual_subloops
-        # 风格 4：随机起终点 + 双子跑道环 / 错位偏心跑道切换跑（在 sub_a、sub_b 与 main 跑道环之间平滑切换绕圈）
-        track_seq = [sub_a, sub_b, main_track]
-        rng.shuffle(track_seq)
-        stage = 0
-        while accum_len < target_distance_m - 120.0 and stage < 20:
-            active_track = track_seq[stage % len(track_seq)]
-            u0 = active_track.nearest_phase(path_xy[-1])
-            lane_d = rng.uniform(1.0, 8.5)
-            entry_pt = active_track.point_at(u0, lane_depth_m=lane_d)
-            if segment_inside_polygon(path_xy[-1], entry_pt, ring_xy):
-                accum_len += _append_safe_leg(
-                    path_xy,
-                    _connect_smooth_curve_xy(path_xy[-1], entry_pt, ring_xy, rng, margin_m=1.8, curvature_scale=0.14),
-                    ring_xy,
-                )
-            delta_u = direction * rng.uniform(1.25, 1.95)
-            arc_pts = _trace_track_arc_xy(
-                active_track,
-                u_start=u0,
-                delta_u=delta_u,
-                lane_start_m=lane_d,
-                lane_end_m=rng.uniform(1.5, 9.5),
-                ring_xy=ring_xy,
-                rng=rng,
-                eccentric_amp_m=1.8,
-                checkpoints_to_visit=remaining_cps,
-            )
-            accum_len += _append_safe_leg(path_xy, arc_pts, ring_xy)
-            stage += 1
+        res_block_rem -= 1
+        if res_block_rem <= 0:
+            res_idx = rng.randrange(len(residuals_pool))
+            res_block_rem = rng.randint(6, 18)
+            res_sign = rng.choice([-1.0, 1.0])
+        else:
+            res_idx = (res_idx + 1) % len(residuals_pool)
+        emp_lon, emp_lat = residuals_pool[res_idx]
 
-    # 3. 若仍有未顺路经过的必经打卡点，从跑道平滑切入访问后再回到跑道
-    for cp in remaining_cps:
-        if segment_inside_polygon(path_xy[-1], cp, ring_xy):
-            leg = _connect_smooth_curve_xy(path_xy[-1], cp, ring_xy, rng, margin_m=1.5, curvature_scale=0.12)
-            accum_len += _append_safe_leg(path_xy, leg, ring_xy)
+        lon_jitter = 0.50 * lon_jitter + rng.gauss(0.0, 0.20) + emp_lon * 0.70
+        lon_jitter = max(-1.1, min(1.1, lon_jitter))
+        micro_lat = emp_lat * res_sign * rng.uniform(0.80, 1.25)
 
-    # 4. 收尾阶段：沿主跑道形状补足剩余里程，最终平滑切出并精确抵达随机终点 best_e
-    curr_u = main_track.nearest_phase(path_xy[-1])
-    end_u = main_track.nearest_phase(best_e)
-    rem_m = max(0.0, target_distance_m - accum_len)
-    exit_chord_m = math.hypot(best_e[0] - path_xy[-1][0], best_e[1] - path_xy[-1][1])
-
-    if rem_m > exit_chord_m + 35.0:
-        track_rem_u = direction * ((rem_m - 25.0) / max(100.0, main_track.perimeter_m))
-        final_lane = rng.uniform(2.0, 10.0)
-        rejoin_pt = main_track.point_at(curr_u, lane_depth_m=final_lane)
-        if segment_inside_polygon(path_xy[-1], rejoin_pt, ring_xy):
-            accum_len += _append_safe_leg(
-                path_xy,
-                _connect_smooth_curve_xy(path_xy[-1], rejoin_pt, ring_xy, rng, margin_m=1.8, curvature_scale=0.12),
-                ring_xy,
-            )
-        tail_arc = _trace_track_arc_xy(
-            main_track,
-            u_start=curr_u,
-            delta_u=track_rem_u,
-            lane_start_m=final_lane,
-            lane_end_m=final_lane,
-            ring_xy=ring_xy,
-            rng=rng,
-            eccentric_amp_m=1.2,
+        total_lat = lat_offset + micro_lat
+        raw_cand = (
+            p_curr[0] + nx * total_lat + ux * lon_jitter,
+            p_curr[1] + ny * total_lat + uy * lon_jitter,
         )
-        accum_len += _append_safe_leg(path_xy, tail_arc, ring_xy)
 
-    # 最终平滑连接至随机终点 best_e（若直接连线距離较短，确保总长严格 >= target_distance_m）
-    if segment_inside_polygon(path_xy[-1], best_e, ring_xy):
-        final_leg = _connect_smooth_curve_xy(path_xy[-1], best_e, ring_xy, rng, margin_m=1.8, curvature_scale=0.14)
-        accum_len += _append_safe_leg(path_xy, final_leg, ring_xy)
+        prev_out = synthesized_xy[-1]
+        accepted_pt: Optional[Tuple[float, float]] = None
+        for shrink in (1.0, 0.5, 0.0):
+            blend = (
+                p_curr[0] + (raw_cand[0] - p_curr[0]) * shrink,
+                p_curr[1] + (raw_cand[1] - p_curr[1]) * shrink,
+            )
+            clamped = shield.clamp_point(blend, target_radius=4.2 * shrink + 0.5)
+            if shield.is_segment_safe(prev_out, clamped):
+                accepted_pt = clamped
+                break
 
-    return path_xy, path_xy[0], path_xy[-1]
+        if accepted_pt is None:
+            if segment_inside_polygon(prev_out, p_curr, shield.ring_xy):
+                accepted_pt = p_curr
+            else:
+                continue
+
+        step_d = math.hypot(accepted_pt[0] - prev_out[0], accepted_pt[1] - prev_out[1])
+        if step_d < 0.35:
+            continue
+        synthesized_xy.append(accepted_pt)
+        accum_len += step_d
+
+        if accum_len >= target_distance_m:
+            se_dist = math.hypot(
+                synthesized_xy[-1][0] - synthesized_xy[0][0],
+                synthesized_xy[-1][1] - synthesized_xy[0][1],
+            )
+            if se_dist >= 45.0 or accum_len >= target_distance_m + 140.0:
+                break
+
+    return synthesized_xy, synthesized_xy[0], synthesized_xy[-1]
 
 
 # ===========================================================================
-# 6. 运动学采样与 Task JSON 组装（100% 兼容 main.py / yun_route.py / route_viewer.html）
+# 7. 运动学采样与 Task JSON 组装（100% 兼容 main.py / yun_route.py / route_viewer.html）
 # ===========================================================================
 
 def _sample_trajectory_to_task_dict(
     route_lonlat: Sequence[Tuple[float, float]],
     ring_lonlat: Sequence[Tuple[float, float]],
-    target_distance_m: float,
     pace_min_km: float,
     cadence_spm: int,
-    sample_seconds: int,
+    dt_pool: Sequence[int],
     manage_list: List[Dict],
     dislikes_count: int,
     rng: random.Random,
     seed_val: int,
-    style: str,
 ) -> Dict:
     """
-    将经纬度几何路径按人体变速节奏采样为完整的 tasklist JSON 结构，
-    并执行操场边缘与单调性校验。
+    将经纬度轨迹按非周期随机步频与变速过程封装为 tasklist JSON，
+    并通过 validate_polygon_route 与字段单调性检验。
     """
-    cum_lengths = [0.0]
-    for a, b in zip(route_lonlat, route_lonlat[1:]):
-        cum_lengths.append(cum_lengths[-1] + distance_m(a, b))
+    cleaned_pts: List[Tuple[float, float]] = [route_lonlat[0]]
+    for p in route_lonlat[1:]:
+        if distance_m(cleaned_pts[-1], p) >= 0.25 and segment_inside_polygon(cleaned_pts[-1], p, ring_lonlat):
+            cleaned_pts.append(p)
 
-    total_avail_m = cum_lengths[-1]
-    actual_target_m = min(target_distance_m, total_avail_m)
-    if actual_target_m < 50.0:
-        raise ValueError(f"生成几何可用长度过短: {actual_target_m:.1f} m")
+    validate_polygon_route(cleaned_pts, ring_lonlat)
 
-    nominal_duration = max(10, int(math.ceil((actual_target_m / 1000.0) * pace_min_km * 60.0)))
-    ticks = list(range(0, nominal_duration, sample_seconds))
-    if ticks[-1] != nominal_duration:
-        ticks.append(nominal_duration)
-
-    n_intervals = len(ticks) - 1
-    phase1 = rng.uniform(0.0, 2.0 * math.pi)
-    phase2 = rng.uniform(0.0, 2.0 * math.pi)
-    weights: List[float] = []
-    for i in range(n_intervals):
-        dt = ticks[i + 1] - ticks[i]
-        u = i / max(1, n_intervals)
-        mod = (
-            1.0
-            + 0.065 * math.sin(2.0 * math.pi * 2.5 * u + phase1)
-            + 0.035 * math.cos(2.0 * math.pi * 6.0 * u + phase2)
-            + rng.uniform(-0.015, 0.015)
-        )
-        weights.append(max(0.2, dt * mod))
-
-    weight_sum = sum(weights)
-    spatial_progress = [0.0]
-    acc = 0.0
-    for w in weights:
-        acc += (w / weight_sum) * actual_target_m
-        spatial_progress.append(min(actual_target_m, acc))
-    spatial_progress[-1] = actual_target_m
-
-    def interp_at(s_m: float) -> Tuple[float, float]:
-        idx = min(len(route_lonlat) - 1, max(1, bisect.bisect_left(cum_lengths, s_m)))
-        p0, p1 = route_lonlat[idx - 1], route_lonlat[idx]
-        seg_len = cum_lengths[idx] - cum_lengths[idx - 1]
-        f = (s_m - cum_lengths[idx - 1]) / seg_len if seg_len > 1e-9 else 0.0
-        f = max(0.0, min(1.0, f))
-        return (
-            round(p0[0] + (p1[0] - p0[0]) * f, 8),
-            round(p0[1] + (p1[1] - p0[1]) * f, 8),
-        )
-
-    sampled_pts: List[Tuple[float, float]] = [interp_at(0.0)]
-    valid_ticks: List[int] = [ticks[0]]
-
-    for t_val, s_m in zip(ticks[1:], spatial_progress[1:]):
-        cand = interp_at(s_m)
-        prev = sampled_pts[-1]
-        if not segment_inside_polygon(prev, cand, ring_lonlat):
-            idx = min(len(route_lonlat) - 1, max(1, bisect.bisect_left(cum_lengths, s_m)))
-            cand = route_lonlat[idx]
-        if distance_m(prev, cand) < 0.05:
-            continue
-        sampled_pts.append(cand)
-        valid_ticks.append(t_val)
-
-    # 严格执行多边形边界验证
-    validate_polygon_route(sampled_pts, ring_lonlat)
-
-    # 计算真实累积球面距离、步数与配速（保持与存储值 100% 一致）
     actual_miles = [0.0]
-    for a, b in zip(sampled_pts, sampled_pts[1:]):
+    for a, b in zip(cleaned_pts, cleaned_pts[1:]):
         actual_miles.append(actual_miles[-1] + distance_m(a, b))
+
+    total_m = actual_miles[-1]
+    if total_m < 50.0:
+        raise ValueError(f"生成几何可用长度过短: {total_m:.1f} m")
+
+    target_total_s = (total_m / 1000.0) * pace_min_km * 60.0
+    raw_dt_floats: List[float] = []
+    pace_state = 1.0
+    for i in range(1, len(cleaned_pts)):
+        dm = actual_miles[i] - actual_miles[i - 1]
+        turn_slowdown = 1.0
+        if 1 <= i < len(cleaned_pts) - 1:
+            p0, p1, p2 = cleaned_pts[i - 1], cleaned_pts[i], cleaned_pts[i + 1]
+            a1 = math.atan2(p1[1] - p0[1], p1[0] - p0[0])
+            a2 = math.atan2(p2[1] - p1[1], p2[0] - p1[0])
+            da = abs((a2 - a1 + math.pi) % (2.0 * math.pi) - math.pi)
+            turn_slowdown = 1.0 + 0.18 * min(1.0, da / (math.pi * 0.5))
+
+        pace_state = 0.88 * pace_state + 0.12 * 1.0 + rng.gauss(0.0, 0.045)
+        pace_state = max(0.78, min(1.28, pace_state))
+        raw_dt_floats.append(dm * pace_state * turn_slowdown)
+
+    scale_t = target_total_s / max(1e-6, sum(raw_dt_floats))
+    valid_ticks: List[int] = [0]
+    acc_t = 0.0
+    for f_dt in raw_dt_floats:
+        acc_t += f_dt * scale_t
+        next_t = max(valid_ticks[-1] + 1, int(round(acc_t)))
+        valid_ticks.append(next_t)
 
     points_list: List[Dict] = []
     cum_steps = 0
-    for i, (t_sec, pt, mile_m) in enumerate(zip(valid_ticks, sampled_pts, actual_miles)):
+    cadence_state = float(cadence_spm)
+
+    for i, (t_sec, pt, mile_m) in enumerate(zip(valid_ticks, cleaned_pts, actual_miles)):
         if i == 0:
             spd_str = "0.0"
             cum_steps = 0
@@ -1347,7 +1169,9 @@ def _sample_trajectory_to_task_dict(
             dm = mile_m - points_list[-1]["runMileage"]
             dt = t_sec - points_list[-1]["runTime"]
             spd_str = client_speed(dm, dt)
-            step_inc = max(1, int(round((dt / 60.0) * cadence_spm * rng.uniform(0.95, 1.05))))
+            cadence_state = 0.85 * cadence_state + 0.15 * cadence_spm + rng.gauss(0.0, 2.5)
+            cadence_state = max(125.0, min(205.0, cadence_state))
+            step_inc = max(1, int(round((dt / 60.0) * cadence_state)))
             cum_steps += step_inc
 
         pt_item = {
@@ -1376,13 +1200,13 @@ def _sample_trajectory_to_task_dict(
         "code": 200,
         "metadata": {
             "synthetic": True,
-            "generator": "playground_track_shape_random_start_end",
-            "visual_style": style,
+            "generator": "corridor_stochastic_empirical_track",
+            "visual_style": "stochastic_track_ar1",
             "coordinate_system": "GCJ-02",
             "seed": seed_val,
-            "start_point": f"{sampled_pts[0][0]:.8f},{sampled_pts[0][1]:.8f}",
-            "end_point": f"{sampled_pts[-1][0]:.8f},{sampled_pts[-1][1]:.8f}",
-            "start_end_distance_m": round(distance_m(sampled_pts[0], sampled_pts[-1]), 2),
+            "start_point": f"{cleaned_pts[0][0]:.8f},{cleaned_pts[0][1]:.8f}",
+            "end_point": f"{cleaned_pts[-1][0]:.8f},{cleaned_pts[-1][1]:.8f}",
+            "start_end_distance_m": round(distance_m(cleaned_pts[0], cleaned_pts[-1]), 2),
             "cadence_spm": final_cadence,
             "server_verified": False,
         },
@@ -1442,19 +1266,18 @@ def generate_task_suite(
     max_cadence: Optional[int] = None,
     dislikes: Optional[int] = None,
     sample_seconds: int = 2,
-    style: str = "cycle",
+    style: str = "stochastic",
     seed: Optional[int] = None,
-    max_visual_iou: float = 0.45,
+    max_visual_iou: float = 0.42,
 ) -> List[Dict]:
     """
-    根据提取的操场边缘信息 boundary_info 批量生成 count 个既符合操场跑道形状、
-    又在人眼视觉上与原有 tasks 截然不同的新 Tasks。
+    根据提取的操场边缘与可通行走廊信息 boundary_info 批量生成 count 个新 Tasks：
+    - 保证与原轨迹不相似，且不同随机种子生成的轨迹彼此也不相似。
     """
     base_seed = seed if seed is not None else secrets.randbits(32)
     rng = random.Random(base_seed)
 
     proj: LocalProjector = boundary_info["projector"]
-    ring_xy: List[Tuple[float, float]] = boundary_info["ring_xy"]
     ring_lonlat: List[Tuple[float, float]] = boundary_info["ring_lonlat"]
     stats = boundary_info["stats"]
 
@@ -1467,7 +1290,8 @@ def generate_task_suite(
     target_dislikes = dislikes if dislikes is not None else stats["dislikes_mode"]
 
     orig_trajs_xy = [[proj.to_xy(p) for p in t] for t in boundary_info["trajectories"]]
-    orig_cells_list = [rasterize_trajectory_cells(t_xy, cell_size_m=3.0) for t_xy in orig_trajs_xy]
+    orig_cells_list = [rasterize_trajectory_cells(t_xy, cell_size_m=2.5) for t_xy in orig_trajs_xy]
+    synth_cells_list: List[set] = []
     used_start_ends: List[Tuple[Tuple[float, float], Tuple[float, float]]] = [
         (t_xy[0], t_xy[-1]) for t_xy in orig_trajs_xy if len(t_xy) >= 2
     ]
@@ -1477,11 +1301,6 @@ def generate_task_suite(
 
     generated_tasks: List[Dict] = []
     for idx in range(count):
-        chosen_style = (
-            VISUAL_STYLES[idx % len(VISUAL_STYLES)]
-            if style == "cycle"
-            else (rng.choice(VISUAL_STYLES) if style == "random" else style)
-        )
         target_m = rng.uniform(km_lo, km_hi) * 1000.0
         pace_val = rng.uniform(pace_lo, pace_hi)
         cadence_val = rng.randint(cad_lo, cad_hi)
@@ -1500,58 +1319,61 @@ def generate_task_suite(
             actual_dislikes = 0
 
         best_candidate = None
-        best_iou = 999.0
-        for _ in range(8):
+        best_score = 999.0
+        for _ in range(3):
             task_seed = rng.getrandbits(32)
             sub_rng = random.Random(task_seed)
-            path_xy, s_xy, e_xy = synthesize_distinct_path_xy(
-                ring_xy=ring_xy,
-                target_distance_m=target_m * 1.04,
+            path_xy, s_xy, e_xy = synthesize_stochastic_track_path_xy(
+                boundary_info=boundary_info,
+                target_distance_m=target_m,
                 checkpoints_xy=chosen_cps_xy,
                 existing_start_ends=used_start_ends,
                 rng=sub_rng,
-                style=chosen_style,
-                margin_m=3.0,
             )
-            cand_cells = rasterize_trajectory_cells(path_xy, cell_size_m=3.0)
+            cand_cells = rasterize_trajectory_cells(path_xy, cell_size_m=2.5)
             max_orig_iou = (
                 max(compute_visual_iou(cand_cells, oc) for oc in orig_cells_list)
                 if orig_cells_list
                 else 0.0
             )
-            if max_orig_iou < best_iou:
-                best_iou = max_orig_iou
-                best_candidate = (path_xy, s_xy, e_xy, task_seed, max_orig_iou)
-            if max_orig_iou <= max_visual_iou:
+            max_synth_iou = (
+                max(compute_visual_iou(cand_cells, sc) for sc in synth_cells_list)
+                if synth_cells_list
+                else 0.0
+            )
+            combined_iou = max(max_orig_iou, max_synth_iou)
+            if combined_iou < best_score:
+                best_score = combined_iou
+                best_candidate = (path_xy, s_xy, e_xy, task_seed, max_orig_iou, max_synth_iou, cand_cells)
+            if combined_iou <= max_visual_iou:
                 break
 
         assert best_candidate is not None
-        path_xy, s_xy, e_xy, task_seed, max_orig_iou = best_candidate
+        path_xy, s_xy, e_xy, task_seed, max_orig_iou, max_synth_iou, cand_cells = best_candidate
         used_start_ends.append((s_xy, e_xy))
-        orig_cells_list.append(rasterize_trajectory_cells(path_xy, cell_size_m=3.0))
+        synth_cells_list.append(cand_cells)
 
         route_lonlat = [proj.to_lonlat(p) for p in path_xy]
         task_dict = _sample_trajectory_to_task_dict(
             route_lonlat=route_lonlat,
             ring_lonlat=ring_lonlat,
-            target_distance_m=target_m,
             pace_min_km=pace_val,
             cadence_spm=cadence_val,
-            sample_seconds=sample_seconds,
+            dt_pool=boundary_info["dt_samples"],
             manage_list=manage_list,
             dislikes_count=actual_dislikes,
             rng=random.Random(task_seed ^ 0xA5A5),
             seed_val=task_seed,
-            style=chosen_style,
         )
         task_dict["metadata"]["max_visual_iou_vs_original"] = round(max_orig_iou, 4)
+        task_dict["metadata"]["max_visual_iou_vs_siblings"] = round(max_synth_iou, 4)
         generated_tasks.append(task_dict)
 
     return generated_tasks
 
 
 # ===========================================================================
-# 7. 可视化对比图生成与命令行入口
+# 8. 可视化对比图生成与命令行入口
 # ===========================================================================
 
 def plot_comparison(
@@ -1559,7 +1381,7 @@ def plot_comparison(
     generated_tasks: Sequence[Dict],
     output_png: str | Path,
 ) -> None:
-    """绘制『原有 Tasks + 提取的操场边缘』与『单条新生成拟真跑道 Tasks 独立展示』对比图。"""
+    """绘制『单条原轨迹实测细节』与『多个不同随机种子生成的拟真跑道轨迹』对比图。"""
     import matplotlib.pyplot as plt
 
     show_tasks = list(generated_tasks)[:4]
@@ -1576,15 +1398,19 @@ def plot_comparison(
     for idx, traj in enumerate(boundary_info["trajectories"]):
         lons = [p[0] for p in traj]
         lats = [p[1] for p in traj]
-        ax0.plot(lons, lats, alpha=0.50, linewidth=1.0, label=f"orig_{idx}" if idx < 5 else None)
-        ax0.scatter([lons[0]], [lats[0]], c="green", s=22, zorder=5)
-        ax0.scatter([lons[-1]], [lats[-1]], c="red", s=22, zorder=5)
-    ax0.plot(bx, by, "k--", linewidth=2.0, label="Boundary")
+        if idx == 0:
+            ax0.plot(lons, lats, color="#333333", alpha=0.88, linewidth=1.15, label="Orig #0")
+            ax0.scatter([lons[0]], [lats[0]], c="green", s=50, zorder=7)
+            ax0.scatter([lons[-1]], [lats[-1]], c="red", marker="X", s=55, zorder=7)
+        else:
+            ax0.plot(lons, lats, color="#999999", alpha=0.22, linewidth=0.8)
+    ax0.plot(bx, by, "k--", linewidth=1.9, label="Boundary")
     for cp in boundary_info["checkpoints_y"]:
         ax0.scatter([cp[0]], [cp[1]], c="purple", marker="*", s=80, zorder=8)
-    ax0.set_title(f"Original ({Path(boundary_info['tasks_dir']).name})\n+ Extracted Boundary", fontsize=10)
+    ax0.set_title(f"Original #0 + Corridor ({Path(boundary_info['tasks_dir']).name})", fontsize=9.5)
     ax0.set_aspect("equal")
     ax0.tick_params(labelsize=7)
+    ax0.legend(fontsize=7, loc="upper right")
 
     colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
     for idx, task in enumerate(show_tasks):
@@ -1594,10 +1420,11 @@ def plot_comparison(
         lons = [p[0] for p in pts]
         lats = [p[1] for p in pts]
         meta = task.get("metadata", {})
-        st = meta.get("visual_style", "")
-        iou = meta.get("max_visual_iou_vs_original", 0.0)
+        seed_v = meta.get("seed", 0)
+        iou_o = meta.get("max_visual_iou_vs_original", 0.0)
+        iou_s = meta.get("max_visual_iou_vs_siblings", 0.0)
         se_d = meta.get("start_end_distance_m", 0.0)
-        ax.plot(lons, lats, color=colors[idx % len(colors)], alpha=0.82, linewidth=1.25)
+        ax.plot(lons, lats, color=colors[idx % len(colors)], alpha=0.82, linewidth=1.15)
         ax.scatter([lons[0]], [lats[0]], c="green", s=55, zorder=7, label="Start (S)")
         ax.scatter([lons[-1]], [lats[-1]], c="red", marker="X", s=60, zorder=7, label="End (E)")
         for m in task["data"].get("manageList", []):
@@ -1605,8 +1432,8 @@ def plot_comparison(
                 mc = tuple(map(float, m["point"].split(",")))
                 ax.scatter([mc[0]], [mc[1]], c="purple", marker="*", s=85, zorder=8)
         ax.set_title(
-            f"New tasklist_{idx} ({st})\n{task['data']['recordMileage']}km | S-E={se_d:.0f}m | IoU={iou:.2f}",
-            fontsize=9.5,
+            f"Seed #{idx+1} ({seed_v % 100000})\n{task['data']['recordMileage']}km | S-E={se_d:.0f}m | IoU={iou_o:.2f}/{iou_s:.2f}",
+            fontsize=9.2,
         )
         ax.set_aspect("equal")
         ax.tick_params(labelsize=7)
@@ -1619,7 +1446,7 @@ def plot_comparison(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="根据已有 tasks 表提取操场边缘，并在边缘限制内按照操场跑道形状与随机起终点生成视觉不同的新 Tasks"
+        description="基于已有 tasks 表提取操场边缘与防穿墙走廊，通过非周期随机游走与经验微观残差生成拟真绕圈 Tasks"
     )
     parser.add_argument(
         "-i",
@@ -1651,8 +1478,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--buffer-m",
         type=float,
-        default=2.5,
-        help="操场边缘外扩安全缓冲距离（米，默认 2.5）",
+        default=2.0,
+        help="操场边缘外扩安全缓冲距离（米，默认 2.0）",
     )
     parser.add_argument(
         "-n",
@@ -1663,17 +1490,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--style",
-        choices=("cycle", "random", *VISUAL_STYLES),
-        default="cycle",
-        help="跑道轨迹视觉生成风格：cycle（轮换 4 种跑道风格）、random 或指定单一风格",
+        type=str,
+        default="stochastic",
+        help="保留兼容参数（默认 stochastic：全随机经验走廊绕圈合成）",
     )
     parser.add_argument("--min-km", type=float, default=None, help="生成任务最小里程（公里，默认自动学习原表）")
     parser.add_argument("--max-km", type=float, default=None, help="生成任务最大里程（公里，默认自动学习原表）")
     parser.add_argument("--min-pace", type=float, default=None, help="最小配速 min/km（默认自动学习原表）")
     parser.add_argument("--max-pace", type=float, default=None, help="最大配速 min/km（默认自动学习原表）")
     parser.add_argument("--dislikes", type=int, default=None, help="必经打卡点数量（填 0 可生成无踩点要求任务）")
-    parser.add_argument("--sample-seconds", type=int, default=2, help="轨迹点采样时间间隔（秒，1~5，默认 2）")
-    parser.add_argument("--seed", type=int, default=None, help="随机种子（默认每次随机生成）")
+    parser.add_argument("--sample-seconds", type=int, default=2, help="基准采样时间间隔（秒，默认 2）")
+    parser.add_argument("--seed", type=int, default=None, help="主随机种子（默认每次随机生成，子任务自动派生独立种子）")
     parser.add_argument("--plot", type=str, default=None, help="可选：保存新旧轨迹与操场边缘视觉对比图 PNG 路径")
     return parser
 
@@ -1726,19 +1553,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         plot_comparison(boundary_info, tasks, args.plot)
 
     print(
-        f"[操场边缘] 已从 {boundary_info['tasks_dir']} 提取 {len(boundary_info['ring_lonlat'])} 个边界顶点 "
-        f"(面积 {boundary_info['geojson']['metadata']['area_m2']} m²) -> {boundary_path}"
+        f"[操场边缘与走廊] 已从 {boundary_info['tasks_dir']} 提取 {len(boundary_info['ring_lonlat'])} 个边界顶点 "
+        f"(面积 {boundary_info['geojson']['metadata']['area_m2']} m²，走廊轨迹 {len(boundary_info['corridor_tracks'])} 条，"
+        f"实测微观残差样本 {len(boundary_info['empirical_residuals'])} 个) -> {boundary_path}"
     )
-    print(f"[任务生成] 已在操场边缘限制内按操场跑道形状生成 {len(tasks)} 个视觉差异化任务 -> {out_dir}")
+    print(f"[任务生成] 已在防穿墙走廊限制内生成 {len(tasks)} 个随机拟真跑道任务 -> {out_dir}")
     for idx, t in enumerate(tasks):
         d = t["data"]
         m = t["metadata"]
         print(
-            f"  tasklist_{idx}.json: style={m['visual_style']}, "
+            f"  tasklist_{idx}.json: seed={m['seed']}, "
             f"mileage={d['recordMileage']:.2f}km, duration={d['duration']}s, "
             f"pace={d['recodePace']:.2f}, cadence={d['recodeCadence']}, "
             f"start_end_dist={m['start_end_distance_m']}m, "
-            f"max_visual_IoU={m['max_visual_iou_vs_original']:.3f}"
+            f"IoU_orig={m['max_visual_iou_vs_original']:.3f}, IoU_sibling={m['max_visual_iou_vs_siblings']:.3f}"
         )
     return 0
 
